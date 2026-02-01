@@ -1,0 +1,122 @@
+package embeddb
+
+import (
+	"fmt"
+	"os"
+	"reflect"
+	"sync"
+
+	"golang.org/x/exp/mmap"
+)
+
+// Record format description:
+// [escCode,startMarker]2 bytes - Marks the beginning of a record.
+// [id]4 bytes - The unique identifier for the record (uint32).
+// [length]4 bytes - The length of the actual record data (uint32).
+// [active]1 byte - Status of the record (1 for active, 0 for inactive).
+// -- Actual record data bytes --
+// [escCode,endMarker]2 bytes - Marks the end of a record.
+
+// Database is a generic type that represents a database for storing records of type T.
+type Database[T any] struct {
+	header       DBHeader
+	lock         sync.RWMutex
+	file         *os.File
+	mfile        *mmap.ReaderAt
+	mlock        sync.RWMutex
+	index        map[uint32]uint32 // Map of record IDs to their file offsets
+	layout       *StructLayout     // Struct layout information using unsafe
+	nextRecordID uint32
+	nlock        sync.Mutex
+	transaction  *Transaction     // Transaction manager for atomicity
+	indexManager *IndexManager[T] // Manager for field indexes
+}
+
+type DBHeader struct {
+	Version       string
+	indexStart    uint32
+	indexEnd      uint32
+	nextRecordID  uint32
+	nextOffset    uint32
+	tocStart      uint32
+	entryStart    uint32
+	lgIndexStart  uint32 // Last good index start position
+	lock          sync.Mutex
+	indexCapacity uint32 // Capacity allocated for the index
+}
+
+// This type is no longer used and has been replaced by FieldOffset in field_offsets.go
+
+const (
+	headerSize                int          = 16
+	chunkSize                 int          = 4096
+	escCode                   byte         = 0x1B
+	startMarker               byte         = 0x02
+	endMarker                 byte         = 0x03
+	valueStartMarker          byte         = 0x1E
+	valueEndMarker            byte         = 0x1F
+	embeddedStructType        reflect.Kind = reflect.Struct // Use reflect.Struct
+	defaultIndexPreallocation uint32       = 10240          // 10KB preallocated for index by default
+	Version                   string       = "0.0.1"
+	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
+)
+
+func (db *Database[T]) nextId() uint32 {
+	db.nlock.Lock()
+	defer db.nlock.Unlock()
+	db.nextRecordID++
+	return db.nextRecordID
+}
+
+// CreateIndex creates an index for the specified field
+func (db *Database[T]) CreateIndex(fieldName string) error {
+	if db.indexManager == nil {
+		db.indexManager = NewIndexManager(db, db.layout)
+	}
+	return db.indexManager.CreateIndex(fieldName)
+}
+
+// DropIndex removes an index for the specified field
+func (db *Database[T]) DropIndex(fieldName string) error {
+	if db.indexManager == nil {
+		return nil
+	}
+	return db.indexManager.DropIndex(fieldName)
+}
+
+// Close closes the database and any open indexes
+func (db *Database[T]) Close() error {
+	// Close indexes first
+	if db.indexManager != nil {
+		if err := db.indexManager.Close(); err != nil {
+			return err
+		}
+	}
+
+	// Close file
+	return db.file.Close()
+}
+
+// Query finds all records that match a field value using an index
+func (db *Database[T]) Query(fieldName string, value interface{}) ([]T, error) {
+	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+
+	// Find matching record IDs using the index
+	recordIDs, err := db.indexManager.Query(fieldName, value)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch the actual records
+	results := make([]T, 0, len(recordIDs))
+	for _, id := range recordIDs {
+		record, err := db.Get(id)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+
+	return results, nil
+}

@@ -1,0 +1,185 @@
+package embeddb
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"sync/atomic"
+)
+
+var (
+	ErrTransactionInProgress = errors.New("transaction already in progress")
+	ErrNoTransaction         = errors.New("no transaction in progress")
+)
+
+// TransactionState represents the current state of a transaction
+type TransactionState int
+
+const (
+	// TransactionNone indicates no transaction is in progress
+	TransactionNone TransactionState = iota
+	// TransactionActive indicates a transaction is currently active
+	TransactionActive
+	// TransactionCommitted indicates a transaction has been committed
+	TransactionCommitted
+	// TransactionRolledBack indicates a transaction has been rolled back
+	TransactionRolledBack
+)
+
+// Transaction represents a database transaction
+type Transaction struct {
+	// The state of the transaction
+	state TransactionState
+	// The temporary file for the transaction
+	tempFile *os.File
+	// The temporary index for the transaction
+	tempIndex map[uint32]uint32
+	// The original header state values (not the entire header with mutex)
+	originalIndexStart    uint32
+	originalIndexEnd      uint32
+	originalNextRecordID  uint32
+	originalNextOffset    uint32
+	originalVersion       string
+	originalTocStart      uint32
+	originalEntryStart    uint32
+	originalLgIndexStart  uint32
+	originalIndexCapacity uint32
+	// Lock for the transaction
+	lock sync.RWMutex
+	// Reference to the database
+	db any
+}
+
+// beginTransaction starts a new transaction
+func (db *Database[T]) beginTransaction() error {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Check if a transaction is already in progress
+	if db.transaction != nil && db.transaction.state == TransactionActive {
+		return ErrTransactionInProgress
+	}
+
+	// Create a temporary file for the transaction
+	tempFile, err := os.CreateTemp("", "embeddb-txn-*")
+	if err != nil {
+		return fmt.Errorf("failed to create transaction temporary file: %w", err)
+	}
+
+	// Save the original header state values (not copying the mutex)
+	var originalIndexStart uint32 = db.header.indexStart
+	var originalIndexEnd uint32 = db.header.indexEnd
+	var originalNextRecordID uint32 = db.header.nextRecordID
+	var originalNextOffset uint32 = db.header.nextOffset
+	var originalVersion string = db.header.Version
+	var originalTocStart uint32 = db.header.tocStart
+	var originalEntryStart uint32 = db.header.entryStart
+	var originalLgIndexStart uint32 = db.header.lgIndexStart
+	var originalIndexCapacity uint32 = db.header.indexCapacity
+
+	// Create a copy of the current index
+	tempIndex := make(map[uint32]uint32)
+	for k, v := range db.index {
+		tempIndex[k] = v
+	}
+
+	// Create a new transaction
+	db.transaction = &Transaction{
+		state:                 TransactionActive,
+		tempFile:              tempFile,
+		tempIndex:             tempIndex,
+		originalIndexStart:    originalIndexStart,
+		originalIndexEnd:      originalIndexEnd,
+		originalNextRecordID:  originalNextRecordID,
+		originalNextOffset:    originalNextOffset,
+		originalVersion:       originalVersion,
+		originalTocStart:      originalTocStart,
+		originalEntryStart:    originalEntryStart,
+		originalLgIndexStart:  originalLgIndexStart,
+		originalIndexCapacity: originalIndexCapacity,
+		db:                    db,
+	}
+
+	return nil
+}
+
+// commitTransaction commits the current transaction
+func (db *Database[T]) commitTransaction() error {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Check if a transaction is in progress
+	if db.transaction == nil || db.transaction.state != TransactionActive {
+		return ErrNoTransaction
+	}
+
+	// Flush any pending writes
+	if err := db.file.Sync(); err != nil {
+		return fmt.Errorf("failed to flush database file: %w", err)
+	}
+
+	// Clean up the temporary file
+	if err := db.transaction.tempFile.Close(); err != nil {
+		return fmt.Errorf("failed to close transaction temporary file: %w", err)
+	}
+	if err := os.Remove(db.transaction.tempFile.Name()); err != nil {
+		return fmt.Errorf("failed to remove transaction temporary file: %w", err)
+	}
+
+	// Mark the transaction as committed
+	db.transaction.state = TransactionCommitted
+	db.transaction = nil
+
+	return nil
+}
+
+// rollbackTransaction rolls back the current transaction
+func (db *Database[T]) rollbackTransaction() error {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Check if a transaction is in progress
+	if db.transaction == nil || db.transaction.state != TransactionActive {
+		return ErrNoTransaction
+	}
+
+	// Restore the original header state values
+	atomic.StoreUint32(&db.header.indexStart, db.transaction.originalIndexStart)
+	atomic.StoreUint32(&db.header.indexEnd, db.transaction.originalIndexEnd)
+	atomic.StoreUint32(&db.header.nextRecordID, db.transaction.originalNextRecordID)
+	atomic.StoreUint32(&db.header.nextOffset, db.transaction.originalNextOffset)
+	db.header.Version = db.transaction.originalVersion
+	atomic.StoreUint32(&db.header.tocStart, db.transaction.originalTocStart)
+	atomic.StoreUint32(&db.header.entryStart, db.transaction.originalEntryStart)
+	atomic.StoreUint32(&db.header.lgIndexStart, db.transaction.originalLgIndexStart)
+	atomic.StoreUint32(&db.header.indexCapacity, db.transaction.originalIndexCapacity)
+
+	// Restore the original index
+	db.index = make(map[uint32]uint32)
+	for k, v := range db.transaction.tempIndex {
+		db.index[k] = v
+	}
+
+	// Clean up the temporary file
+	if err := db.transaction.tempFile.Close(); err != nil {
+		return fmt.Errorf("failed to close transaction temporary file: %w", err)
+	}
+	if err := os.Remove(db.transaction.tempFile.Name()); err != nil {
+		return fmt.Errorf("failed to remove transaction temporary file: %w", err)
+	}
+
+	// Mark the transaction as rolled back
+	db.transaction.state = TransactionRolledBack
+	db.transaction = nil
+
+	// Reload the memory-mapped file to reflect the rollback
+	return db.ReloadMMap()
+}
+
+// isInTransaction checks if a transaction is currently active
+func (db *Database[T]) isInTransaction() bool {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+	return db.transaction != nil && db.transaction.state == TransactionActive
+}
