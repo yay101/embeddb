@@ -179,3 +179,57 @@ func (db *Database[T]) QueryRangeBetween(fieldName string, min, max interface{},
 	}
 	return db.indexManager.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
 }
+
+// FilterFunc is a function that returns true if a record matches the filter criteria
+type FilterFunc[T any] func(record T) bool
+
+// Filter scans all records and returns those that match the filter function.
+// This performs an unindexed full table scan - use only when no index is available.
+func (db *Database[T]) Filter(fn FilterFunc[T]) ([]T, error) {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+
+	results := make([]T, 0)
+
+	for id := range db.index {
+		record, err := db.getLocked(id)
+		if err != nil {
+			continue // Skip records that can't be read
+		}
+
+		if fn(*record) {
+			results = append(results, *record)
+		}
+	}
+
+	return results, nil
+}
+
+// Scan iterates over all records, calling the callback for each.
+// This performs an unindexed full table scan - use only when no index is available.
+// The callback can return false to stop iteration early.
+func (db *Database[T]) Scan(fn func(record T) bool) error {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+
+	for id := range db.index {
+		record, err := db.getLocked(id)
+		if err != nil {
+			continue // Skip records that can't be read
+		}
+
+		if !fn(*record) {
+			break // Stop iteration if callback returns false
+		}
+	}
+
+	return nil
+}
+
+// Count returns the total number of records in the database
+func (db *Database[T]) Count() int {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+
+	return len(db.index)
+}

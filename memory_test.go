@@ -1,5 +1,9 @@
 package embeddb
 
+// Benchmark Notes:
+// These benchmarks run on a single AMD Milan core with 1GB RAM.
+// Results will vary based on hardware.
+
 import (
 	"fmt"
 	"math/rand"
@@ -279,6 +283,284 @@ func BenchmarkMemoryGet(b *testing.B) {
 
 	runtime.ReadMemStats(&stats)
 	b.ReportMetric(float64(stats.HeapAlloc), "bytes/ops(heap)")
+}
+
+func BenchmarkFilterAll(b *testing.B) {
+	rand.Seed(42)
+
+	dbPath := "bench_filter.db"
+	os.Remove(dbPath)
+	defer func() {
+		os.Remove(dbPath)
+		files, _ := os.ReadDir(".")
+		for _, f := range files {
+			if len(f.Name()) > len(dbPath) && f.Name()[:len(dbPath)] == dbPath {
+				os.Remove(f.Name())
+			}
+		}
+	}()
+
+	db, err := New[BenchmarkRecord](dbPath, false, false)
+	if err != nil {
+		b.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	// Pre-populate
+	for i := 0; i < 10000; i++ {
+		record := generateRecord(i)
+		db.Insert(record)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := db.Filter(func(r BenchmarkRecord) bool {
+			return r.Age > 0
+		})
+		if err != nil {
+			b.Fatalf("Filter failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkFilterMatch(b *testing.B) {
+	rand.Seed(42)
+
+	dbPath := "bench_filter_match.db"
+	os.Remove(dbPath)
+	defer func() {
+		os.Remove(dbPath)
+		files, _ := os.ReadDir(".")
+		for _, f := range files {
+			if len(f.Name()) > len(dbPath) && f.Name()[:len(dbPath)] == dbPath {
+				os.Remove(f.Name())
+			}
+		}
+	}()
+
+	db, err := New[BenchmarkRecord](dbPath, false, false)
+	if err != nil {
+		b.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	// Pre-populate
+	for i := 0; i < 10000; i++ {
+		record := generateRecord(i)
+		db.Insert(record)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := db.Filter(func(r BenchmarkRecord) bool {
+			return r.Age > 50 // Matches ~30% of records
+		})
+		if err != nil {
+			b.Fatalf("Filter failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkScan(b *testing.B) {
+	rand.Seed(42)
+
+	dbPath := "bench_scan.db"
+	os.Remove(dbPath)
+	defer func() {
+		os.Remove(dbPath)
+		files, _ := os.ReadDir(".")
+		for _, f := range files {
+			if len(f.Name()) > len(dbPath) && f.Name()[:len(dbPath)] == dbPath {
+				os.Remove(f.Name())
+			}
+		}
+	}()
+
+	db, err := New[BenchmarkRecord](dbPath, false, false)
+	if err != nil {
+		b.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	// Pre-populate
+	for i := 0; i < 10000; i++ {
+		record := generateRecord(i)
+		db.Insert(record)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	count := 0
+	for i := 0; i < b.N; i++ {
+		err := db.Scan(func(r BenchmarkRecord) bool {
+			count++
+			return true
+		})
+		if err != nil {
+			b.Fatalf("Scan failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkScanEarlyExit(b *testing.B) {
+	rand.Seed(42)
+
+	dbPath := "bench_scan_early.db"
+	os.Remove(dbPath)
+	defer func() {
+		os.Remove(dbPath)
+		files, _ := os.ReadDir(".")
+		for _, f := range files {
+			if len(f.Name()) > len(dbPath) && f.Name()[:len(dbPath)] == dbPath {
+				os.Remove(f.Name())
+			}
+		}
+	}()
+
+	db, err := New[BenchmarkRecord](dbPath, false, false)
+	if err != nil {
+		b.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	// Pre-populate
+	for i := 0; i < 10000; i++ {
+		record := generateRecord(i)
+		db.Insert(record)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	// Scan but stop after 100 records
+	for i := 0; i < b.N; i++ {
+		count := 0
+		err := db.Scan(func(r BenchmarkRecord) bool {
+			count++
+			return count < 100 // Early exit after 100 records
+		})
+		if err != nil {
+			b.Fatalf("Scan failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkFilterNested(b *testing.B) {
+	rand.Seed(42)
+
+	type TestRecordNested struct {
+		ID     uint32
+		Name   string
+		Age    int
+		Nested struct {
+			City string
+			Zip  int
+		}
+	}
+
+	dbPath := "bench_filter_nested.db"
+	os.Remove(dbPath)
+	defer func() {
+		os.Remove(dbPath)
+		files, _ := os.ReadDir(".")
+		for _, f := range files {
+			if len(f.Name()) > len(dbPath) && f.Name()[:len(dbPath)] == dbPath {
+				os.Remove(f.Name())
+			}
+		}
+	}()
+
+	db, err := New[TestRecordNested](dbPath, false, false)
+	if err != nil {
+		b.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	// Pre-populate
+	for i := 0; i < 10000; i++ {
+		db.Insert(&TestRecordNested{
+			ID:   uint32(i),
+			Name: fmt.Sprintf("User%d", i),
+			Age:  rand.Intn(80) + 18,
+		})
+		// Note: Nested field not set for simplicity
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := db.Filter(func(r TestRecordNested) bool {
+			return r.Age > 50
+		})
+		if err != nil {
+			b.Fatalf("Filter failed: %v", err)
+		}
+	}
+}
+
+func TestUnindexedScanBenchmarks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping benchmark test in short mode")
+	}
+
+	rand.Seed(42)
+
+	dbPath := "bench_unindexed.db"
+	os.Remove(dbPath)
+	defer cleanupTestFiles(dbPath)
+
+	db, err := New[BenchmarkRecord](dbPath, false, false)
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	// Pre-populate with 10000 records
+	for i := 0; i < 10000; i++ {
+		db.Insert(generateRecord(i))
+	}
+
+	fmt.Println("\n=== Unindexed Scan Benchmarks (10,000 records) ===")
+	fmt.Println("System: AMD Milan (1 core, 1GB RAM)")
+	fmt.Println()
+
+	// Benchmark Filter - match all
+	start := time.Now()
+	count := 0
+	db.Scan(func(r BenchmarkRecord) bool { count++; return true })
+	elapsed := time.Since(start)
+	fmt.Printf("Full scan (iterating all):    %8.2f ms (%d records)\n", float64(elapsed.Microseconds())/1000, count)
+
+	// Benchmark Filter - match some
+	start = time.Now()
+	results, _ := db.Filter(func(r BenchmarkRecord) bool { return r.Age > 50 })
+	elapsed = time.Since(start)
+	fmt.Printf("Filter (age > 50):             %8.2f ms (%d results)\n", float64(elapsed.Microseconds())/1000, len(results))
+
+	// Benchmark Scan with early exit
+	start = time.Now()
+	earlyCount := 0
+	db.Scan(func(r BenchmarkRecord) bool {
+		earlyCount++
+		return earlyCount < 100 // Stop after 100
+	})
+	elapsed = time.Since(start)
+	fmt.Printf("Scan (early exit at 100):      %8.2f ms (%d records)\n", float64(elapsed.Microseconds())/1000, earlyCount)
+
+	// Get memory stats
+	runtime.GC()
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+
+	fmt.Printf("\nHeap memory:        %s\n", formatBytes(stats.HeapAlloc))
+	fmt.Printf("Records/second:     %.0f\n", 10000/elapsed.Seconds())
+	fmt.Println()
 }
 
 func init() {

@@ -138,7 +138,14 @@ err := db.Close()
 
 ## Querying
 
-### Exact Match
+EmbedDB supports two types of queries:
+
+1. **Indexed queries** - Fast B-tree lookups on indexed fields
+2. **Unindexed queries** - Full table scans using Filter/Scan
+
+Use indexed queries when possible for best performance.
+
+### Exact Match (Indexed)
 
 ```go
 // Find all users named "Alice"
@@ -180,6 +187,61 @@ results, err := db.QueryRangeBetween("Address.ZipCode", 10000, 99999, true, true
 
 // Query embedded time in nested struct
 results, err := db.Query("Metadata.DeletedAt", time.Time{})
+```
+
+### Unindexed Queries (Full Table Scan)
+
+For fields without indexes, use `Filter` or `Scan` to perform full table scans:
+
+```go
+// Filter - returns all matching records
+results, err := db.Filter(func(u User) bool {
+    return u.Age > 18 && u.IsActive
+})
+
+// Filter with nested struct access
+results, err := db.Filter(func(u User) bool {
+    return u.Address.City == "New York"
+})
+
+// Filter with time
+results, err := db.Filter(func(u User) bool {
+    return u.CreatedAt.After(time.Now().AddDate(-1, 0, 0)) // Created in last year
+})
+
+// Scan - iterate over all records, stop early if needed
+err := db.Scan(func(u User) bool {
+    fmt.Println(u.Name)
+    return true // return false to stop iteration
+})
+
+// Count - total records in database (including soft-deleted)
+total := db.Count()
+```
+
+**Note:** Filter and Scan skip soft-deleted records automatically.
+
+### Sorting Results
+
+Use Go's built-in `sort` package - no need for database-level sorting:
+
+```go
+import "sort"
+
+results, _ := db.Filter(func(u User) bool { return u.Age > 18 })
+
+// Sort by age ascending
+sort.Slice(results, func(i, j int) bool {
+    return results[i].Age < results[j].Age
+})
+
+// Sort by multiple fields
+sort.Slice(results, func(i, j int) bool {
+    if results[i].Age != results[j].Age {
+        return results[i].Age < results[j].Age
+    }
+    return results[i].Name < results[j].Name
+})
 ```
 
 ## Index Management
