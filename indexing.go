@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -57,7 +58,7 @@ func (im *IndexManager[T]) CreateIndex(fieldName string) error {
 	}
 
 	// Create the B-tree index
-	index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, fieldOffset.Type)
+	index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, fieldOffset.Type, fieldOffset.IsTime)
 	if err != nil {
 		return fmt.Errorf("failed to create index for field '%s': %w", fieldName, err)
 	}
@@ -179,15 +180,28 @@ func (im *IndexManager[T]) BuildIndex(fieldName string) error {
 			var fieldValue interface{}
 
 			// Get the field value based on its type
+			// Important: preserve the exact type to match B-tree field type expectations
 			switch fieldOffset.Type {
 			case reflect.String:
 				fieldValue = *(*string)(fieldPtr)
-			case reflect.Int, reflect.Int32:
+			case reflect.Int:
 				fieldValue = *(*int)(fieldPtr)
+			case reflect.Int8:
+				fieldValue = *(*int8)(fieldPtr)
+			case reflect.Int16:
+				fieldValue = *(*int16)(fieldPtr)
+			case reflect.Int32:
+				fieldValue = *(*int32)(fieldPtr)
 			case reflect.Int64:
 				fieldValue = *(*int64)(fieldPtr)
-			case reflect.Uint, reflect.Uint32:
+			case reflect.Uint:
 				fieldValue = *(*uint)(fieldPtr)
+			case reflect.Uint8:
+				fieldValue = *(*uint8)(fieldPtr)
+			case reflect.Uint16:
+				fieldValue = *(*uint16)(fieldPtr)
+			case reflect.Uint32:
+				fieldValue = *(*uint32)(fieldPtr)
 			case reflect.Uint64:
 				fieldValue = *(*uint64)(fieldPtr)
 			case reflect.Float32:
@@ -196,6 +210,13 @@ func (im *IndexManager[T]) BuildIndex(fieldName string) error {
 				fieldValue = *(*float64)(fieldPtr)
 			case reflect.Bool:
 				fieldValue = *(*bool)(fieldPtr)
+			case reflect.Struct:
+				// Check if this is a time.Time field
+				if fieldOffset.IsTime {
+					fieldValue = *(*time.Time)(fieldPtr)
+				} else {
+					continue // Skip unsupported struct types
+				}
 			default:
 				continue // Skip unsupported types
 			}
@@ -246,15 +267,28 @@ func (im *IndexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 		var fieldValue interface{}
 
 		// Get the field value based on its type
+		// Important: preserve the exact type to match B-tree field type expectations
 		switch fieldOffset.Type {
 		case reflect.String:
 			fieldValue = *(*string)(fieldPtr)
-		case reflect.Int, reflect.Int32:
+		case reflect.Int:
 			fieldValue = *(*int)(fieldPtr)
+		case reflect.Int8:
+			fieldValue = *(*int8)(fieldPtr)
+		case reflect.Int16:
+			fieldValue = *(*int16)(fieldPtr)
+		case reflect.Int32:
+			fieldValue = *(*int32)(fieldPtr)
 		case reflect.Int64:
 			fieldValue = *(*int64)(fieldPtr)
-		case reflect.Uint, reflect.Uint32:
+		case reflect.Uint:
 			fieldValue = *(*uint)(fieldPtr)
+		case reflect.Uint8:
+			fieldValue = *(*uint8)(fieldPtr)
+		case reflect.Uint16:
+			fieldValue = *(*uint16)(fieldPtr)
+		case reflect.Uint32:
+			fieldValue = *(*uint32)(fieldPtr)
 		case reflect.Uint64:
 			fieldValue = *(*uint64)(fieldPtr)
 		case reflect.Float32:
@@ -263,6 +297,13 @@ func (im *IndexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 			fieldValue = *(*float64)(fieldPtr)
 		case reflect.Bool:
 			fieldValue = *(*bool)(fieldPtr)
+		case reflect.Struct:
+			// Check if this is a time.Time field
+			if fieldOffset.IsTime {
+				fieldValue = *(*time.Time)(fieldPtr)
+			} else {
+				continue // Skip unsupported struct types
+			}
 		default:
 			continue // Skip unsupported types
 		}
@@ -302,15 +343,28 @@ func (im *IndexManager[T]) RemoveFromIndexes(record *T, recordID uint32) error {
 		var fieldValue interface{}
 
 		// Get the field value based on its type
+		// Important: preserve the exact type to match B-tree field type expectations
 		switch fieldOffset.Type {
 		case reflect.String:
 			fieldValue = *(*string)(fieldPtr)
-		case reflect.Int, reflect.Int32:
+		case reflect.Int:
 			fieldValue = *(*int)(fieldPtr)
+		case reflect.Int8:
+			fieldValue = *(*int8)(fieldPtr)
+		case reflect.Int16:
+			fieldValue = *(*int16)(fieldPtr)
+		case reflect.Int32:
+			fieldValue = *(*int32)(fieldPtr)
 		case reflect.Int64:
 			fieldValue = *(*int64)(fieldPtr)
-		case reflect.Uint, reflect.Uint32:
+		case reflect.Uint:
 			fieldValue = *(*uint)(fieldPtr)
+		case reflect.Uint8:
+			fieldValue = *(*uint8)(fieldPtr)
+		case reflect.Uint16:
+			fieldValue = *(*uint16)(fieldPtr)
+		case reflect.Uint32:
+			fieldValue = *(*uint32)(fieldPtr)
 		case reflect.Uint64:
 			fieldValue = *(*uint64)(fieldPtr)
 		case reflect.Float32:
@@ -319,6 +373,13 @@ func (im *IndexManager[T]) RemoveFromIndexes(record *T, recordID uint32) error {
 			fieldValue = *(*float64)(fieldPtr)
 		case reflect.Bool:
 			fieldValue = *(*bool)(fieldPtr)
+		case reflect.Struct:
+			// Check if this is a time.Time field
+			if fieldOffset.IsTime {
+				fieldValue = *(*time.Time)(fieldPtr)
+			} else {
+				continue // Skip unsupported struct types
+			}
 		default:
 			continue // Skip unsupported types
 		}
@@ -353,8 +414,100 @@ func (im *IndexManager[T]) Query(fieldName string, value interface{}) ([]uint32,
 		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
 	}
 
+	// Flush pending writes before querying to ensure all data is in the index
+	if err := index.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush index before query: %w", err)
+	}
+
 	// Find all matching records
 	return index.Find(value)
+}
+
+// QueryRangeGreaterThan finds records where field > value (or >= if inclusive)
+func (im *IndexManager[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+	im.lock.RLock()
+	index, exists := im.indexes[fieldName]
+	im.lock.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+
+	if err := index.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush index before query: %w", err)
+	}
+
+	recordIDs, err := index.FindGreaterThan(value, inclusive)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]T, 0, len(recordIDs))
+	for _, id := range recordIDs {
+		record, err := im.db.Get(id)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+	return results, nil
+}
+
+// QueryRangeLessThan finds records where field < value (or <= if inclusive)
+func (im *IndexManager[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+	im.lock.RLock()
+	index, exists := im.indexes[fieldName]
+	im.lock.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+
+	if err := index.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush index before query: %w", err)
+	}
+
+	recordIDs, err := index.FindLessThan(value, inclusive)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]T, 0, len(recordIDs))
+	for _, id := range recordIDs {
+		record, err := im.db.Get(id)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+	return results, nil
+}
+
+// QueryRangeBetween finds records where min <= field <= max
+func (im *IndexManager[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
+	im.lock.RLock()
+	index, exists := im.indexes[fieldName]
+	im.lock.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+
+	if err := index.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush index before query: %w", err)
+	}
+
+	recordIDs, err := index.FindBetween(min, max, inclusiveMin, inclusiveMax)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]T, 0, len(recordIDs))
+	for _, id := range recordIDs {
+		record, err := im.db.Get(id)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+	return results, nil
 }
 
 // Close closes all indexes
@@ -440,7 +593,7 @@ func (im *IndexManager[T]) CheckIndexes() error {
 		}
 
 		// Try to load the index
-		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, fieldOffset.Type)
+		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, fieldOffset.Type, fieldOffset.IsTime)
 		if err != nil {
 			// If we fail to load, mark it for rebuild
 			im.pendingIndexes[fieldName] = struct{}{}
@@ -496,7 +649,7 @@ func (im *IndexManager[T]) ExtractIndexesFromDatabase() error {
 		}
 
 		// Try to load the extracted index
-		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, offset.Offset, offset.Type)
+		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, offset.Offset, offset.Type, offset.IsTime)
 		if err != nil {
 			// If we fail to load, mark it for rebuild
 			im.pendingIndexes[fieldName] = struct{}{}

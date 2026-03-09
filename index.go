@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync/atomic"
 )
@@ -30,10 +31,17 @@ func (db *Database[T]) OffsetFromID(id uint32) uint32 {
 	return db.index[id]
 }
 
+// WriteIndex writes the index to the database file.
+// This is the public API that acquires locks.
 func (db *Database[T]) WriteIndex() (err error) {
 	db.lock.Lock()
 	defer db.lock.Unlock()
+	return db.writeIndexLocked()
+}
 
+// writeIndexLocked writes the index to the database file.
+// IMPORTANT: Caller must hold db.lock before calling this method.
+func (db *Database[T]) writeIndexLocked() (err error) {
 	// Prepare a buffer for the index data
 	buf := bytes.NewBuffer(nil)
 
@@ -50,78 +58,76 @@ func (db *Database[T]) WriteIndex() (err error) {
 		buf.Write(idBytes)
 	}
 
-	// Calculate required space for the index
-	indexSize := buf.Len()
+	// Calculate required space for the index (content + markers + length header)
+	indexContentSize := buf.Len()
+	totalIndexSize := 1 + 4 + indexContentSize + 1 // startMarker + length + content + endMarker
 
-	// Check if we need to allocate more space for the index
-	if db.header.indexCapacity < uint32(indexSize) {
-		// Double the capacity to avoid frequent reallocations
-		newCapacity := uint32(indexSize) * 2
+	// Determine write position - use existing index location if it fits,
+	// otherwise write at the end of records
+	var writePosition uint32
+
+	// Check if we have an existing index location with enough capacity
+	if db.header.indexStart > 0 && db.header.indexCapacity >= uint32(totalIndexSize) {
+		// Reuse existing index location
+		writePosition = db.header.indexStart
+	} else {
+		// Need to allocate new space - write after all records
+		writePosition = db.header.nextOffset
+
+		// Calculate new capacity (double what we need, minimum defaultIndexPreallocation)
+		newCapacity := uint32(totalIndexSize) * 2
 		if newCapacity < defaultIndexPreallocation {
 			newCapacity = defaultIndexPreallocation
 		}
-
-		// Update the header with the new capacity
 		atomic.StoreUint32(&db.header.indexCapacity, newCapacity)
+
+		// Update nextOffset to be after the index area (using capacity, not actual size)
+		// This reserves space for the index to grow without moving
+		atomic.StoreUint32(&db.header.nextOffset, writePosition+newCapacity)
 	}
 
 	// Prepare the full index data with markers
 	headerBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(headerBytes, uint32(indexSize))
+	binary.BigEndian.PutUint32(headerBytes, uint32(indexContentSize))
 	indexData := slices.Concat([]byte{startMarker}, headerBytes, buf.Bytes(), []byte{endMarker})
 
-	// Decide where to write the index
-	var writePosition int64
-	if db.header.indexStart == 0 {
-		// First time writing the index - append to the file
-		fileInfo, err := db.file.Stat()
-		if err != nil {
-			return fmt.Errorf("failed to get file stats: %w", err)
-		}
-		writePosition = fileInfo.Size()
-	} else if uint32(len(indexData)) <= db.header.indexCapacity {
-		// Index fits in the preallocated space - use the existing location
-		writePosition = int64(db.header.indexStart)
-	} else {
-		// Need to move the index to the end of the file
-		fileInfo, err := db.file.Stat()
-		if err != nil {
-			return fmt.Errorf("failed to get file stats: %w", err)
-		}
-		writePosition = fileInfo.Size()
-	}
-
 	// Write the index data
-	if _, err := db.file.WriteAt(indexData, writePosition); err != nil {
+	if _, err := db.file.WriteAt(indexData, int64(writePosition)); err != nil {
 		return fmt.Errorf("failed to write index: %w", err)
 	}
 
-	// Save the previous index location before updating
-	db.header.lgIndexStart = db.header.indexStart
+	// Save the previous index location before updating (only if location changed)
+	if db.header.indexStart != writePosition {
+		db.header.lgIndexStart = db.header.indexStart
+	}
 
-	// Update the header with the new index location
-	atomic.StoreUint32(&db.header.indexStart, uint32(writePosition))
-	atomic.StoreUint32(&db.header.indexEnd, uint32(writePosition+int64(len(indexData))))
+	// Update the header with the index location
+	atomic.StoreUint32(&db.header.indexStart, writePosition)
+	atomic.StoreUint32(&db.header.indexEnd, writePosition+uint32(len(indexData)))
 
 	// Update the header on disk
-	return db.encodeHeader()
+	return db.encodeHeaderLocked()
 }
 
 func (db *Database[T]) ReadIndex() (err error) {
-	db.mlock.Lock()
-	defer db.mlock.Unlock()
-
 	// If no index has been written yet
 	if db.header.indexStart == 0 {
 		return nil
 	}
 
-	// Ensure we have a memory-mapped file
-	if db.mfile == nil {
+	// Ensure we have a memory-mapped file (ReloadMMap acquires its own lock)
+	db.mlock.RLock()
+	needsReload := db.mfile == nil
+	db.mlock.RUnlock()
+
+	if needsReload {
 		if err := db.ReloadMMap(); err != nil {
 			return fmt.Errorf("failed to reload memory-mapped file: %w", err)
 		}
 	}
+
+	db.mlock.Lock()
+	defer db.mlock.Unlock()
 
 	// Check for start marker
 	if db.mfile.At(int(db.header.indexStart)) != startMarker {
@@ -199,16 +205,22 @@ func (db *Database[T]) ReadIndex() (err error) {
 }
 
 func (db *Database[T]) Vacuum() error {
-	// Create a temporary file for the vacuum operation
-	tempFile, err := os.CreateTemp("", "embeddb-vacuum-*")
+	// Create a temporary file in the same directory as the database
+	// This ensures rename() works (can't rename across filesystems)
+	dbDir := filepath.Dir(db.file.Name())
+	tempFile, err := os.CreateTemp(dbDir, "embeddb-vacuum-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary file for vacuum: %w", err)
 	}
 	defer tempFile.Close()
 	defer os.Remove(tempFile.Name())
 
-	// Begin a transaction to ensure atomicity
-	if err := db.beginTransaction(); err != nil {
+	// Acquire lock for the entire vacuum operation
+	db.lock.Lock()
+
+	// Begin a transaction to ensure atomicity (using locked version since we hold the lock)
+	if err := db.beginTransactionLocked(); err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to begin vacuum transaction: %w", err)
 	}
 
@@ -228,13 +240,23 @@ func (db *Database[T]) Vacuum() error {
 	// Collect records that will remain after vacuum
 	keptRecords := make(map[uint32]*T)
 
-	// Process each active record
-	for id, oldOffset := range db.index {
+	// Copy the index keys to avoid holding lock while iterating
+	indexCopy := make(map[uint32]uint32)
+	for k, v := range db.index {
+		indexCopy[k] = v
+	}
+
+	// Release lock temporarily to read records (readRecordBytes needs mlock)
+	db.lock.Unlock()
+
+	// Process each active record (using copy to avoid race)
+	var vacuumErr error
+	for id, oldOffset := range indexCopy {
 		// Read the record
 		recordBytes, err := db.readRecordBytes(oldOffset)
 		if err != nil {
-			db.rollbackTransaction()
-			return fmt.Errorf("failed to read record %d during vacuum: %w", id, err)
+			vacuumErr = fmt.Errorf("failed to read record %d during vacuum: %w", id, err)
+			break
 		}
 
 		// Skip inactive records
@@ -245,8 +267,8 @@ func (db *Database[T]) Vacuum() error {
 		// Decode the record for index maintenance
 		record, err := db.decodeRecord(recordBytes)
 		if err != nil {
-			db.rollbackTransaction()
-			return fmt.Errorf("failed to decode record %d during vacuum: %w", id, err)
+			vacuumErr = fmt.Errorf("failed to decode record %d during vacuum: %w", id, err)
+			break
 		}
 
 		// Store the record for index rebuilding
@@ -254,13 +276,23 @@ func (db *Database[T]) Vacuum() error {
 
 		// Write the record to the temporary file
 		if _, err := tempFile.WriteAt(recordBytes, int64(writePos)); err != nil {
-			db.rollbackTransaction()
-			return fmt.Errorf("failed to write record %d to temporary file: %w", id, err)
+			vacuumErr = fmt.Errorf("failed to write record %d to temporary file: %w", id, err)
+			break
 		}
 
 		// Update the index
 		newIndex[id] = writePos
 		writePos += uint32(len(recordBytes))
+	}
+
+	// Re-acquire lock for the rest of the operation
+	db.lock.Lock()
+
+	// Check if there was an error during record processing
+	if vacuumErr != nil {
+		db.rollbackTransactionLocked()
+		db.lock.Unlock()
+		return vacuumErr
 	}
 
 	// Copy the original header
@@ -299,7 +331,8 @@ func (db *Database[T]) Vacuum() error {
 
 	// Write the index to the temporary file
 	if _, err := tempFile.WriteAt(indexData, int64(writePos)); err != nil {
-		db.rollbackTransaction()
+		db.rollbackTransactionLocked()
+		db.lock.Unlock()
 		return fmt.Errorf("failed to write index to temporary file: %w", err)
 	}
 
@@ -312,7 +345,8 @@ func (db *Database[T]) Vacuum() error {
 	headerBytes = make([]byte, headerSize)
 	// TODO: Write the header data to headerBytes
 	if _, err := tempFile.WriteAt(headerBytes, 0); err != nil {
-		db.rollbackTransaction()
+		db.rollbackTransactionLocked()
+		db.lock.Unlock()
 		return fmt.Errorf("failed to write header to temporary file: %w", err)
 	}
 
@@ -324,7 +358,8 @@ func (db *Database[T]) Vacuum() error {
 	}
 	db.mlock.Unlock()
 
-	db.lock.Lock()
+	// Save the original filename before closing
+	originalFileName := db.file.Name()
 	db.file.Close()
 
 	// Save existing indexes
@@ -334,35 +369,62 @@ func (db *Database[T]) Vacuum() error {
 		// Close all indexes to make sure they're saved
 		for _, index := range indexManager.indexes {
 			if err := index.Flush(); err != nil {
-				db.rollbackTransaction()
+				// Reopen the original file before rolling back
+				db.file, _ = os.OpenFile(originalFileName, os.O_RDWR, 0644)
+				db.rollbackTransactionLocked()
+				db.lock.Unlock()
 				return fmt.Errorf("failed to flush indexes: %w", err)
 			}
 		}
 	}
 
 	// Rename the temporary file to the original
-	if err := os.Rename(tempFile.Name(), db.file.Name()); err != nil {
-		db.rollbackTransaction()
+	if err := os.Rename(tempFile.Name(), originalFileName); err != nil {
+		// Reopen the original file before rolling back
+		db.file, _ = os.OpenFile(originalFileName, os.O_RDWR, 0644)
+		db.rollbackTransactionLocked()
+		db.lock.Unlock()
 		return fmt.Errorf("failed to replace original file: %w", err)
 	}
 
 	// Reopen the file
-	file, err := os.OpenFile(db.file.Name(), os.O_RDWR, 0644)
+	file, err := os.OpenFile(originalFileName, os.O_RDWR, 0644)
 	if err != nil {
-		db.rollbackTransaction()
+		db.rollbackTransactionLocked()
+		db.lock.Unlock()
 		return fmt.Errorf("failed to reopen database file: %w", err)
 	}
 
 	// Update the database
 	db.file = file
-	db.header = newHeader
+	// Update header fields individually to avoid copying the mutex
+	db.header.Version = newHeader.Version
+	db.header.indexStart = newHeader.indexStart
+	db.header.indexEnd = newHeader.indexEnd
+	db.header.nextRecordID = newHeader.nextRecordID
+	db.header.nextOffset = newHeader.nextOffset
+	db.header.tocStart = newHeader.tocStart
+	db.header.entryStart = newHeader.entryStart
+	db.header.lgIndexStart = newHeader.lgIndexStart
+	db.header.indexCapacity = newHeader.indexCapacity
 	db.index = newIndex
+
+	// Release lock before reloading mmap (ReloadMMap uses mlock)
 	db.lock.Unlock()
 
 	// Reload memory mapping
+	// Note: At this point, the file has been replaced - we can't rollback anymore
 	if err := db.ReloadMMap(); err != nil {
-		db.rollbackTransaction()
-		return fmt.Errorf("failed to reload memory mapping: %w", err)
+		// Can't rollback since file is already replaced, just return error
+		// The transaction will be cleaned up when Close() is called
+		if db.transaction != nil {
+			db.transaction.state = TransactionRolledBack
+			if db.transaction.tempFile != nil {
+				db.transaction.tempFile.Close()
+			}
+			db.transaction = nil
+		}
+		return fmt.Errorf("failed to reload memory mapping after vacuum: %w", err)
 	}
 
 	// Rebuild indexes if needed
@@ -392,5 +454,11 @@ func (db *Database[T]) Vacuum() error {
 	}
 
 	// Commit the transaction
-	return db.commitTransaction()
+	// At this point we've successfully completed the vacuum, so commit should succeed
+	if err := db.commitTransaction(); err != nil {
+		// Log but don't fail - the vacuum itself succeeded
+		fmt.Printf("Warning: failed to commit vacuum transaction: %v\n", err)
+	}
+
+	return nil
 }

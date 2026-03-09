@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 	"unsafe"
 )
 
 // FieldOffset stores the offset and type information for a field in a struct
 type FieldOffset struct {
 	Name       string
-	Offset     uintptr
+	Offset     uintptr // Absolute offset from the start of the root struct
 	Type       reflect.Kind
 	Size       uintptr
 	Primary    bool
@@ -19,6 +20,7 @@ type FieldOffset struct {
 	IsStruct   bool
 	StructType reflect.Type
 	Parent     []string // For nested structs
+	IsTime     bool     // True if the field is time.Time
 }
 
 // StructLayout contains the mapping of field byte keys to their offsets
@@ -39,10 +41,11 @@ func ComputeStructLayout(data interface{}) (*StructLayout, error) {
 
 	layout := &StructLayout{
 		FieldOffsets: make(map[byte]FieldOffset),
+		PrimaryKey:   255, // Use 255 as sentinel value meaning "no primary key"
 	}
 
 	byteKey := byte(0)
-	computeFieldOffsets(t, unsafe.Pointer(nil), &byteKey, []string{}, layout)
+	computeFieldOffsets(t, 0, &byteKey, []string{}, layout)
 
 	// Generate a simple hash of the struct layout for checking compatibility
 	var hashBuilder strings.Builder
@@ -58,7 +61,8 @@ func ComputeStructLayout(data interface{}) (*StructLayout, error) {
 }
 
 // computeFieldOffsets recursively computes the offset of each field in the struct
-func computeFieldOffsets(t reflect.Type, base unsafe.Pointer, byteKey *byte, parentPath []string, layout *StructLayout) {
+// baseOffset is the accumulated offset from the root struct to the current struct
+func computeFieldOffsets(t reflect.Type, baseOffset uintptr, byteKey *byte, parentPath []string, layout *StructLayout) {
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 
@@ -71,26 +75,32 @@ func computeFieldOffsets(t reflect.Type, base unsafe.Pointer, byteKey *byte, par
 		fieldPath := append([]string{}, parentPath...)
 		fieldPath = append(fieldPath, field.Name)
 
-		// Check for primary key tag
-		isPrimary := field.Tag.Get("db") == "id"
+		// Check for primary key tag (handles comma-separated values like "id,primary")
+		dbTag := field.Tag.Get("db")
+		isPrimary := strings.Contains(dbTag, "id") || strings.Contains(dbTag, "primary")
 		if isPrimary {
 			layout.PrimaryKey = *byteKey
 		}
 
-		// Check for unique tag
-		isUnique := field.Tag.Get("db") == "unique"
+		// Check for unique tag (handles comma-separated values like "unique,index")
+		isUnique := strings.Contains(dbTag, "unique")
+
+		// Check if this is a time.Time field
+		isTimeField := field.Type.PkgPath() == "time" && field.Type.Name() == "Time"
 
 		// Create field offset info
-		offset := field.Offset
+		// Calculate absolute offset from root struct by adding base offset
+		absoluteOffset := baseOffset + field.Offset
 		fieldOffset := FieldOffset{
 			Name:    strings.Join(fieldPath, "."),
-			Offset:  offset,
+			Offset:  absoluteOffset,
 			Type:    field.Type.Kind(),
 			Size:    field.Type.Size(),
 			Primary: isPrimary,
 			Unique:  isUnique,
 			Key:     *byteKey,
 			Parent:  parentPath,
+			IsTime:  isTimeField,
 		}
 
 		// Handle nested structs
@@ -103,7 +113,8 @@ func computeFieldOffsets(t reflect.Type, base unsafe.Pointer, byteKey *byte, par
 			*byteKey++
 
 			// Recursively process the nested struct fields
-			computeFieldOffsets(field.Type, unsafe.Add(base, offset), byteKey, fieldPath, layout)
+			// Pass the absolute offset so nested fields have correct offsets from root
+			computeFieldOffsets(field.Type, absoluteOffset, byteKey, fieldPath, layout)
 		} else {
 			// Store regular field
 			layout.FieldOffsets[*byteKey] = fieldOffset
@@ -154,6 +165,10 @@ func GetFieldValue(data interface{}, offset FieldOffset) (interface{}, error) {
 		return *(*string)(fieldPtr), nil
 	case reflect.Struct:
 		// For embedded structs, return a pointer to the struct
+		// Check if it's time.Time
+		if offset.IsTime {
+			return *(*time.Time)(fieldPtr), nil
+		}
 		return fieldPtr, nil
 	default:
 		return nil, fmt.Errorf("unsupported field type: %v", offset.Type)
@@ -162,40 +177,142 @@ func GetFieldValue(data interface{}, offset FieldOffset) (interface{}, error) {
 
 // SetFieldValue uses the field offset to directly set a field's value in the struct
 // This avoids reflection during database operations
+// Handles type conversions from decoded values (e.g., int64 -> int, uint64 -> uint32)
 func SetFieldValue(data interface{}, offset FieldOffset, value interface{}) error {
 	ptr := unsafe.Pointer(reflect.ValueOf(data).Pointer())
 	fieldPtr := unsafe.Add(ptr, offset.Offset)
 
 	switch offset.Type {
 	case reflect.Int:
-		*(*int)(fieldPtr) = value.(int)
+		// Handle conversion from int64 (varint decode result)
+		switch v := value.(type) {
+		case int64:
+			*(*int)(fieldPtr) = int(v)
+		case int:
+			*(*int)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to int", value)
+		}
 	case reflect.Int8:
-		*(*int8)(fieldPtr) = value.(int8)
+		switch v := value.(type) {
+		case int64:
+			*(*int8)(fieldPtr) = int8(v)
+		case int8:
+			*(*int8)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to int8", value)
+		}
 	case reflect.Int16:
-		*(*int16)(fieldPtr) = value.(int16)
+		switch v := value.(type) {
+		case int64:
+			*(*int16)(fieldPtr) = int16(v)
+		case int16:
+			*(*int16)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to int16", value)
+		}
 	case reflect.Int32:
-		*(*int32)(fieldPtr) = value.(int32)
+		switch v := value.(type) {
+		case int64:
+			*(*int32)(fieldPtr) = int32(v)
+		case int32:
+			*(*int32)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to int32", value)
+		}
 	case reflect.Int64:
-		*(*int64)(fieldPtr) = value.(int64)
+		switch v := value.(type) {
+		case int64:
+			*(*int64)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to int64", value)
+		}
 	case reflect.Uint:
-		*(*uint)(fieldPtr) = value.(uint)
+		// Handle conversion from uint64 (uvarint decode result)
+		switch v := value.(type) {
+		case uint64:
+			*(*uint)(fieldPtr) = uint(v)
+		case uint:
+			*(*uint)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to uint", value)
+		}
 	case reflect.Uint8:
-		*(*uint8)(fieldPtr) = value.(uint8)
+		switch v := value.(type) {
+		case uint64:
+			*(*uint8)(fieldPtr) = uint8(v)
+		case uint8:
+			*(*uint8)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to uint8", value)
+		}
 	case reflect.Uint16:
-		*(*uint16)(fieldPtr) = value.(uint16)
+		switch v := value.(type) {
+		case uint64:
+			*(*uint16)(fieldPtr) = uint16(v)
+		case uint16:
+			*(*uint16)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to uint16", value)
+		}
 	case reflect.Uint32:
-		*(*uint32)(fieldPtr) = value.(uint32)
+		switch v := value.(type) {
+		case uint64:
+			*(*uint32)(fieldPtr) = uint32(v)
+		case uint32:
+			*(*uint32)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to uint32", value)
+		}
 	case reflect.Uint64:
-		*(*uint64)(fieldPtr) = value.(uint64)
+		switch v := value.(type) {
+		case uint64:
+			*(*uint64)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to uint64", value)
+		}
 	case reflect.Float32:
-		*(*float32)(fieldPtr) = value.(float32)
+		switch v := value.(type) {
+		case float64:
+			*(*float32)(fieldPtr) = float32(v)
+		case float32:
+			*(*float32)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to float32", value)
+		}
 	case reflect.Float64:
-		*(*float64)(fieldPtr) = value.(float64)
+		switch v := value.(type) {
+		case float64:
+			*(*float64)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to float64", value)
+		}
 	case reflect.Bool:
-		*(*bool)(fieldPtr) = value.(bool)
+		switch v := value.(type) {
+		case bool:
+			*(*bool)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to bool", value)
+		}
 	case reflect.String:
-		// Strings need special handling since they're a reference type
-		*(*string)(fieldPtr) = value.(string)
+		switch v := value.(type) {
+		case string:
+			*(*string)(fieldPtr) = v
+		default:
+			return fmt.Errorf("cannot convert %T to string", value)
+		}
+	case reflect.Struct:
+		// Check if this is a time.Time field
+		if offset.IsTime {
+			switch v := value.(type) {
+			case time.Time:
+				*(*time.Time)(fieldPtr) = v
+			default:
+				return fmt.Errorf("cannot convert %T to time.Time", value)
+			}
+		} else {
+			return fmt.Errorf("unsupported struct field type: %v", offset.Type)
+		}
 	default:
 		return fmt.Errorf("unsupported field type: %v", offset.Type)
 	}

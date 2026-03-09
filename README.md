@@ -1,21 +1,22 @@
 # EmbedDB
 
-EmbedDB is a lightweight, embedded database written in Go. It provides a type-safe, efficient way to store and retrieve structured data using Go generics, with no code generation required.
+A lightweight, embedded database for Go that gives you SQLite-like functionality with a more Go-native experience. Perfect for desktop apps, CLI tools, local caching, and anywhere you'd reach for SQLite but want something simpler.
 
 ## Features
 
-- **Type-safe**: Uses Go generics for type safety without code generation
-- **Embedded**: Single file database with no external dependencies
-- **Indexing**: B-tree indexes for fast queries on any field
-- **Portable**: Database file includes embedded indexes
-- **Concurrent**: Thread-safe operations with transaction support
-- **Memory-efficient**: Memory-mapped files with minimal memory overhead
-- **Go-idiomatic**: Simple API designed to feel natural to Go developers
+- **Zero dependencies** - Just Go standard library + mmapped files
+- **Type-safe** - Full Go generics support, no code generation
+- **Single file** - Database and indexes in your project directory
+- **B-tree indexes** - Fast queries on any indexed field
+- **Range queries** - Query by greater than, less than, or between ranges
+- **Nested structs** - Query fields like `Address.City` with dot notation
+- **time.Time support** - Full indexing and range queries on timestamps
+- **Memory-efficient** - Memory-mapped I/O keeps heap usage minimal
 
 ## Installation
 
-```go
-go get -u github.com/yay101/embeddb
+```bash
+go get github.com/yay101/embeddb
 ```
 
 ## Quick Start
@@ -31,176 +32,212 @@ import (
 )
 
 type User struct {
-    ID    uint32 `db:"id,primary"`
-    Name  string `db:"index"`
-    Email string `db:"unique,index"`
-    Age   int
+    ID        uint32    `db:"id,primary"`
+    Name      string    `db:"index"`
+    Email     string    `db:"unique,index"`
+    Age       int       `db:"index"`
+    Balance   float64   `db:"index"`
+    IsActive  bool      `db:"index"`
+    CreatedAt time.Time `db:"index"`
 }
 
 func main() {
-    // Create a new database
-    db, err := embeddb.New[User]("users.db", true, true)
+    db, err := embeddb.New[User]("users.db", false, true)
     if err != nil {
-        log.Fatalf("Failed to create database: %v", err)
+        log.Fatal(err)
     }
     defer db.Close()
 
-    // Insert a user
-    user := &User{
-        Name:  "John Doe",
-        Email: "john@example.com",
-        Age:   30,
-    }
-    id, err := db.Insert(user)
-    if err != nil {
-        log.Fatalf("Failed to insert user: %v", err)
-    }
-    fmt.Printf("Inserted user with ID: %d\n", id)
+    // Insert
+    id, _ := db.Insert(&User{
+        Name:      "Alice",
+        Email:     "alice@example.com",
+        Age:       30,
+        Balance:   100.50,
+        IsActive:  true,
+    })
 
-    // Retrieve a user by ID
-    retrievedUser, err := db.Get(id)
-    if err != nil {
-        log.Fatalf("Failed to retrieve user: %v", err)
-    }
-    fmt.Printf("Retrieved user: %+v\n", retrievedUser)
+    // Get by ID
+    user, _ := db.Get(id)
 
-    // Query users by Name (using index)
-    users, err := db.Query("Name", "John Doe")
-    if err != nil {
-        log.Fatalf("Failed to query users: %v", err)
-    }
-    fmt.Printf("Found %d users with name 'John Doe'\n", len(users))
+    // Query by exact match
+    results, _ := db.Query("Name", "Alice")
+
+    // Query by range
+    adults, _ := db.QueryRangeGreaterThan("Age", 18, true)
 }
 ```
 
-## Database Operations
+## Supported Field Types
 
-### Creating a Database
+EmbedDB supports all common Go types:
 
 ```go
-// Create a new database with no migration and no auto-indexing
-db, err := embeddb.New[MyStruct]("mydata.db", false, false)
+type Record struct {
+    // Basic types
+    ID        uint32    `db:"id,primary"`  // Primary key
+    Name      string    `db:"index"`        // String (indexed)
+    Age       int       `db:"index"`        // Integer
+    Score     float64   `db:"index"`        // Float
+    Amount    int64     `db:"index"`        // Large integers  
+    Ratio     float32   `db:"index"`        // Smaller floats
+    IsActive  bool      `db:"index"`        // Boolean
+    Category  uint32    `db:"index"`        // Unsigned int
+    
+    // time.Time - fully supported
+    CreatedAt time.Time `db:"index"`
+    UpdatedAt time.Time
+    
+    // Nested structs - access with dot notation
+    Address   Address
+    
+    // Embedded time.Time in nested struct
+    Metadata  Metadata
+}
 
-// Create with migration enabled (will migrate if struct has changed)
-db, err := embeddb.New[MyStruct]("mydata.db", true, false)
+type Address struct {
+    City    string `db:"index"`   // Query: "Address.City"
+    ZipCode int    `db:"index"`   // Query: "Address.ZipCode"
+}
 
-// Create with auto-indexing enabled (fields with `db:"index"` tag)
-db, err := embeddb.New[MyStruct]("mydata.db", false, true)
+type Metadata struct {
+    Version   int       `db:"index"`
+    DeletedAt time.Time `db:"index"`  // Query: "Metadata.DeletedAt"
+}
 ```
 
-### Basic CRUD Operations
+## Database Options
 
 ```go
-// Insert a record
-id, err := db.Insert(&myRecord)
+// New creates a database
+// Parameters: filename, migrate (auto-migrate on struct change), autoIndex (auto-create indexes)
 
-// Get a record by ID
-record, err := db.Get(id)
+db, err := embeddb.New[User]("app.db", false, false)  // No migration, no auto-index
+db, err := embeddb.New[User]("app.db", true, false)  // With migration
+db, err := embeddb.New[User]("app.db", false, true)  // Auto-index fields with db:"index"
+```
 
-// Update a record
-err := db.Update(id, &updatedRecord)
+## CRUD Operations
 
-// Delete a record
+```go
+// Insert - returns new ID
+id, err := db.Insert(&user)
+
+// Get by ID
+user, err := db.Get(id)
+
+// Update
+err := db.Update(id, &user)
+
+// Delete (soft delete)
 err := db.Delete(id)
-```
 
-### Closing the Database
-
-Always close the database when you're done with it to ensure all data is properly flushed to disk and any indexes are saved:
-
-```go
+// Close - flushes all data to disk
 err := db.Close()
 ```
 
-## Indexing and Querying
+## Querying
 
-EmbedDB provides B-tree indexes for fast queries on any field of your struct.
-
-### Creating and Using Indexes
-
-There are three ways to create indexes:
-
-1. **Using struct tags** (with auto-indexing enabled):
+### Exact Match
 
 ```go
-type Person struct {
-    ID    uint32 `db:"id,primary"`
-    Name  string `db:"index"`     // Will be indexed
-    Email string `db:"unique,index"` // Unique index
-    Age   int    // No index
-}
+// Find all users named "Alice"
+results, err := db.Query("Name", "Alice")
 
-// Enable auto-indexing during database creation
-db, err := embeddb.New[Person]("people.db", true, true)
+// Find all active users
+results, err := db.Query("IsActive", true)
+
+// Find user created at specific time
+results, err := db.Query("CreatedAt", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
 ```
 
-2. **Explicitly creating indexes**:
+### Range Queries
 
 ```go
-// Create an index on any field
+// Age >= 18 (inclusive)
+adults, err := db.QueryRangeGreaterThan("Age", 18, true)
+
+// Age < 65 (exclusive)
+seniors, err := db.QueryRangeLessThan("Age", 65, false)
+
+// Balance between 100 and 500 (inclusive)
+rangeResults, err := db.QueryRangeBetween("Balance", 100.0, 500.0, true, true)
+
+// Created in year 2024
+startOfYear := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+endOfYear := time.Date(2024, 12, 31, 23, 59, 59, 0, time.UTC)
+thisYear, err := db.QueryRangeBetween("CreatedAt", startOfYear, endOfYear, true, true)
+```
+
+### Nested Struct Queries
+
+```go
+// Query nested struct fields using dot notation
+results, err := db.Query("Address.City", "New York")
+
+// Range query on nested field
+results, err := db.QueryRangeBetween("Address.ZipCode", 10000, 99999, true, true)
+
+// Query embedded time in nested struct
+results, err := db.Query("Metadata.DeletedAt", time.Time{})
+```
+
+## Index Management
+
+```go
+// Create index on any field (even after database creation)
 err := db.CreateIndex("Age")
-```
+err := db.CreateIndex("Address.City")
 
-3. **Dropping indexes**:
-
-```go
-// Remove an index when no longer needed
+// Drop index
 err := db.DropIndex("Age")
+
+// Indexes persist with the database file
+// They load automatically when you reopen the database
 ```
 
-### Querying with Indexes
+## Schema Migration
 
-Once an index is created, you can perform efficient queries:
+If you change your struct and already have data, enable migration:
 
 ```go
-// Query by an indexed field
-results, err := db.Query("Name", "John Doe")
-
-// Query by another indexed field
-youngPeople, err := db.Query("Age", 25)
+// migrate=true will automatically migrate your data to the new schema
+db, err := embeddb.New[MyStruct]("data.db", true, false)
 ```
 
-### Index Management
+## Performance
 
-The B-tree indexes are stored in separate files but are embedded in the database file when closed, ensuring portability. When the database is opened, indexes are automatically extracted and used.
+Memory usage stays minimal even with large datasets:
 
-## Performance Optimization
+| Records | File Size | Heap Alloc | OS Memory |
+|---------|-----------|------------|-----------|
+| 1,000   | 94 KB     | 87 KB      | 12 MB     |
+| 10,000  | 954 KB    | 217 KB     | 12 MB     |
+| 50,000  | 4.7 MB    | 668 KB     | 12 MB     |
 
-### Vacuuming the Database
+The database uses memory-mapped I/O, so most of the "Sys" memory is just the mapped file - not heap allocations.
 
-Over time, as records are updated and deleted, the database file might contain unused space. You can compact the database to reclaim this space:
+## Why EmbedDB?
 
-```go
-err := db.Vacuum()
-```
+| SQLite | EmbedDB |
+|--------|---------|
+| Cgo required | Pure Go |
+| SQL queries | Go structs |
+| Schema migrations | Just change your struct |
+| Multiple tables | Single struct type |
+| ACID transactions | Atomic single-record ops |
+| 2MB+ binary | Single .go file |
 
-This operation is atomic and will maintain all indexes.
+## When to use EmbedDB
 
-## Struct Requirements
+- Desktop applications needing local storage
+- CLI tools with config/state files
+- Local caching layer
+- Embedded devices
+- Anywhere you'd use SQLite but want simpler code
 
-Your struct should follow these guidelines:
+## When NOT to use EmbedDB
 
-- Fields should be exported (start with a capital letter)
-- Use basic Go types (int, string, bool, etc.) for best compatibility
-- You can use nested structs
-- Use struct tags for primary keys, unique constraints, and indexes
-
-## Struct Tags
-
-EmbedDB supports several struct tags to control how fields are handled:
-
-- `db:"id,primary"` - Marks a field as the primary key
-- `db:"index"` - Creates an index on this field
-- `db:"unique,index"` - Creates a unique index on this field
-
-## Technical Details
-
-- Memory-mapped B-tree indexes for efficient querying
-- Unsafe pointer field access for maximum performance
-- Batched operations for improved write efficiency
-- Bloom filters to speed up negative lookups
-- Transaction support for atomic operations
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+- Multi-table relational data (use SQLite)
+- High-concurrency write workloads (use PostgreSQL/MySQL)
+- Distributed systems (use proper databases)

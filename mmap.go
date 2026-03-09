@@ -9,8 +9,8 @@ import (
 )
 
 func (db *Database[T]) ReloadMMap() error {
-	db.lock.Lock()
-	defer db.lock.Unlock()
+	db.mlock.Lock()
+	defer db.mlock.Unlock()
 	if db.mfile != nil {
 		db.mfile.Close()
 	}

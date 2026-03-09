@@ -59,6 +59,13 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 			db.Close()
 			return nil, fmt.Errorf("failed to write header: %w", err)
 		}
+
+		// Auto-index fields if requested (for new files)
+		if autoIndex {
+			if err := db.autoIndexFields(); err != nil {
+				fmt.Printf("Warning: failed to auto-index fields: %v\n", err)
+			}
+		}
 	} else {
 		// Read the existing header
 		if err := db.decodeHeader(); err != nil {
@@ -198,18 +205,17 @@ func (db *Database[T]) Insert(record *T) (uint32, error) {
 		}
 	}()
 
-	// Lock for thread safety
-	db.lock.Lock()
-	defer db.lock.Unlock()
-
-	// Get the next record ID
+	// Get the next record ID (has its own lock)
 	newRecordId = db.nextId()
 
-	// 1. Encode the record into the binary format.
+	// 1. Encode the record into the binary format (no lock needed).
 	encoded, err := db.encodeRecord(record)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode record: %w", err)
 	}
+
+	// Lock for the critical section of writing to file and updating index
+	db.lock.Lock()
 
 	// 2. Write the record header (escCode, startMarker, ID, length, active)
 	headerBytes := make([]byte, 11)
@@ -247,23 +253,31 @@ func (db *Database[T]) Insert(record *T) (uint32, error) {
 	// 5. Update the next offset
 	db.header.nextOffset += uint32(len(completeRecord))
 
-	// 6. Write the updated index
-	if err := db.WriteIndex(); err != nil {
-		return 0, fmt.Errorf("failed to update index: %w", err)
-	}
+	// 6. Index is kept in memory - will be persisted on Close() or Sync()
+	// This avoids O(n^2) file growth from writing the full index on every insert
 
 	// 7. Update any indexes
 	if db.indexManager != nil {
 		if err := db.indexManager.InsertIntoIndexes(record, newRecordId); err != nil {
+			db.lock.Unlock()
 			return 0, fmt.Errorf("failed to update indexes: %w", err)
 		}
 	}
+
+	// Release lock before calling commit (which acquires its own lock)
+	db.lock.Unlock()
 
 	// Commit the transaction
 	if err := db.commitTransaction(); err != nil {
 		return 0, fmt.Errorf("failed to commit insert transaction: %w", err)
 	}
 	committed = true
+
+	// Reload mmap to ensure subsequent reads can see the new data
+	if err := db.ReloadMMap(); err != nil {
+		// Log but don't fail - the insert succeeded
+		fmt.Printf("Warning: failed to reload mmap after insert: %v\n", err)
+	}
 
 	return newRecordId, nil
 }
@@ -286,6 +300,12 @@ func (db *Database[T]) Get(id uint32) (*T, error) {
 	db.lock.RLock()
 	defer db.lock.RUnlock()
 
+	return db.getLocked(id)
+}
+
+// getLocked retrieves a record without acquiring locks.
+// IMPORTANT: Caller must hold db.lock (read or write) before calling this method.
+func (db *Database[T]) getLocked(id uint32) (*T, error) {
 	// 1. Look up the record offset in the index
 	offset, exists := db.index[id]
 	if !exists {
@@ -334,11 +354,11 @@ func (db *Database[T]) Delete(id uint32) error {
 	}()
 
 	db.lock.Lock()
-	defer db.lock.Unlock()
 
 	// Check if the record exists
 	offset, exists := db.index[id]
 	if !exists {
+		db.lock.Unlock()
 		return fmt.Errorf("record with id %d not found", id)
 	}
 
@@ -350,12 +370,15 @@ func (db *Database[T]) Delete(id uint32) error {
 
 	if !isActiveRecord(recordBytes) {
 		// Record is already deleted
+		db.lock.Unlock()
 		return nil
 	}
 
 	// Get the record for index updates before marking it inactive
-	record, err := db.Get(id)
+	// Use getLocked since we already hold the lock
+	record, err := db.getLocked(id)
 	if err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to get record for index updates: %w", err)
 	}
 
@@ -365,6 +388,7 @@ func (db *Database[T]) Delete(id uint32) error {
 	// Write the inactive flag
 	_, err = db.file.WriteAt([]byte{inactiveFlag}, int64(offset+10))
 	if err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to mark record as deleted: %w", err)
 	}
 
@@ -372,22 +396,32 @@ func (db *Database[T]) Delete(id uint32) error {
 	// Alternative approach could be to remove it from the index
 
 	// Write the updated index
-	if err := db.WriteIndex(); err != nil {
+	if err := db.writeIndexLocked(); err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to update index: %w", err)
 	}
 
 	// Update any indexes
 	if db.indexManager != nil && record != nil {
 		if err := db.indexManager.RemoveFromIndexes(record, id); err != nil {
+			db.lock.Unlock()
 			return fmt.Errorf("failed to update indexes: %w", err)
 		}
 	}
+
+	// Release lock before calling commit
+	db.lock.Unlock()
 
 	// Commit the transaction
 	if err := db.commitTransaction(); err != nil {
 		return fmt.Errorf("failed to commit delete transaction: %w", err)
 	}
 	committed = true
+
+	// Reload mmap to ensure subsequent reads see the updated data
+	if err := db.ReloadMMap(); err != nil {
+		fmt.Printf("Warning: failed to reload mmap after delete: %v\n", err)
+	}
 
 	return nil
 }
@@ -423,11 +457,11 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 	}()
 
 	db.lock.Lock()
-	defer db.lock.Unlock()
 
 	// Check if the record exists
 	oldOffset, exists := db.index[id]
 	if !exists {
+		db.lock.Unlock()
 		return fmt.Errorf("record with id %d not found", id)
 	}
 
@@ -438,12 +472,14 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 	}
 
 	if !isActiveRecord(oldBytes) {
+		db.lock.Unlock()
 		return fmt.Errorf("cannot update inactive record with id %d", id)
 	}
 
-	// Get the old record for index updates
-	oldRecord, err := db.Get(id)
+	// Get the old record for index updates (use getLocked since we hold lock)
+	oldRecord, err := db.getLocked(id)
 	if err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to get old record for index updates: %w", err)
 	}
 
@@ -451,12 +487,14 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 	// This modifies just the active byte at offset+10
 	_, err = db.file.WriteAt([]byte{0}, int64(oldOffset+10))
 	if err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to mark old record as inactive: %w", err)
 	}
 
 	// Encode the updated record
 	encoded, err := db.encodeRecord(record)
 	if err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to encode record: %w", err)
 	}
 
@@ -496,23 +534,30 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 	// Update the next offset
 	db.header.nextOffset += uint32(len(completeRecord))
 
-	// Write the updated index
-	if err := db.WriteIndex(); err != nil {
-		return fmt.Errorf("failed to update index: %w", err)
-	}
+	// Index is kept in memory - will be persisted on Close() or Sync()
+	// This avoids O(n^2) file growth from writing the full index on every update
 
 	// Update any indexes
 	if db.indexManager != nil && oldRecord != nil {
 		if err := db.indexManager.UpdateInIndexes(oldRecord, record, id); err != nil {
+			db.lock.Unlock()
 			return fmt.Errorf("failed to update indexes: %w", err)
 		}
 	}
+
+	// Release lock before calling commit
+	db.lock.Unlock()
 
 	// Commit the transaction
 	if err := db.commitTransaction(); err != nil {
 		return fmt.Errorf("failed to commit update transaction: %w", err)
 	}
 	committed = true
+
+	// Reload mmap to ensure subsequent reads see the updated data
+	if err := db.ReloadMMap(); err != nil {
+		fmt.Printf("Warning: failed to reload mmap after update: %v\n", err)
+	}
 
 	return nil
 }

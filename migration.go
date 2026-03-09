@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"sync"
+	"time"
 )
 
 // MigrationOptions contains options for schema migration
@@ -170,14 +172,16 @@ func (db *Database[T]) MigrateWithOptions(oldLayout *StructLayout, opts Migratio
 
 // readRecordBytes reads the raw bytes of a record at the given offset
 func (db *Database[T]) readRecordBytes(offset uint32) ([]byte, error) {
-	db.mlock.RLock()
-	defer db.mlock.RUnlock()
-
+	// Check if mmap needs to be loaded before acquiring read lock
+	// (ReloadMMap acquires write lock, so we can't call it while holding read lock)
 	if db.mfile == nil {
 		if err := db.ReloadMMap(); err != nil {
 			return nil, err
 		}
 	}
+
+	db.mlock.RLock()
+	defer db.mlock.RUnlock()
 
 	// First, determine the length of the record
 	// Read the length bytes (4 bytes at offset+6)
@@ -244,8 +248,22 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 	// Create a new instance of T
 	record := new(T)
 
-	// Skip the header (first 11 bytes)
+	// Extract the ID from the header before skipping it
 	// Header: [escCode,startMarker](2) + id(4) + length(4) + active(1)
+	recordID := binary.BigEndian.Uint32(data[2:6])
+
+	// If there's a primary key field, set the ID
+	if layout.PrimaryKey < 255 {
+		if pkField, exists := layout.FieldOffsets[layout.PrimaryKey]; exists {
+			// Set the primary key field value
+			// Pass as uint32 directly since that's what we read from the header
+			if err := SetFieldValue(record, pkField, uint32(recordID)); err != nil {
+				return nil, fmt.Errorf("failed to set primary key field: %w", err)
+			}
+		}
+	}
+
+	// Skip the header (first 11 bytes)
 	data = data[11:]
 
 	// Remove the end marker (last 2 bytes)
@@ -279,6 +297,17 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 			continue
 		}
 
+		// Skip primary key field - it's already set from the record header
+		if fieldOffset.Primary {
+			// Find the value end marker and skip
+			endIdx := bytes.IndexByte(data, valueEndMarker)
+			if endIdx == -1 {
+				return nil, errors.New("invalid record format: missing value end marker for primary key")
+			}
+			data = data[endIdx+1:]
+			continue
+		}
+
 		// Decode the field value based on its type
 		var value interface{}
 		var err error
@@ -302,36 +331,50 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 			value, data, err = decodeBool(data)
 		case reflect.Struct:
 			// For embedded structs, we need to handle them differently
-			// This is a simplified implementation
-			if !fieldOffset.IsStruct {
+			// Check if this is a time.Time field
+			if fieldOffset.IsTime {
+				// time.Time is stored as int64 (Unix nanoseconds)
+				unixNanoVal, remaining, decodeErr := decodeVarint(data)
+				if decodeErr != nil {
+					err = decodeErr
+					break
+				}
+				unixNano, ok := unixNanoVal.(int64)
+				if !ok {
+					err = fmt.Errorf("invalid time value: expected int64")
+					break
+				}
+				value = time.Unix(0, unixNano)
+				data = remaining
+			} else if fieldOffset.IsStruct {
+				// Read the length of the embedded struct
+				length, remaining, decodeErr := decodeUvarint(data)
+				if decodeErr != nil {
+					err = decodeErr
+					break
+				}
+
+				// Extract the embedded struct data
+				if len(remaining) < int(length.(uint64)) {
+					err = errors.New("invalid record: embedded struct data too short")
+					break
+				}
+
+				// Skip processing the embedded struct for now
+				// In a real implementation, you'd recursively decode the struct
+				data = remaining[int(length.(uint64)):]
+
+				// Skip the value end marker
+				if len(data) > 0 && data[0] == valueEndMarker {
+					data = data[1:]
+				} else {
+					err = errors.New("invalid record: missing value end marker after embedded struct")
+				}
+				continue
+			} else {
 				err = fmt.Errorf("field %s is marked as struct but IsStruct is false", fieldOffset.Name)
 				break
 			}
-
-			// Read the length of the embedded struct
-			length, remaining, decodeErr := decodeUvarint(data)
-			if decodeErr != nil {
-				err = decodeErr
-				break
-			}
-
-			// Extract the embedded struct data
-			if len(remaining) < int(length.(uint64)) {
-				err = errors.New("invalid record: embedded struct data too short")
-				break
-			}
-
-			// Skip processing the embedded struct for now
-			// In a real implementation, you'd recursively decode the struct
-			data = remaining[int(length.(uint64)):]
-
-			// Skip the value end marker
-			if len(data) > 0 && data[0] == valueEndMarker {
-				data = data[1:]
-			} else {
-				err = errors.New("invalid record: missing value end marker after embedded struct")
-			}
-			continue
 		default:
 			err = fmt.Errorf("unsupported field type: %v", fieldOffset.Type)
 		}
@@ -341,7 +384,8 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 		}
 
 		// Set the field value using the unsafe pointer
-		if fieldOffset.Type != reflect.Struct {
+		// For time.Time fields (which are structs with IsTime=true), we need to set the value too
+		if fieldOffset.Type != reflect.Struct || fieldOffset.IsTime {
 			err = SetFieldValue(record, fieldOffset, value)
 			if err != nil {
 				return nil, fmt.Errorf("failed to set field %s: %w", fieldOffset.Name, err)
@@ -360,26 +404,33 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 }
 
 // encodeRecordWithLayout encodes a record using the specified struct layout
+// This only encodes the field data, NOT the record wrapper (header/footer).
+// The caller (Insert/Update) is responsible for adding the record header and footer.
 func (db *Database[T]) encodeRecordWithLayout(record *T, layout *StructLayout) ([]byte, error) {
 	var buffer []byte
 
-	// Start with the record markers and header
-	// We'll fill in the length later
-	buffer = append(buffer, escCode, startMarker)
+	// Get sorted keys for deterministic field order
+	keys := make([]byte, 0, len(layout.FieldOffsets))
+	for key := range layout.FieldOffsets {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 
-	// Add placeholder for ID (4 bytes)
-	idBytes := make([]byte, 4)
-	buffer = append(buffer, idBytes...)
+	// Encode each field in sorted key order
+	for _, key := range keys {
+		fieldOffset := layout.FieldOffsets[key]
+		// Skip struct container fields - we only encode the leaf fields
+		// The nested struct's fields are already expanded in the layout
+		// Exception: time.Time fields need to be encoded
+		if fieldOffset.IsStruct && !fieldOffset.IsTime {
+			continue
+		}
 
-	// Add placeholder for length (4 bytes)
-	lengthBytes := make([]byte, 4)
-	buffer = append(buffer, lengthBytes...)
+		// Skip primary key field - it's stored in the record header, not the data
+		if fieldOffset.Primary {
+			continue
+		}
 
-	// Set the active flag (1 byte)
-	buffer = append(buffer, 1) // 1 = active
-
-	// Encode each field
-	for key, fieldOffset := range layout.FieldOffsets {
 		// Add the field key and start marker
 		buffer = append(buffer, key, valueStartMarker)
 
@@ -405,21 +456,29 @@ func (db *Database[T]) encodeRecordWithLayout(record *T, layout *StructLayout) (
 			bits := math.Float64bits(floatValue)
 			buffer = encodeUvarint(buffer, bits)
 		case reflect.String:
-			strValue := value.(string)
+			strValue, ok := value.(string)
+			if !ok {
+				strValue = ""
+			}
 			buffer = encodeString(buffer, strValue)
 		case reflect.Bool:
-			boolValue := value.(bool)
+			boolValue, ok := value.(bool)
+			if !ok {
+				boolValue = false
+			}
 			buffer = encodeBool(buffer, boolValue)
 		case reflect.Struct:
-			// For embedded structs, we need special handling
-			// This is a simplified implementation
-			if !fieldOffset.IsStruct {
-				return nil, fmt.Errorf("field %s is marked as struct but IsStruct is false", fieldOffset.Name)
+			// Check if this is a time.Time field
+			if fieldOffset.IsTime {
+				timeValue, ok := value.(time.Time)
+				if !ok {
+					return nil, fmt.Errorf("field %s is marked as time.Time but value is not time.Time", fieldOffset.Name)
+				}
+				// Store as int64 (Unix nanoseconds)
+				buffer = encodeVarint(buffer, timeValue.UnixNano())
+			} else {
+				return nil, fmt.Errorf("unsupported struct field type: %s", fieldOffset.Name)
 			}
-
-			// Placeholder for now
-			// In a real implementation, you'd recursively encode the struct
-			buffer = encodeUvarint(buffer, uint64(0)) // Empty struct for now
 		default:
 			return nil, fmt.Errorf("unsupported field type: %v", fieldOffset.Type)
 		}
@@ -427,13 +486,6 @@ func (db *Database[T]) encodeRecordWithLayout(record *T, layout *StructLayout) (
 		// Add the value end marker
 		buffer = append(buffer, valueEndMarker)
 	}
-
-	// Add the record end marker
-	buffer = append(buffer, escCode, endMarker)
-
-	// Calculate and fill in the record data length (excluding the header and markers)
-	dataLength := uint32(len(buffer) - 11 - 2) // 11 bytes header, 2 bytes footer
-	binary.BigEndian.PutUint32(buffer[6:10], dataLength)
 
 	return buffer, nil
 }

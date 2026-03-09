@@ -8,11 +8,26 @@ import (
 
 // Version constant is now defined in main.go
 
+// Header format (expanded to 32 bytes):
+// [Version (3 bytes)] [tocStart (4 bytes)] [indexStart (4 bytes)] [entryStart (4 bytes)]
+// [nextOffset (4 bytes)] [nextRecordID (4 bytes)] [indexCapacity (4 bytes)] [lgIndexStart (4 bytes)] [reserved (1 byte)]
+// Total: 32 bytes
+
+// encodeHeader writes the header to the database file.
+// This is the public API that acquires locks.
 func (db *Database[T]) encodeHeader() error {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+	return db.encodeHeaderLocked()
+}
+
+// encodeHeaderLocked writes the header to the database file.
+// IMPORTANT: Caller must hold db.lock before calling this method.
+func (db *Database[T]) encodeHeaderLocked() error {
 	// Prepare byte slice for version (major, minor, patch).
 	vb := make([]byte, 3)
 	// Initialize the buffer for the full header bytes.
-	hb := []byte{}
+	hb := make([]byte, 0, headerSize)
 	// Prepare byte slice for 32-bit unsigned integers (used for offsets).
 	ub := make([]byte, 4)
 
@@ -43,15 +58,33 @@ func (db *Database[T]) encodeHeader() error {
 	binary.BigEndian.PutUint32(ub, db.header.entryStart)
 	// Append the encoded entryStart (4 bytes) to the header buffer.
 	hb = append(hb, ub...)
-	// Acquire a lock to ensure exclusive access to the database file.
-	db.lock.Lock()
-	defer db.lock.Unlock()
+
+	// Encode the nextOffset (uint32) in BigEndian.
+	binary.BigEndian.PutUint32(ub, db.header.nextOffset)
+	// Append the encoded nextOffset (4 bytes) to the header buffer.
+	hb = append(hb, ub...)
+
+	// Encode the nextRecordID (uint32) in BigEndian.
+	binary.BigEndian.PutUint32(ub, db.nextRecordID)
+	// Append the encoded nextRecordID (4 bytes) to the header buffer.
+	hb = append(hb, ub...)
+
+	// Encode the indexCapacity (uint32) in BigEndian.
+	binary.BigEndian.PutUint32(ub, db.header.indexCapacity)
+	// Append the encoded indexCapacity (4 bytes) to the header buffer.
+	hb = append(hb, ub...)
+
+	// Encode the lgIndexStart (uint32) in BigEndian.
+	binary.BigEndian.PutUint32(ub, db.header.lgIndexStart)
+	// Append the encoded lgIndexStart (4 bytes) to the header buffer.
+	hb = append(hb, ub...)
+
+	// Add reserved byte for future expansion
+	hb = append(hb, 0)
+
 	// Write the complete header buffer to the beginning of the file (offset 0).
-	// The header structure is:
-	// [Version (3 bytes)] [tocStart (4 bytes)] [indexStart (4 bytes)] [entryStart (4 bytes)]
-	// Total header size written is 3 + 4 + 4 + 4 = 15 bytes.
+	// Total header size written is 32 bytes.
 	_, err := db.file.WriteAt(hb, 0)
-	// Release the lock after writing is complete.
 
 	if err != nil {
 		return err
@@ -61,16 +94,21 @@ func (db *Database[T]) encodeHeader() error {
 	return nil
 }
 
+// decodeHeader reads the header from the database file.
+// This is the public API that acquires locks.
 func (db *Database[T]) decodeHeader() error {
-	// Acquire a lock to ensure exclusive access to the database file.
 	db.lock.Lock()
-	// Prepare a byte slice to read the header. The expected header size is 15 bytes,
-	// but we allocate 16 to simplify indexing.
-	hb := make([]byte, 16)
+	defer db.lock.Unlock()
+	return db.decodeHeaderLocked()
+}
+
+// decodeHeaderLocked reads the header from the database file.
+// IMPORTANT: Caller must hold db.lock before calling this method.
+func (db *Database[T]) decodeHeaderLocked() error {
+	// Prepare a byte slice to read the header (32 bytes).
+	hb := make([]byte, headerSize)
 	// Read the header bytes from the beginning of the file (offset 0).
 	_, err := db.file.ReadAt(hb, 0)
-	// Release the lock after reading is complete.
-	db.lock.Unlock()
 	if err != nil {
 		// Return the error if reading fails.
 		return err
@@ -91,16 +129,29 @@ func (db *Database[T]) decodeHeader() error {
 
 	// Lock the header for writing.
 	db.header.lock.Lock()
-	// Ensure the header lock is released when the function exits.
 	defer db.header.lock.Unlock()
 
-	// Assign the decoded header values to the database header structure.
-	db.header = DBHeader{
-		Version:    version,                            // Decoded version string.
-		tocStart:   binary.BigEndian.Uint32(hb[3:7]),   // Decode Table of Contents start offset (bytes 3-7).
-		indexStart: binary.BigEndian.Uint32(hb[7:11]),  // Decode Index start offset (bytes 7-11).
-		entryStart: binary.BigEndian.Uint32(hb[11:15]), // Decode Entry start offset (bytes 11-15).
-		// Note: The original header is 15 bytes. The buffer was 16, which is fine for indexing.
+	// Update header fields individually to preserve the mutex
+	// DO NOT replace the entire struct as that would replace the mutex
+	db.header.Version = version
+	db.header.tocStart = binary.BigEndian.Uint32(hb[3:7])
+	db.header.indexStart = binary.BigEndian.Uint32(hb[7:11])
+	db.header.entryStart = binary.BigEndian.Uint32(hb[11:15])
+	db.header.nextOffset = binary.BigEndian.Uint32(hb[15:19])
+	db.header.indexCapacity = binary.BigEndian.Uint32(hb[23:27])
+	db.header.lgIndexStart = binary.BigEndian.Uint32(hb[27:31])
+
+	// Read nextRecordID and set it on the database
+	db.nextRecordID = binary.BigEndian.Uint32(hb[19:23])
+
+	// If nextOffset is 0 (old format), initialize it to after header
+	if db.header.nextOffset == 0 {
+		db.header.nextOffset = uint32(headerSize)
+	}
+
+	// If nextRecordID is 0, start at 1
+	if db.nextRecordID == 0 {
+		db.nextRecordID = 1
 	}
 
 	// Return nil to indicate successful decoding.

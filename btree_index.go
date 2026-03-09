@@ -10,13 +10,49 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
+	"unicode"
 
 	"golang.org/x/exp/mmap"
 )
 
+// normalizeString converts a string to lowercase and removes special characters
+// for case-insensitive, punctuation-insensitive searching.
+// This allows searching for "fox" to match "The Quick Brown Fox!"
+func normalizeString(s string) string {
+	var result strings.Builder
+	result.Grow(len(s))
+
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			result.WriteRune(unicode.ToLower(r))
+		} else if unicode.IsSpace(r) {
+			result.WriteRune(' ')
+		}
+		// Skip punctuation and other special characters
+	}
+
+	// Trim leading/trailing spaces and collapse multiple spaces
+	normalized := strings.Join(strings.Fields(result.String()), " ")
+	return normalized
+}
+
+// tokenizeString splits a normalized string into individual words for token-based search
+func tokenizeString(s string) []string {
+	normalized := normalizeString(s)
+	if normalized == "" {
+		return nil
+	}
+	return strings.Fields(normalized)
+}
+
 const (
 	// B-tree parameters
-	BTreeOrder     = 100  // Maximum number of keys per node
+	// BTreeOrder reduced to 32 to ensure nodes don't overflow with variable-size
+	// string keys and multiple values per key. With 4KB pages:
+	// - ~128 bytes per key slot (key + values + overhead)
+	// - 32 keys * 128 bytes = 4KB
+	BTreeOrder     = 32   // Maximum number of keys per node
 	BTreePageSize  = 4096 // Size of each page in bytes
 	BTreeHeaderLen = 4096 // Size of the B-tree header page
 
@@ -25,10 +61,31 @@ const (
 	BTreePageTypeInternal = 2
 	BTreePageTypeFree     = 3
 	BTreePageTypeHeader   = 4
+	BTreePageTypeOverflow = 5 // Overflow page for large value lists
 
 	// Bloom filter size in bytes (512 bits for quick checks)
 	BloomFilterSize = 64
+
+	// Maximum values per key before using overflow pages
+	// Each value is 4 bytes (uint32), plus 2 bytes for count, plus 1 byte flag
+	// With BTreeOrder=100 keys per node and 4KB page size, we need to be conservative
+	// 4096 bytes / 100 keys = ~40 bytes per key for values
+	// (40 - 3 overhead) / 4 bytes per value = ~9 values max per key inline
+	// Use 8 to leave room for key data and other overhead
+	MaxInlineValues = 8
+
+	// Overflow page header: next page pointer (4 bytes) + value count (2 bytes)
+	OverflowHeaderSize = 6
+	// Values per overflow page: (4096 - 6) / 4 = 1022
+	ValuesPerOverflowPage = (BTreePageSize - OverflowHeaderSize) / 4
 )
+
+func boolToUint8(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 // BTreeIndex represents a memory-mapped B-tree index for a specific field
 type BTreeIndex struct {
@@ -41,6 +98,7 @@ type BTreeIndex struct {
 	fieldName     string         // Name of the indexed field
 	fieldOffset   uintptr        // Offset of the field in the struct
 	fieldType     reflect.Kind   // Type of the indexed field
+	isTimeField   bool           // True if the field is time.Time
 	keySize       int            // Size of fixed-size keys, -1 for variable-sized keys
 	dbFileName    string         // Name of the database file (for portability)
 	pendingWrites []pendingWrite // Buffer for batched writes
@@ -53,6 +111,7 @@ type BTreeHeader struct {
 	FieldNameLen uint16    // Length of the field name
 	FieldName    [256]byte // Field name (null-terminated)
 	FieldType    uint16    // Type of the indexed field
+	IsTimeField  uint8     // 1 if the field is time.Time
 	RootPageNum  uint32    // Page number of the root node
 	PageCount    uint32    // Total number of pages in the file
 	FreeListHead uint32    // First page in the free list
@@ -61,13 +120,21 @@ type BTreeHeader struct {
 
 // BTreeNode represents a node in the B-tree
 type BTreeNode struct {
-	PageType    uint8                 // 1 for leaf, 2 for internal
-	KeyCount    uint16                // Number of keys in this node
-	ParentPage  uint32                // Page number of the parent node
-	BloomFilter [BloomFilterSize]byte // Bloom filter for quick checks
-	Keys        []interface{}         // Keys in this node
-	Values      [][]uint32            // Values for each key (only for leaf nodes)
-	Children    []uint32              // Child page numbers (only for internal nodes)
+	PageType      uint8                 // 1 for leaf, 2 for internal
+	KeyCount      uint16                // Number of keys in this node
+	ParentPage    uint32                // Page number of the parent node
+	BloomFilter   [BloomFilterSize]byte // Bloom filter for quick checks
+	Keys          []interface{}         // Keys in this node
+	Values        [][]uint32            // Values for each key (only for leaf nodes)
+	OverflowPages []uint32              // Overflow page numbers for keys with many values (0 = no overflow)
+	Children      []uint32              // Child page numbers (only for internal nodes)
+}
+
+// OverflowPage represents a page that stores overflow values for a key
+type OverflowPage struct {
+	NextPage   uint32   // Next overflow page (0 if none)
+	ValueCount uint16   // Number of values in this page
+	Values     []uint32 // Record IDs stored in this page
 }
 
 // pendingWrite represents a pending write to the B-tree
@@ -78,7 +145,7 @@ type pendingWrite struct {
 }
 
 // NewBTreeIndex creates a new B-tree index for the specified field
-func NewBTreeIndex(dbFileName, fieldName string, fieldOffset uintptr, fieldType reflect.Kind) (*BTreeIndex, error) {
+func NewBTreeIndex(dbFileName, fieldName string, fieldOffset uintptr, fieldType reflect.Kind, isTimeField bool) (*BTreeIndex, error) {
 	// Create the index file in the same directory as the database file
 	dbDir := filepath.Dir(dbFileName)
 	indexFileName := filepath.Join(dbDir, fmt.Sprintf("%s.%s.idx", filepath.Base(dbFileName), fieldName))
@@ -87,6 +154,7 @@ func NewBTreeIndex(dbFileName, fieldName string, fieldOffset uintptr, fieldType 
 		fieldName:     fieldName,
 		fieldOffset:   fieldOffset,
 		fieldType:     fieldType,
+		isTimeField:   isTimeField,
 		dbFileName:    dbFileName,
 		pendingWrites: make([]pendingWrite, 0, 1000),
 	}
@@ -99,6 +167,13 @@ func NewBTreeIndex(dbFileName, fieldName string, fieldOffset uintptr, fieldType 
 		idx.keySize = 8
 	case reflect.Bool:
 		idx.keySize = 1
+	case reflect.Struct:
+		if isTimeField {
+			idx.keySize = 8 // time.Time stored as Unix nanoseconds
+		} else {
+			// Variable-sized keys (like strings)
+			idx.keySize = -1
+		}
 	default:
 		// Variable-sized keys (like strings)
 		idx.keySize = -1
@@ -150,8 +225,9 @@ func (idx *BTreeIndex) initializeFile() error {
 		Version:      1,
 		FieldNameLen: uint16(len(idx.fieldName)),
 		FieldType:    uint16(idx.fieldType),
-		RootPageNum:  1, // Root will be page 1 (after the header)
-		PageCount:    2, // Header + initial root
+		IsTimeField:  boolToUint8(idx.isTimeField),
+		RootPageNum:  0, // Root is page 0 (first data page after header)
+		PageCount:    1, // Just the root page (header is not counted as a page)
 		FreeListHead: 0, // No free pages yet
 	}
 
@@ -188,8 +264,8 @@ func (idx *BTreeIndex) initializeFile() error {
 	}
 
 	// Set index metadata
-	idx.rootPageNum = 1
-	idx.pageCount = 2
+	idx.rootPageNum = 0
+	idx.pageCount = 1
 	idx.freeListHead = 0
 
 	return nil
@@ -215,9 +291,15 @@ func (idx *BTreeIndex) mapFile() error {
 
 // remapFile updates the memory mapping after file size changes
 func (idx *BTreeIndex) remapFile() error {
+	// Sync file before remapping to ensure all writes are flushed
+	if err := idx.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync file before remap: %w", err)
+	}
+
 	// Close existing mapping if it exists
 	if idx.mmap != nil {
 		idx.mmap.Close()
+		idx.mmap = nil
 	}
 
 	// Create new mapping
@@ -253,6 +335,7 @@ func (idx *BTreeIndex) loadMetadata() error {
 	idx.rootPageNum = header.RootPageNum
 	idx.pageCount = header.PageCount
 	idx.freeListHead = header.FreeListHead
+	idx.isTimeField = header.IsTimeField == 1
 
 	return nil
 }
@@ -271,10 +354,11 @@ func (idx *BTreeIndex) encodeHeader(header BTreeHeader, buf []byte) error {
 	binary.LittleEndian.PutUint16(buf[12:14], header.FieldNameLen)
 	copy(buf[14:270], header.FieldName[:])
 	binary.LittleEndian.PutUint16(buf[270:272], header.FieldType)
-	binary.LittleEndian.PutUint32(buf[272:276], header.RootPageNum)
-	binary.LittleEndian.PutUint32(buf[276:280], header.PageCount)
-	binary.LittleEndian.PutUint32(buf[280:284], header.FreeListHead)
-	binary.LittleEndian.PutUint32(buf[284:288], header.KeyCount)
+	buf[272] = header.IsTimeField
+	binary.LittleEndian.PutUint32(buf[273:277], header.RootPageNum)
+	binary.LittleEndian.PutUint32(buf[277:281], header.PageCount)
+	binary.LittleEndian.PutUint32(buf[281:285], header.FreeListHead)
+	binary.LittleEndian.PutUint32(buf[285:289], header.KeyCount)
 
 	return nil
 }
@@ -293,26 +377,32 @@ func (idx *BTreeIndex) decodeHeader(buf []byte, header *BTreeHeader) error {
 	header.FieldNameLen = binary.LittleEndian.Uint16(buf[12:14])
 	copy(header.FieldName[:], buf[14:270])
 	header.FieldType = binary.LittleEndian.Uint16(buf[270:272])
-	header.RootPageNum = binary.LittleEndian.Uint32(buf[272:276])
-	header.PageCount = binary.LittleEndian.Uint32(buf[276:280])
-	header.FreeListHead = binary.LittleEndian.Uint32(buf[280:284])
-	header.KeyCount = binary.LittleEndian.Uint32(buf[284:288])
+	header.IsTimeField = buf[272]
+	header.RootPageNum = binary.LittleEndian.Uint32(buf[273:277])
+	header.PageCount = binary.LittleEndian.Uint32(buf[277:281])
+	header.FreeListHead = binary.LittleEndian.Uint32(buf[281:285])
+	header.KeyCount = binary.LittleEndian.Uint32(buf[285:289])
 
 	return nil
 }
 
 // readNode reads a B-tree node from the specified page
+// Page 0 is the first data page (root), located right after the header
 func (idx *BTreeIndex) readNode(pageNum uint32) (*BTreeNode, error) {
 	if pageNum >= idx.pageCount {
-		return nil, fmt.Errorf("invalid page number: %d", pageNum)
+		return nil, fmt.Errorf("invalid page number: %d (pageCount=%d)", pageNum, idx.pageCount)
 	}
 
 	// Read page data
+	// Pages start after the header, so page 0 is at offset BTreeHeaderLen
 	pageData := make([]byte, BTreePageSize)
 	offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
+	if idx.mmap == nil {
+		return nil, fmt.Errorf("mmap is nil")
+	}
 	_, err := idx.mmap.ReadAt(pageData, offset)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mmap ReadAt error at offset %d (file len %d): %w", offset, idx.mmap.Len(), err)
 	}
 
 	// Decode the node
@@ -326,9 +416,10 @@ func (idx *BTreeIndex) readNode(pageNum uint32) (*BTreeNode, error) {
 }
 
 // writeNode writes a B-tree node to the specified page
+// Page 0 is the first data page (root), located right after the header
 func (idx *BTreeIndex) writeNode(pageNum uint32, node *BTreeNode) error {
 	if pageNum >= idx.pageCount {
-		return fmt.Errorf("invalid page number: %d", pageNum)
+		return fmt.Errorf("invalid page number: %d (pageCount=%d)", pageNum, idx.pageCount)
 	}
 
 	// Encode the node
@@ -337,17 +428,15 @@ func (idx *BTreeIndex) writeNode(pageNum uint32, node *BTreeNode) error {
 		return err
 	}
 
-	// Write to file
+	// Write to file - pages start after the header
 	offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
 	_, err := idx.file.WriteAt(pageData, offset)
 	return err
 }
 
 // allocatePage allocates a new page in the B-tree file
+// NOTE: This function does NOT acquire locks - callers must hold idx.lock if needed
 func (idx *BTreeIndex) allocatePage() (uint32, error) {
-	idx.lock.Lock()
-	defer idx.lock.Unlock()
-
 	var pageNum uint32
 
 	// Check if we have any free pages
@@ -370,16 +459,24 @@ func (idx *BTreeIndex) allocatePage() (uint32, error) {
 		pageNum = idx.pageCount
 		idx.pageCount++
 
-		// Extend the file
-		offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
-		err := idx.file.Truncate(offset + BTreePageSize)
-		if err != nil {
-			return 0, err
-		}
+		// Pre-allocate multiple pages at once to reduce file operations
+		// Extend by 64 pages (256KB) at a time for efficiency
+		const preAllocPages = 64
+		targetPageCount := ((idx.pageCount + preAllocPages - 1) / preAllocPages) * preAllocPages
+		targetOffset := int64(BTreeHeaderLen + (targetPageCount * BTreePageSize))
 
-		// Update memory mapping to include the new page
-		if err := idx.remapFile(); err != nil {
-			return 0, err
+		// Only extend and remap if we need more space
+		currentSize, _ := idx.file.Seek(0, 2) // Get current file size
+		if currentSize < targetOffset {
+			err := idx.file.Truncate(targetOffset)
+			if err != nil {
+				return 0, err
+			}
+
+			// Update memory mapping to include the new pages
+			if err := idx.remapFile(); err != nil {
+				return 0, err
+			}
 		}
 	}
 
@@ -392,9 +489,8 @@ func (idx *BTreeIndex) allocatePage() (uint32, error) {
 }
 
 // freePage adds a page to the free list
+// NOTE: This function does NOT acquire locks - callers must hold idx.lock if needed
 func (idx *BTreeIndex) freePage(pageNum uint32) error {
-	idx.lock.Lock()
-	defer idx.lock.Unlock()
 
 	// Write the current free list head to the page
 	freePage := make([]byte, BTreePageSize)
@@ -423,6 +519,7 @@ func (idx *BTreeIndex) updateHeader() error {
 		Version:      1,
 		FieldNameLen: uint16(len(idx.fieldName)),
 		FieldType:    uint16(idx.fieldType),
+		IsTimeField:  boolToUint8(idx.isTimeField),
 		RootPageNum:  idx.rootPageNum,
 		PageCount:    idx.pageCount,
 		FreeListHead: idx.freeListHead,
@@ -530,6 +627,13 @@ func (idx *BTreeIndex) encodeNode(node *BTreeNode, buf []byte) error {
 				buf[pos] = 0
 			}
 			pos++
+		case time.Time:
+			// time.Time key (8 bytes as Unix nanoseconds)
+			if pos+8 > BTreePageSize {
+				return fmt.Errorf("node overflow: not enough space for time.Time key")
+			}
+			binary.LittleEndian.PutUint64(buf[pos:pos+8], uint64(k.UnixNano()))
+			pos += 8
 		default:
 			return fmt.Errorf("unsupported key type: %T", node.Keys[i])
 		}
@@ -538,18 +642,65 @@ func (idx *BTreeIndex) encodeNode(node *BTreeNode, buf []byte) error {
 		if node.PageType == BTreePageTypeLeaf {
 			values := node.Values[i]
 			valCount := len(values)
-			if pos+2+valCount*4 > BTreePageSize {
-				return fmt.Errorf("node overflow: too many values for key")
-			}
 
-			// Write value count
-			binary.LittleEndian.PutUint16(buf[pos:pos+2], uint16(valCount))
-			pos += 2
+			// Check if we have an overflow page for this key
+			hasOverflow := i < len(node.OverflowPages) && node.OverflowPages[i] != 0
 
-			// Write each value (record ID)
-			for _, val := range values {
-				binary.LittleEndian.PutUint32(buf[pos:pos+4], val)
+			if hasOverflow {
+				// Write overflow marker: flag (1) + inline count (2) + overflow page (4)
+				if pos+7 > BTreePageSize {
+					return fmt.Errorf("node overflow: not enough space for overflow pointer")
+				}
+				buf[pos] = 1 // Overflow flag
+				pos++
+
+				// Calculate how many inline values we can fit
+				// We need 7 bytes for header (flag + count + pointer), already accounted for
+				// Each value is 4 bytes
+				remainingSpace := BTreePageSize - pos - 6 // -6 for count(2) + pointer(4)
+				maxInlineForSpace := remainingSpace / 4
+
+				inlineCount := len(values)
+				if inlineCount > MaxInlineValues {
+					inlineCount = MaxInlineValues
+				}
+				if inlineCount > maxInlineForSpace {
+					inlineCount = maxInlineForSpace
+				}
+				if inlineCount < 0 {
+					inlineCount = 0
+				}
+
+				binary.LittleEndian.PutUint16(buf[pos:pos+2], uint16(inlineCount))
+				pos += 2
+				// Write overflow page pointer
+				binary.LittleEndian.PutUint32(buf[pos:pos+4], node.OverflowPages[i])
 				pos += 4
+				// Write inline values (only as many as fit)
+				for j := 0; j < inlineCount; j++ {
+					binary.LittleEndian.PutUint32(buf[pos:pos+4], values[j])
+					pos += 4
+				}
+			} else {
+				// No overflow - write inline values
+				// Check if there's enough space
+				requiredSpace := 1 + 2 + valCount*4 // flag + count + values
+				if pos+requiredSpace > BTreePageSize {
+					// Not enough space - this key has too many values for inline storage
+					// This shouldn't happen if overflow is working correctly
+					return fmt.Errorf("node overflow: too many values for key (%d values, need %d bytes, have %d)",
+						valCount, requiredSpace, BTreePageSize-pos)
+				}
+				buf[pos] = 0 // No overflow flag
+				pos++
+				// Write value count
+				binary.LittleEndian.PutUint16(buf[pos:pos+2], uint16(valCount))
+				pos += 2
+				// Write each value (record ID)
+				for _, val := range values {
+					binary.LittleEndian.PutUint32(buf[pos:pos+4], val)
+					pos += 4
+				}
 			}
 		}
 
@@ -593,6 +744,7 @@ func (idx *BTreeIndex) decodeNode(buf []byte, node *BTreeNode) error {
 	node.Keys = make([]interface{}, node.KeyCount)
 	if node.PageType == BTreePageTypeLeaf {
 		node.Values = make([][]uint32, node.KeyCount)
+		node.OverflowPages = make([]uint32, node.KeyCount)
 	} else {
 		node.Children = make([]uint32, int(node.KeyCount)+1)
 	}
@@ -622,9 +774,15 @@ func (idx *BTreeIndex) decodeNode(buf []byte, node *BTreeNode) error {
 				return fmt.Errorf("invalid node format: int key beyond page size")
 			}
 			intVal := binary.LittleEndian.Uint32(buf[pos : pos+4])
-			if idx.fieldType == reflect.Int || idx.fieldType == reflect.Int32 {
+			// Preserve the exact type to match query expectations
+			switch idx.fieldType {
+			case reflect.Int:
 				node.Keys[i] = int(intVal)
-			} else {
+			case reflect.Int32:
+				node.Keys[i] = int32(intVal)
+			case reflect.Uint:
+				node.Keys[i] = uint(intVal)
+			case reflect.Uint32:
 				node.Keys[i] = intVal
 			}
 			pos += 4
@@ -657,12 +815,32 @@ func (idx *BTreeIndex) decodeNode(buf []byte, node *BTreeNode) error {
 			}
 			node.Keys[i] = buf[pos] != 0
 			pos++
+		case reflect.Struct:
+			// Check if this is a time.Time field
+			if idx.isTimeField {
+				// time.Time key (8 bytes as Unix nanoseconds)
+				if pos+8 > BTreePageSize {
+					return fmt.Errorf("invalid node format: time.Time key beyond page size")
+				}
+				unixNano := int64(binary.LittleEndian.Uint64(buf[pos : pos+8]))
+				node.Keys[i] = time.Unix(0, unixNano)
+				pos += 8
+			} else {
+				return fmt.Errorf("unsupported field type: %v", idx.fieldType)
+			}
 		default:
 			return fmt.Errorf("unsupported field type: %v", idx.fieldType)
 		}
 
 		// For leaf nodes, read values
 		if node.PageType == BTreePageTypeLeaf {
+			// Read overflow flag
+			if pos+1 > BTreePageSize {
+				return fmt.Errorf("invalid node format: overflow flag beyond page size")
+			}
+			hasOverflow := buf[pos] != 0
+			pos++
+
 			// Read value count
 			if pos+2 > BTreePageSize {
 				return fmt.Errorf("invalid node format: value count beyond page size")
@@ -670,7 +848,16 @@ func (idx *BTreeIndex) decodeNode(buf []byte, node *BTreeNode) error {
 			valCount := binary.LittleEndian.Uint16(buf[pos : pos+2])
 			pos += 2
 
-			// Read each value (record ID)
+			if hasOverflow {
+				// Read overflow page pointer
+				if pos+4 > BTreePageSize {
+					return fmt.Errorf("invalid node format: overflow pointer beyond page size")
+				}
+				node.OverflowPages[i] = binary.LittleEndian.Uint32(buf[pos : pos+4])
+				pos += 4
+			}
+
+			// Read inline values
 			node.Values[i] = make([]uint32, valCount)
 			for j := 0; j < int(valCount); j++ {
 				if pos+4 > BTreePageSize {
@@ -709,12 +896,185 @@ func (idx *BTreeIndex) Find(key interface{}) ([]uint32, error) {
 	defer idx.lock.RUnlock()
 
 	// Verify key type
-	if reflect.TypeOf(key).Kind() != idx.fieldType {
+	keyKind := reflect.TypeOf(key).Kind()
+	if idx.isTimeField {
+		if _, ok := key.(time.Time); !ok {
+			return nil, fmt.Errorf("key type mismatch: got %T, expected time.Time", key)
+		}
+	} else if keyKind != idx.fieldType {
 		return nil, fmt.Errorf("key type mismatch: got %T, expected %v", key, idx.fieldType)
 	}
 
+	// For string keys, normalize the search term for case-insensitive matching
+	searchKey := key
+	if str, ok := key.(string); ok && idx.fieldType == reflect.String {
+		// Normalize the search term - if it's a single word, search for that token
+		// If it's multiple words, search for all tokens and intersect results
+		tokens := tokenizeString(str)
+		if len(tokens) == 0 {
+			return nil, nil // Empty search term
+		}
+
+		if len(tokens) == 1 {
+			// Single word search - just search for that token
+			searchKey = tokens[0]
+		} else {
+			// Multi-word search - find records that contain ALL tokens
+			var resultSet map[uint32]struct{}
+			for i, token := range tokens {
+				ids, err := idx.searchInNode(idx.rootPageNum, token)
+				if err != nil {
+					return nil, err
+				}
+				if i == 0 {
+					// Initialize result set with first token's matches
+					resultSet = make(map[uint32]struct{}, len(ids))
+					for _, id := range ids {
+						resultSet[id] = struct{}{}
+					}
+				} else {
+					// Intersect with subsequent token matches
+					newSet := make(map[uint32]struct{})
+					for _, id := range ids {
+						if _, exists := resultSet[id]; exists {
+							newSet[id] = struct{}{}
+						}
+					}
+					resultSet = newSet
+				}
+				if len(resultSet) == 0 {
+					return nil, nil // No matches
+				}
+			}
+			// Convert result set to slice
+			results := make([]uint32, 0, len(resultSet))
+			for id := range resultSet {
+				results = append(results, id)
+			}
+			return results, nil
+		}
+	}
+
 	// Start search at the root
-	return idx.searchInNode(idx.rootPageNum, key)
+	return idx.searchInNode(idx.rootPageNum, searchKey)
+}
+
+// FindGreaterThan finds all keys greater than the given key
+func (idx *BTreeIndex) FindGreaterThan(key interface{}, inclusive bool) ([]uint32, error) {
+	idx.lock.RLock()
+	defer idx.lock.RUnlock()
+
+	if err := idx.validateKeyType(key); err != nil {
+		return nil, err
+	}
+
+	return idx.searchRange(idx.rootPageNum, key, nil, inclusive, true)
+}
+
+// FindLessThan finds all keys less than the given key
+func (idx *BTreeIndex) FindLessThan(key interface{}, inclusive bool) ([]uint32, error) {
+	idx.lock.RLock()
+	defer idx.lock.RUnlock()
+
+	if err := idx.validateKeyType(key); err != nil {
+		return nil, err
+	}
+
+	return idx.searchRange(idx.rootPageNum, nil, key, true, inclusive)
+}
+
+// FindBetween finds all keys between min and max (inclusive if specified)
+func (idx *BTreeIndex) FindBetween(min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
+	idx.lock.RLock()
+	defer idx.lock.RUnlock()
+
+	if err := idx.validateKeyType(min); err != nil {
+		return nil, err
+	}
+	if err := idx.validateKeyType(max); err != nil {
+		return nil, err
+	}
+
+	return idx.searchRange(idx.rootPageNum, min, max, inclusiveMin, inclusiveMax)
+}
+
+// searchRange searches for keys in a range [min, max]
+func (idx *BTreeIndex) searchRange(pageNum uint32, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
+	node, err := idx.readNode(pageNum)
+	if err != nil {
+		return nil, err
+	}
+
+	var results []uint32
+
+	if node.PageType == BTreePageTypeLeaf {
+		// Iterate through all keys in this leaf node
+		for i := 0; i < int(node.KeyCount); i++ {
+			key := node.Keys[i]
+
+			// Check if key is in range
+			inRange := true
+
+			if min != nil {
+				cmp := idx.compareKeys(key, min)
+				if cmp < 0 || (cmp == 0 && !inclusiveMin) {
+					inRange = false
+				}
+			}
+
+			if max != nil && inRange {
+				cmp := idx.compareKeys(key, max)
+				if cmp > 0 || (cmp == 0 && !inclusiveMax) {
+					inRange = false
+				}
+			}
+
+			if inRange {
+				// Collect values for this key
+				var values []uint32
+				if i < len(node.OverflowPages) && node.OverflowPages[i] != 0 {
+					values, err = idx.collectAllValues(node.Values[i], node.OverflowPages[i])
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					values = node.Values[i]
+				}
+				results = append(results, values...)
+			}
+		}
+	} else {
+		// Internal node - traverse children
+		for i := 0; i <= int(node.KeyCount); i++ {
+			childResults, err := idx.searchRange(node.Children[i], min, max, inclusiveMin, inclusiveMax)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, childResults...)
+		}
+	}
+
+	return results, nil
+}
+
+// validateKeyType validates that the key type matches the field type
+func (idx *BTreeIndex) validateKeyType(key interface{}) error {
+	if key == nil {
+		return nil
+	}
+
+	if idx.isTimeField {
+		if _, ok := key.(time.Time); !ok {
+			return fmt.Errorf("key type mismatch: got %T, expected time.Time", key)
+		}
+		return nil
+	}
+
+	keyKind := reflect.TypeOf(key).Kind()
+	if keyKind != idx.fieldType {
+		return fmt.Errorf("key type mismatch: got %T, expected %v", key, idx.fieldType)
+	}
+	return nil
 }
 
 // searchInNode recursively searches for a key in a node
@@ -735,6 +1095,11 @@ func (idx *BTreeIndex) searchInNode(pageNum uint32, key interface{}) ([]uint32, 
 
 	// If we found an exact match and we're at a leaf, return the values
 	if found && node.PageType == BTreePageTypeLeaf {
+		// Check if there are overflow pages
+		if i < len(node.OverflowPages) && node.OverflowPages[i] != 0 {
+			// Collect all values including overflow
+			return idx.collectAllValues(node.Values[i], node.OverflowPages[i])
+		}
 		return node.Values[i], nil
 	}
 
@@ -762,6 +1127,135 @@ func (idx *BTreeIndex) searchInNode(pageNum uint32, key interface{}) ([]uint32, 
 
 	// Recurse into the child
 	return idx.searchInNode(node.Children[childIndex], key)
+}
+
+// collectAllValues collects values from inline storage and overflow pages
+func (idx *BTreeIndex) collectAllValues(inlineValues []uint32, overflowPageNum uint32) ([]uint32, error) {
+	// Start with inline values
+	result := make([]uint32, len(inlineValues), len(inlineValues)+ValuesPerOverflowPage)
+	copy(result, inlineValues)
+
+	// Follow overflow page chain
+	currentPage := overflowPageNum
+	for currentPage != 0 {
+		overflow, err := idx.readOverflowPage(currentPage)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read overflow page %d: %w", currentPage, err)
+		}
+		result = append(result, overflow.Values...)
+		currentPage = overflow.NextPage
+	}
+
+	return result, nil
+}
+
+// readOverflowPage reads an overflow page from disk
+func (idx *BTreeIndex) readOverflowPage(pageNum uint32) (*OverflowPage, error) {
+	buf := make([]byte, BTreePageSize)
+	offset := int64(BTreeHeaderLen) + int64(pageNum)*int64(BTreePageSize)
+
+	if idx.mmap != nil {
+		_, err := idx.mmap.ReadAt(buf, offset)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		_, err := idx.file.ReadAt(buf, offset)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	overflow := &OverflowPage{
+		NextPage:   binary.LittleEndian.Uint32(buf[0:4]),
+		ValueCount: binary.LittleEndian.Uint16(buf[4:6]),
+	}
+
+	overflow.Values = make([]uint32, overflow.ValueCount)
+	pos := OverflowHeaderSize
+	for i := uint16(0); i < overflow.ValueCount; i++ {
+		overflow.Values[i] = binary.LittleEndian.Uint32(buf[pos : pos+4])
+		pos += 4
+	}
+
+	return overflow, nil
+}
+
+// writeOverflowPage writes an overflow page to disk
+func (idx *BTreeIndex) writeOverflowPage(pageNum uint32, overflow *OverflowPage) error {
+	buf := make([]byte, BTreePageSize)
+
+	binary.LittleEndian.PutUint32(buf[0:4], overflow.NextPage)
+	binary.LittleEndian.PutUint16(buf[4:6], overflow.ValueCount)
+
+	pos := OverflowHeaderSize
+	for _, val := range overflow.Values {
+		binary.LittleEndian.PutUint32(buf[pos:pos+4], val)
+		pos += 4
+	}
+
+	offset := int64(BTreeHeaderLen) + int64(pageNum)*int64(BTreePageSize)
+	_, err := idx.file.WriteAt(buf, offset)
+	return err
+}
+
+// allocateOverflowPages allocates overflow pages for a large value list
+// Returns the first overflow page number
+func (idx *BTreeIndex) allocateOverflowPages(values []uint32, startIndex int) (uint32, error) {
+	if startIndex >= len(values) {
+		return 0, nil // No overflow needed
+	}
+
+	remaining := values[startIndex:]
+	var firstPage uint32
+	var prevPageNum uint32
+
+	for len(remaining) > 0 {
+		// Allocate a new page
+		pageNum, err := idx.allocatePage()
+		if err != nil {
+			return 0, err
+		}
+
+		if firstPage == 0 {
+			firstPage = pageNum
+		}
+
+		// Determine how many values fit in this page
+		count := len(remaining)
+		if count > ValuesPerOverflowPage {
+			count = ValuesPerOverflowPage
+		}
+
+		// Create overflow page
+		overflow := &OverflowPage{
+			NextPage:   0, // Will be updated if there's another page
+			ValueCount: uint16(count),
+			Values:     remaining[:count],
+		}
+
+		// Link from previous page
+		if prevPageNum != 0 {
+			prevOverflow, err := idx.readOverflowPage(prevPageNum)
+			if err != nil {
+				return 0, err
+			}
+			prevOverflow.NextPage = pageNum
+			if err := idx.writeOverflowPage(prevPageNum, prevOverflow); err != nil {
+				return 0, err
+			}
+		}
+
+		// Write this page
+		if err := idx.writeOverflowPage(pageNum, overflow); err != nil {
+			return 0, err
+		}
+
+		prevPageNum = pageNum
+		remaining = remaining[count:]
+	}
+
+	return firstPage, nil
 }
 
 // searchNodeForKey performs a binary search in a node for a key
@@ -863,6 +1357,14 @@ func (idx *BTreeIndex) compareKeys(a, b interface{}) int {
 			return 1
 		}
 		return 0
+	case time.Time:
+		bVal := b.(time.Time)
+		if aVal.Before(bVal) {
+			return -1
+		} else if aVal.After(bVal) {
+			return 1
+		}
+		return 0
 	default:
 		// If we can't compare directly, convert to string and compare
 		return strings.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
@@ -921,6 +1423,8 @@ func (idx *BTreeIndex) hashKey(key interface{}) (uint32, uint32) {
 		} else {
 			str = "false"
 		}
+	case time.Time:
+		str = fmt.Sprintf("%d", k.UnixNano())
 	default:
 		str = fmt.Sprintf("%v", k)
 	}
@@ -955,16 +1459,31 @@ func (idx *BTreeIndex) Insert(key interface{}, recordID uint32) error {
 		return fmt.Errorf("key type mismatch: got %T, expected %v", key, idx.fieldType)
 	}
 
-	// Add to pending writes
-	idx.pendingWrites = append(idx.pendingWrites, pendingWrite{
-		id:       recordID,
-		key:      key,
-		isDelete: false,
-	})
+	// For string keys, tokenize and index each word separately for word-based search
+	if str, ok := key.(string); ok && idx.fieldType == reflect.String {
+		tokens := tokenizeString(str)
+		for _, token := range tokens {
+			idx.pendingWrites = append(idx.pendingWrites, pendingWrite{
+				id:       recordID,
+				key:      token,
+				isDelete: false,
+			})
+		}
+	} else {
+		// Add to pending writes (non-string types)
+		idx.pendingWrites = append(idx.pendingWrites, pendingWrite{
+			id:       recordID,
+			key:      key,
+			isDelete: false,
+		})
+	}
 
 	// Apply writes if we have enough pending
 	if len(idx.pendingWrites) >= 1000 {
-		return idx.applyWrites()
+		idx.lock.Lock()
+		err := idx.applyWrites()
+		idx.lock.Unlock()
+		return err
 	}
 
 	return nil
@@ -977,16 +1496,31 @@ func (idx *BTreeIndex) Remove(key interface{}, recordID uint32) error {
 		return fmt.Errorf("key type mismatch: got %T, expected %v", key, idx.fieldType)
 	}
 
-	// Add to pending writes
-	idx.pendingWrites = append(idx.pendingWrites, pendingWrite{
-		id:       recordID,
-		key:      key,
-		isDelete: true,
-	})
+	// For string keys, remove all tokenized entries
+	if str, ok := key.(string); ok && idx.fieldType == reflect.String {
+		tokens := tokenizeString(str)
+		for _, token := range tokens {
+			idx.pendingWrites = append(idx.pendingWrites, pendingWrite{
+				id:       recordID,
+				key:      token,
+				isDelete: true,
+			})
+		}
+	} else {
+		// Add to pending writes (non-string types)
+		idx.pendingWrites = append(idx.pendingWrites, pendingWrite{
+			id:       recordID,
+			key:      key,
+			isDelete: true,
+		})
+	}
 
 	// Apply writes if we have enough pending
 	if len(idx.pendingWrites) >= 1000 {
-		return idx.applyWrites()
+		idx.lock.Lock()
+		err := idx.applyWrites()
+		idx.lock.Unlock()
+		return err
 	}
 
 	return nil
@@ -1027,6 +1561,7 @@ func (idx *BTreeIndex) Close() error {
 }
 
 // applyWrites applies all pending writes to the B-tree
+// NOTE: Caller must hold idx.lock before calling this method
 func (idx *BTreeIndex) applyWrites() error {
 	if len(idx.pendingWrites) == 0 {
 		return nil
@@ -1154,11 +1689,12 @@ func (idx *BTreeIndex) insertIntoTree(key interface{}, recordID uint32) error {
 }
 
 // insertIntoNode recursively inserts a key-value pair into a node
-func (idx *BTreeIndex) insertIntoNode(pageNum uint32, key interface{}, recordID uint32) (bool, error) {
+// Returns a *splitResult if the node was split, or nil if no split occurred
+func (idx *BTreeIndex) insertIntoNode(pageNum uint32, key interface{}, recordID uint32) (*splitResult, error) {
 	// Read the node
 	node, err := idx.readNode(pageNum)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	// Find the position where the key should go
@@ -1172,19 +1708,93 @@ func (idx *BTreeIndex) insertIntoNode(pageNum uint32, key interface{}, recordID 
 			values := node.Values[pos]
 			for _, id := range values {
 				if id == recordID {
-					return false, nil // Record ID already exists for this key
+					return nil, nil // Record ID already exists for this key
 				}
 			}
 
 			// Add the record ID
 			node.Values[pos] = append(node.Values[pos], recordID)
 
-			// Write the updated node
-			if err := idx.writeNode(pageNum, node); err != nil {
-				return false, err
+			// Check if we need to create/extend overflow pages
+			if len(node.Values[pos]) > MaxInlineValues {
+				// Need overflow pages
+				overflowStart := MaxInlineValues
+				if pos < len(node.OverflowPages) && node.OverflowPages[pos] != 0 {
+					// Already have overflow - append to existing chain
+					// For simplicity, we'll just add to the end of the chain
+					// A more sophisticated approach would track the last page
+					lastPage := node.OverflowPages[pos]
+					for {
+						overflow, err := idx.readOverflowPage(lastPage)
+						if err != nil {
+							return nil, err
+						}
+						if overflow.NextPage == 0 {
+							// Found the last page - add values here or create new page
+							if int(overflow.ValueCount) < ValuesPerOverflowPage {
+								// Add to this page
+								overflow.Values = append(overflow.Values, recordID)
+								overflow.ValueCount++
+								if err := idx.writeOverflowPage(lastPage, overflow); err != nil {
+									return nil, err
+								}
+								// Remove the extra value we added to inline
+								node.Values[pos] = node.Values[pos][:MaxInlineValues]
+								if err := idx.writeNode(pageNum, node); err != nil {
+									return nil, err
+								}
+								return nil, nil
+							}
+							// Page is full, create new overflow page
+							newPage, err := idx.allocatePage()
+							if err != nil {
+								return nil, err
+							}
+							newOverflow := &OverflowPage{
+								NextPage:   0,
+								ValueCount: 1,
+								Values:     []uint32{recordID},
+							}
+							if err := idx.writeOverflowPage(newPage, newOverflow); err != nil {
+								return nil, err
+							}
+							overflow.NextPage = newPage
+							if err := idx.writeOverflowPage(lastPage, overflow); err != nil {
+								return nil, err
+							}
+							// Remove the extra value we added to inline
+							node.Values[pos] = node.Values[pos][:MaxInlineValues]
+							if err := idx.writeNode(pageNum, node); err != nil {
+								return nil, err
+							}
+							return nil, nil
+						}
+						lastPage = overflow.NextPage
+					}
+				} else {
+					// First time needing overflow for this key
+					overflowPageNum, err := idx.allocateOverflowPages(node.Values[pos], overflowStart)
+					if err != nil {
+						return nil, fmt.Errorf("failed to allocate overflow pages: %w", err)
+					}
+					// Ensure OverflowPages slice is large enough
+					if len(node.OverflowPages) <= pos {
+						newOverflow := make([]uint32, pos+1)
+						copy(newOverflow, node.OverflowPages)
+						node.OverflowPages = newOverflow
+					}
+					node.OverflowPages[pos] = overflowPageNum
+					// Keep only inline values
+					node.Values[pos] = node.Values[pos][:MaxInlineValues]
+				}
 			}
 
-			return false, nil
+			// Write the updated node
+			if err := idx.writeNode(pageNum, node); err != nil {
+				return nil, err
+			}
+
+			return nil, nil
 		}
 
 		// Insert the key and value at the found position
@@ -1200,6 +1810,13 @@ func (idx *BTreeIndex) insertIntoNode(pageNum uint32, key interface{}, recordID 
 		// Insert the new key and value
 		node.Keys[pos] = key
 		node.Values[pos] = []uint32{recordID}
+		// Ensure OverflowPages slice is large enough
+		if len(node.OverflowPages) <= pos {
+			newOverflow := make([]uint32, pos+1)
+			copy(newOverflow, node.OverflowPages)
+			node.OverflowPages = newOverflow
+		}
+		node.OverflowPages[pos] = 0 // No overflow for new key
 		node.KeyCount++
 
 		// Add to bloom filter
@@ -1207,15 +1824,19 @@ func (idx *BTreeIndex) insertIntoNode(pageNum uint32, key interface{}, recordID 
 
 		// Check if the node is now full
 		if int(node.KeyCount) > BTreeOrder {
-			return true, idx.splitLeafNode(pageNum, node)
+			rightPageNum, firstKey, err := idx.splitLeafNode(pageNum, node)
+			if err != nil {
+				return nil, err
+			}
+			return &splitResult{key: firstKey, childPageNum: rightPageNum}, nil
 		}
 
 		// Write the updated node
 		if err := idx.writeNode(pageNum, node); err != nil {
-			return false, err
+			return nil, err
 		}
 
-		return false, nil
+		return nil, nil
 	}
 
 	// If we're at an internal node, recurse into the appropriate child
@@ -1227,25 +1848,18 @@ func (idx *BTreeIndex) insertIntoNode(pageNum uint32, key interface{}, recordID 
 
 	// Make sure the child index is valid
 	if childIndex >= len(node.Children) {
-		return false, fmt.Errorf("invalid child index: %d (node has %d children)", childIndex, len(node.Children))
+		return nil, fmt.Errorf("invalid child index: %d (node has %d children)", childIndex, len(node.Children))
 	}
 
 	// Recurse into the child
-	needsSplit, err := idx.insertIntoNode(node.Children[childIndex], key, recordID)
+	childSplit, err := idx.insertIntoNode(node.Children[childIndex], key, recordID)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	// If the child was split, we need to insert the middle key and new child pointer
-	if needsSplit {
-		// Read the child to get its middle key and right child
-		child, err := idx.readNode(node.Children[childIndex])
-		if err != nil {
-			return false, err
-		}
-
+	if childSplit != nil {
 		// Insert the middle key and right child into this node
-		// (This is simplified - in a real implementation, we would get this information from the split operation)
 		node.Keys = append(node.Keys, nil) // Make room
 		node.Children = append(node.Children, 0)
 
@@ -1255,23 +1869,27 @@ func (idx *BTreeIndex) insertIntoNode(pageNum uint32, key interface{}, recordID 
 			node.Children[i+1] = node.Children[i]
 		}
 
-		// Insert the middle key and right child
-		node.Keys[childIndex] = child.Keys[0]
-		node.Children[childIndex+1] = child.Children[1]
+		// Insert the middle key and right child from the split result
+		node.Keys[childIndex] = childSplit.key
+		node.Children[childIndex+1] = childSplit.childPageNum
 		node.KeyCount++
 
 		// Check if this node is now full
 		if int(node.KeyCount) > BTreeOrder {
-			return true, idx.splitInternalNode(pageNum, node)
+			rightPageNum, middleKey, err := idx.splitInternalNode(pageNum, node)
+			if err != nil {
+				return nil, err
+			}
+			return &splitResult{key: middleKey, childPageNum: rightPageNum}, nil
 		}
 
 		// Write the updated node
 		if err := idx.writeNode(pageNum, node); err != nil {
-			return false, err
+			return nil, err
 		}
 	}
 
-	return false, nil
+	return nil, nil
 }
 
 // removeFromTree removes a key-value pair from the B-tree
@@ -1354,7 +1972,8 @@ type splitResult struct {
 }
 
 // splitLeafNode splits a leaf node that is too full
-func (idx *BTreeIndex) splitLeafNode(pageNum uint32, node *BTreeNode) error {
+// Returns the new page number and the first key of the right node
+func (idx *BTreeIndex) splitLeafNode(pageNum uint32, node *BTreeNode) (uint32, interface{}, error) {
 	// Create a new leaf node for the right half
 	rightNode := &BTreeNode{
 		PageType: BTreePageTypeLeaf,
@@ -1366,7 +1985,7 @@ func (idx *BTreeIndex) splitLeafNode(pageNum uint32, node *BTreeNode) error {
 	// Allocate a page for the new node
 	rightPageNum, err := idx.allocatePage()
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	// Calculate split point (middle of the node)
@@ -1374,13 +1993,21 @@ func (idx *BTreeIndex) splitLeafNode(pageNum uint32, node *BTreeNode) error {
 
 	// Move half of the keys and values to the new node
 	rightNode.KeyCount = node.KeyCount - uint16(splitPoint)
+	rightNode.OverflowPages = make([]uint32, rightNode.KeyCount)
 	for i := splitPoint; i < int(node.KeyCount); i++ {
 		rightNode.Keys[i-splitPoint] = node.Keys[i]
 		rightNode.Values[i-splitPoint] = node.Values[i]
+		// Copy overflow page pointer if exists
+		if i < len(node.OverflowPages) {
+			rightNode.OverflowPages[i-splitPoint] = node.OverflowPages[i]
+		}
 
 		// Add to right node's bloom filter
 		idx.addToBloomFilter(&rightNode.BloomFilter, node.Keys[i])
 	}
+
+	// Save the first key of the right node before modifying left node
+	firstRightKey := rightNode.Keys[0]
 
 	// Update the original node's key count
 	node.KeyCount = uint16(splitPoint)
@@ -1392,18 +2019,19 @@ func (idx *BTreeIndex) splitLeafNode(pageNum uint32, node *BTreeNode) error {
 
 	// Write both nodes
 	if err := idx.writeNode(pageNum, node); err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	if err := idx.writeNode(rightPageNum, rightNode); err != nil {
-		return err
+		return 0, nil, err
 	}
 
-	return nil
+	return rightPageNum, firstRightKey, nil
 }
 
 // splitInternalNode splits an internal node that is too full
-func (idx *BTreeIndex) splitInternalNode(pageNum uint32, node *BTreeNode) error {
+// Returns the new page number and the middle key that should be promoted
+func (idx *BTreeIndex) splitInternalNode(pageNum uint32, node *BTreeNode) (uint32, interface{}, error) {
 	// Create a new internal node for the right half
 	rightNode := &BTreeNode{
 		PageType: BTreePageTypeInternal,
@@ -1415,7 +2043,7 @@ func (idx *BTreeIndex) splitInternalNode(pageNum uint32, node *BTreeNode) error 
 	// Allocate a page for the new node
 	rightPageNum, err := idx.allocatePage()
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	// Calculate split point (middle of the node)
@@ -1442,11 +2070,11 @@ func (idx *BTreeIndex) splitInternalNode(pageNum uint32, node *BTreeNode) error 
 
 	// Write both nodes
 	if err := idx.writeNode(pageNum, node); err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	if err := idx.writeNode(rightPageNum, rightNode); err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	// Handle the case where this is the root node
@@ -1462,49 +2090,42 @@ func (idx *BTreeIndex) splitInternalNode(pageNum uint32, node *BTreeNode) error 
 		// Allocate a page for the new root
 		newRootPageNum, err := idx.allocatePage()
 		if err != nil {
-			return err
+			return 0, nil, err
 		}
 
 		// Write the new root
 		if err := idx.writeNode(newRootPageNum, newRoot); err != nil {
-			return err
+			return 0, nil, err
 		}
 
 		// Update root page number
 		idx.rootPageNum = newRootPageNum
 	}
 
-	return nil
+	return rightPageNum, middleKey, nil
 }
 
 // splitNode is a helper that handles both leaf and internal node splits
 func (idx *BTreeIndex) splitNode(pageNum uint32, node *BTreeNode, keyIndex int) (*splitResult, error) {
 	if node.PageType == BTreePageTypeLeaf {
-		if err := idx.splitLeafNode(pageNum, node); err != nil {
-			return nil, err
-		}
-
-		// For a leaf node split, we need to return the first key of the right node
-		// Simplified version - in a real implementation we would get this information from splitLeafNode
-		rightNode, err := idx.readNode(pageNum + 1) // This assumes the right node is at the next page
+		rightPageNum, firstKey, err := idx.splitLeafNode(pageNum, node)
 		if err != nil {
 			return nil, err
 		}
 
 		return &splitResult{
-			key:          rightNode.Keys[0],
-			childPageNum: pageNum + 1,
+			key:          firstKey,
+			childPageNum: rightPageNum,
 		}, nil
 	} else {
-		if err := idx.splitInternalNode(pageNum, node); err != nil {
+		rightPageNum, middleKey, err := idx.splitInternalNode(pageNum, node)
+		if err != nil {
 			return nil, err
 		}
 
-		// For an internal node split, we need to return the middle key and the right node page number
-		// Simplified version - in a real implementation we would get this information from splitInternalNode
 		return &splitResult{
-			key:          node.Keys[node.KeyCount-1],
-			childPageNum: pageNum + 1, // This assumes the right node is at the next page
+			key:          middleKey,
+			childPageNum: rightPageNum,
 		}, nil
 	}
 }

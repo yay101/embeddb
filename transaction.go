@@ -52,10 +52,16 @@ type Transaction struct {
 }
 
 // beginTransaction starts a new transaction
+// This acquires db.lock and releases it before returning
 func (db *Database[T]) beginTransaction() error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
+	return db.beginTransactionLocked()
+}
 
+// beginTransactionLocked starts a new transaction
+// IMPORTANT: Caller must hold db.lock before calling this method
+func (db *Database[T]) beginTransactionLocked() error {
 	// Check if a transaction is already in progress
 	if db.transaction != nil && db.transaction.state == TransactionActive {
 		return ErrTransactionInProgress
@@ -105,10 +111,16 @@ func (db *Database[T]) beginTransaction() error {
 }
 
 // commitTransaction commits the current transaction
+// This acquires db.lock and releases it before returning
 func (db *Database[T]) commitTransaction() error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
+	return db.commitTransactionLocked()
+}
 
+// commitTransactionLocked commits the current transaction
+// IMPORTANT: Caller must hold db.lock before calling this method
+func (db *Database[T]) commitTransactionLocked() error {
 	// Check if a transaction is in progress
 	if db.transaction == nil || db.transaction.state != TransactionActive {
 		return ErrNoTransaction
@@ -135,10 +147,16 @@ func (db *Database[T]) commitTransaction() error {
 }
 
 // rollbackTransaction rolls back the current transaction
+// This acquires db.lock and releases it before returning
 func (db *Database[T]) rollbackTransaction() error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
+	return db.rollbackTransactionLocked()
+}
 
+// rollbackTransactionLocked rolls back the current transaction
+// IMPORTANT: Caller must hold db.lock before calling this method
+func (db *Database[T]) rollbackTransactionLocked() error {
 	// Check if a transaction is in progress
 	if db.transaction == nil || db.transaction.state != TransactionActive {
 		return ErrNoTransaction
@@ -173,7 +191,17 @@ func (db *Database[T]) rollbackTransaction() error {
 	db.transaction.state = TransactionRolledBack
 	db.transaction = nil
 
-	// Reload the memory-mapped file to reflect the rollback
+	return nil
+}
+
+// rollbackTransactionAndReloadMMap rolls back the transaction and reloads mmap
+// This is a convenience method that handles both operations safely
+// IMPORTANT: Caller must hold db.lock before calling this method
+func (db *Database[T]) rollbackTransactionAndReloadMMap() error {
+	if err := db.rollbackTransactionLocked(); err != nil {
+		return err
+	}
+	// ReloadMMap uses mlock, not db.lock, so this is safe
 	return db.ReloadMMap()
 }
 
@@ -181,5 +209,11 @@ func (db *Database[T]) rollbackTransaction() error {
 func (db *Database[T]) isInTransaction() bool {
 	db.lock.RLock()
 	defer db.lock.RUnlock()
+	return db.transaction != nil && db.transaction.state == TransactionActive
+}
+
+// isInTransactionLocked checks if a transaction is currently active
+// IMPORTANT: Caller must hold db.lock (read or write) before calling this method
+func (db *Database[T]) isInTransactionLocked() bool {
 	return db.transaction != nil && db.transaction.state == TransactionActive
 }

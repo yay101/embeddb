@@ -6,9 +6,9 @@ import (
 	"io"
 )
 
+// writeData writes data to the file at the given offset.
+// IMPORTANT: Caller must hold db.lock before calling this method.
 func (db *Database[T]) writeData(data []byte, offset int64) error {
-	db.lock.Lock()
-	defer db.lock.Unlock()
 	_, err := db.file.WriteAt(data, offset)
 	if err != nil {
 		return err
@@ -16,10 +16,10 @@ func (db *Database[T]) writeData(data []byte, offset int64) error {
 	return db.file.Sync()
 }
 
+// readData reads data from the file at the given offset.
+// IMPORTANT: Caller must hold db.lock (read or write) before calling this method.
 func (db *Database[T]) readData(offset int64, length int) (buf []byte, err error) {
 	buf = make([]byte, length)
-	db.lock.RLock()
-	defer db.lock.RUnlock()
 	n, err := db.file.ReadAt(buf, offset)
 	if err != nil {
 		return nil, err
@@ -30,11 +30,9 @@ func (db *Database[T]) readData(offset int64, length int) (buf []byte, err error
 	return buf, nil
 }
 
+// findSeq searches for a byte sequence in the file.
+// IMPORTANT: Caller must hold db.lock (read or write) before calling this method.
 func (db *Database[T]) findSeq(seq []byte) (matchloc []int, err error) {
-	// Acquire a read lock to prevent concurrent writes while searching the file.
-	db.lock.RLock()
-	defer db.lock.RUnlock()
-
 	// Ensure the sequence to search for is not empty. An empty sequence would match everywhere.
 	if len(seq) == 0 {
 		return nil, errors.New("search sequence cannot be empty")

@@ -48,7 +48,7 @@ type DBHeader struct {
 // This type is no longer used and has been replaced by FieldOffset in field_offsets.go
 
 const (
-	headerSize                int          = 16
+	headerSize                int          = 32
 	chunkSize                 int          = 4096
 	escCode                   byte         = 0x1B
 	startMarker               byte         = 0x02
@@ -64,8 +64,9 @@ const (
 func (db *Database[T]) nextId() uint32 {
 	db.nlock.Lock()
 	defer db.nlock.Unlock()
+	id := db.nextRecordID
 	db.nextRecordID++
-	return db.nextRecordID
+	return id
 }
 
 // CreateIndex creates an index for the specified field
@@ -86,15 +87,49 @@ func (db *Database[T]) DropIndex(fieldName string) error {
 
 // Close closes the database and any open indexes
 func (db *Database[T]) Close() error {
-	// Close indexes first
+	// Persist the index and header before closing
+	if err := db.Sync(); err != nil {
+		return fmt.Errorf("failed to sync before close: %w", err)
+	}
+
+	// Close indexes
 	if db.indexManager != nil {
 		if err := db.indexManager.Close(); err != nil {
 			return err
 		}
 	}
 
+	// Close memory mapping
+	db.mlock.Lock()
+	if db.mfile != nil {
+		db.mfile.Close()
+		db.mfile = nil
+	}
+	db.mlock.Unlock()
+
 	// Close file
 	return db.file.Close()
+}
+
+// Sync persists the in-memory index and header to disk.
+// This should be called periodically for durability, and is automatically
+// called by Close().
+func (db *Database[T]) Sync() error {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Write the index to disk
+	if err := db.writeIndexLocked(); err != nil {
+		return fmt.Errorf("failed to write index: %w", err)
+	}
+
+	// Write the header to disk
+	if err := db.encodeHeaderLocked(); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+
+	// Sync the file
+	return db.file.Sync()
 }
 
 // Query finds all records that match a field value using an index
@@ -119,4 +154,28 @@ func (db *Database[T]) Query(fieldName string, value interface{}) ([]T, error) {
 	}
 
 	return results, nil
+}
+
+// QueryRangeGreaterThan finds all records where field > value (or >= if inclusive)
+func (db *Database[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+	return db.indexManager.QueryRangeGreaterThan(fieldName, value, inclusive)
+}
+
+// QueryRangeLessThan finds all records where field < value (or <= if inclusive)
+func (db *Database[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+	return db.indexManager.QueryRangeLessThan(fieldName, value, inclusive)
+}
+
+// QueryRangeBetween finds all records where min <= field <= max
+func (db *Database[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
+	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+	return db.indexManager.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
 }
