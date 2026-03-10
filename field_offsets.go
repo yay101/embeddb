@@ -19,8 +19,10 @@ type FieldOffset struct {
 	Key        byte
 	IsStruct   bool
 	StructType reflect.Type
-	Parent     []string // For nested structs
-	IsTime     bool     // True if the field is time.Time
+	Parent     []string     // For nested structs
+	IsTime     bool         // True if the field is time.Time
+	IsSlice    bool         // True if the field is a slice
+	SliceElem  reflect.Type // Element type of the slice
 }
 
 // StructLayout contains the mapping of field byte keys to their offsets
@@ -88,19 +90,28 @@ func computeFieldOffsets(t reflect.Type, baseOffset uintptr, byteKey *byte, pare
 		// Check if this is a time.Time field
 		isTimeField := field.Type.PkgPath() == "time" && field.Type.Name() == "Time"
 
+		// Check if this is a slice field
+		isSliceField := field.Type.Kind() == reflect.Slice
+		var sliceElem reflect.Type
+		if isSliceField {
+			sliceElem = field.Type.Elem()
+		}
+
 		// Create field offset info
 		// Calculate absolute offset from root struct by adding base offset
 		absoluteOffset := baseOffset + field.Offset
 		fieldOffset := FieldOffset{
-			Name:    strings.Join(fieldPath, "."),
-			Offset:  absoluteOffset,
-			Type:    field.Type.Kind(),
-			Size:    field.Type.Size(),
-			Primary: isPrimary,
-			Unique:  isUnique,
-			Key:     *byteKey,
-			Parent:  parentPath,
-			IsTime:  isTimeField,
+			Name:      strings.Join(fieldPath, "."),
+			Offset:    absoluteOffset,
+			Type:      field.Type.Kind(),
+			Size:      field.Type.Size(),
+			Primary:   isPrimary,
+			Unique:    isUnique,
+			Key:       *byteKey,
+			Parent:    parentPath,
+			IsTime:    isTimeField,
+			IsSlice:   isSliceField,
+			SliceElem: sliceElem,
 		}
 
 		// Handle nested structs
@@ -169,6 +180,10 @@ func GetFieldValue(data interface{}, offset FieldOffset) (interface{}, error) {
 		if offset.IsTime {
 			return *(*time.Time)(fieldPtr), nil
 		}
+		return fieldPtr, nil
+	case reflect.Slice:
+		// Return the slice header pointer so we can iterate over elements
+		// The slice header contains: ptr, len, cap
 		return fieldPtr, nil
 	default:
 		return nil, fmt.Errorf("unsupported field type: %v", offset.Type)
@@ -313,6 +328,103 @@ func SetFieldValue(data interface{}, offset FieldOffset, value interface{}) erro
 		} else {
 			return fmt.Errorf("unsupported struct field type: %v", offset.Type)
 		}
+	case reflect.Slice:
+		sliceVal, ok := value.([]interface{})
+		if !ok {
+			return fmt.Errorf("cannot convert %T to slice", value)
+		}
+		if len(sliceVal) == 0 {
+			break
+		}
+		sliceHeader := (*reflect.SliceHeader)(fieldPtr)
+		elemType := offset.SliceElem
+		sliceSize := elemType.Size()
+		data := make([]byte, len(sliceVal)*int(sliceSize))
+		for i, elem := range sliceVal {
+			elemPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&data[0])) + uintptr(i)*uintptr(sliceSize))
+			switch elemType.Kind() {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				var intVal int64
+				switch v := elem.(type) {
+				case int64:
+					intVal = v
+				case int:
+					intVal = int64(v)
+				case int32:
+					intVal = int64(v)
+				case int16:
+					intVal = int64(v)
+				case int8:
+					intVal = int64(v)
+				}
+				switch elemType.Kind() {
+				case reflect.Int:
+					*(*int)(elemPtr) = int(intVal)
+				case reflect.Int8:
+					*(*int8)(elemPtr) = int8(intVal)
+				case reflect.Int16:
+					*(*int16)(elemPtr) = int16(intVal)
+				case reflect.Int32:
+					*(*int32)(elemPtr) = int32(intVal)
+				case reflect.Int64:
+					*(*int64)(elemPtr) = intVal
+				}
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				var uintVal uint64
+				switch v := elem.(type) {
+				case uint64:
+					uintVal = v
+				case uint:
+					uintVal = uint64(v)
+				case uint32:
+					uintVal = uint64(v)
+				case uint16:
+					uintVal = uint64(v)
+				case uint8:
+					uintVal = uint64(v)
+				}
+				switch elemType.Kind() {
+				case reflect.Uint:
+					*(*uint)(elemPtr) = uint(uintVal)
+				case reflect.Uint8:
+					*(*uint8)(elemPtr) = uint8(uintVal)
+				case reflect.Uint16:
+					*(*uint16)(elemPtr) = uint16(uintVal)
+				case reflect.Uint32:
+					*(*uint32)(elemPtr) = uint32(uintVal)
+				case reflect.Uint64:
+					*(*uint64)(elemPtr) = uintVal
+				}
+			case reflect.Float32, reflect.Float64:
+				var floatVal float64
+				switch v := elem.(type) {
+				case float64:
+					floatVal = v
+				case float32:
+					floatVal = float64(v)
+				}
+				if elemType.Kind() == reflect.Float32 {
+					*(*float32)(elemPtr) = float32(floatVal)
+				} else {
+					*(*float64)(elemPtr) = floatVal
+				}
+			case reflect.String:
+				strVal, _ := elem.(string)
+				strHdr := (*reflect.StringHeader)(elemPtr)
+				if len(strVal) > 0 {
+					strData := make([]byte, len(strVal))
+					copy(strData, strVal)
+					strHdr.Data = uintptr(unsafe.Pointer(&strData[0]))
+					strHdr.Len = len(strVal)
+				}
+			case reflect.Bool:
+				boolVal, _ := elem.(bool)
+				*(*bool)(elemPtr) = boolVal
+			}
+		}
+		sliceHeader.Data = uintptr(unsafe.Pointer(&data[0]))
+		sliceHeader.Len = len(sliceVal)
+		sliceHeader.Cap = len(sliceVal)
 	default:
 		return fmt.Errorf("unsupported field type: %v", offset.Type)
 	}

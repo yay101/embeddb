@@ -895,6 +895,18 @@ func (idx *BTreeIndex) Find(key interface{}) ([]uint32, error) {
 	idx.lock.RLock()
 	defer idx.lock.RUnlock()
 
+	// Flush pending writes to ensure we can find recently inserted keys
+	if len(idx.pendingWrites) > 0 {
+		idx.lock.RUnlock()
+		idx.lock.Lock()
+		if err := idx.applyWrites(); err != nil {
+			idx.lock.Unlock()
+			return nil, err
+		}
+		idx.lock.Unlock()
+		idx.lock.RLock()
+	}
+
 	// Verify key type
 	keyKind := reflect.TypeOf(key).Kind()
 	if idx.isTimeField {

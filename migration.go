@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 // MigrationOptions contains options for schema migration
@@ -375,6 +376,92 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 				err = fmt.Errorf("field %s is marked as struct but IsStruct is false", fieldOffset.Name)
 				break
 			}
+		case reflect.Slice:
+			lengthVal, remaining, decodeErr := decodeUvarint(data)
+			if decodeErr != nil {
+				err = decodeErr
+				break
+			}
+			length := int(lengthVal.(uint64))
+
+			elemType := fieldOffset.SliceElem
+			slice := make([]interface{}, length)
+
+			for i := 0; i < length; i++ {
+				var elem interface{}
+				switch elemType.Kind() {
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					elem, remaining, err = decodeVarint(remaining)
+					if err != nil {
+						break
+					}
+					intVal := elem.(int64)
+					switch elemType.Kind() {
+					case reflect.Int:
+						slice[i] = int(intVal)
+					case reflect.Int8:
+						slice[i] = int8(intVal)
+					case reflect.Int16:
+						slice[i] = int16(intVal)
+					case reflect.Int32:
+						slice[i] = int32(intVal)
+					case reflect.Int64:
+						slice[i] = intVal
+					}
+					continue
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					elem, remaining, err = decodeUvarint(remaining)
+					if err != nil {
+						break
+					}
+					uintVal := elem.(uint64)
+					switch elemType.Kind() {
+					case reflect.Uint:
+						slice[i] = uint(uintVal)
+					case reflect.Uint8:
+						slice[i] = uint8(uintVal)
+					case reflect.Uint16:
+						slice[i] = uint16(uintVal)
+					case reflect.Uint32:
+						slice[i] = uint32(uintVal)
+					case reflect.Uint64:
+						slice[i] = uintVal
+					}
+					continue
+				case reflect.Float32, reflect.Float64:
+					elem, remaining, decodeErr = decodeUvarint(remaining)
+					if decodeErr != nil {
+						err = decodeErr
+						break
+					}
+					floatVal := math.Float64frombits(elem.(uint64))
+					if elemType.Kind() == reflect.Float32 {
+						slice[i] = float32(floatVal)
+					} else {
+						slice[i] = floatVal
+					}
+					continue
+				case reflect.String:
+					elem, remaining, err = decodeString(remaining)
+					if err != nil {
+						break
+					}
+					slice[i] = elem.(string)
+					continue
+				case reflect.Bool:
+					elem, remaining, err = decodeBool(remaining)
+					if err != nil {
+						break
+					}
+					slice[i] = elem.(bool)
+					continue
+				default:
+					err = fmt.Errorf("unsupported slice element type: %v", elemType.Kind())
+					break
+				}
+			}
+			value = slice
+			data = remaining
 		default:
 			err = fmt.Errorf("unsupported field type: %v", fieldOffset.Type)
 		}
@@ -478,6 +565,72 @@ func (db *Database[T]) encodeRecordWithLayout(record *T, layout *StructLayout) (
 				buffer = encodeVarint(buffer, timeValue.UnixNano())
 			} else {
 				return nil, fmt.Errorf("unsupported struct field type: %s", fieldOffset.Name)
+			}
+		case reflect.Slice:
+			slicePtr := value.(unsafe.Pointer)
+			sliceHeader := (*reflect.SliceHeader)(slicePtr)
+			length := sliceHeader.Len
+			buffer = encodeUvarint(buffer, uint64(length))
+			if length == 0 || sliceHeader.Data == 0 {
+				break
+			}
+
+			elemType := fieldOffset.SliceElem
+			dataPtr := sliceHeader.Data
+			elemSize := elemType.Size()
+
+			for i := 0; i < length; i++ {
+				elemPtr := unsafe.Pointer(dataPtr + uintptr(i)*elemSize)
+				switch elemType.Kind() {
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					var intVal int64
+					switch elemType.Kind() {
+					case reflect.Int:
+						intVal = int64(*(*int)(elemPtr))
+					case reflect.Int8:
+						intVal = int64(*(*int8)(elemPtr))
+					case reflect.Int16:
+						intVal = int64(*(*int16)(elemPtr))
+					case reflect.Int32:
+						intVal = int64(*(*int32)(elemPtr))
+					case reflect.Int64:
+						intVal = *(*int64)(elemPtr)
+					}
+					buffer = encodeVarint(buffer, intVal)
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					var uintVal uint64
+					switch elemType.Kind() {
+					case reflect.Uint:
+						uintVal = uint64(*(*uint)(elemPtr))
+					case reflect.Uint8:
+						uintVal = uint64(*(*uint8)(elemPtr))
+					case reflect.Uint16:
+						uintVal = uint64(*(*uint16)(elemPtr))
+					case reflect.Uint32:
+						uintVal = uint64(*(*uint32)(elemPtr))
+					case reflect.Uint64:
+						uintVal = *(*uint64)(elemPtr)
+					}
+					buffer = encodeUvarint(buffer, uintVal)
+				case reflect.Float32, reflect.Float64:
+					var floatVal float64
+					if elemType.Kind() == reflect.Float32 {
+						floatVal = float64(*(*float32)(elemPtr))
+					} else {
+						floatVal = *(*float64)(elemPtr)
+					}
+					bits := math.Float64bits(floatVal)
+					buffer = encodeUvarint(buffer, bits)
+				case reflect.String:
+					strHdr := (*reflect.StringHeader)(elemPtr)
+					strVal := unsafe.String((*byte)(unsafe.Pointer(strHdr.Data)), strHdr.Len)
+					buffer = encodeString(buffer, strVal)
+				case reflect.Bool:
+					boolVal := *(*bool)(elemPtr)
+					buffer = encodeBool(buffer, boolVal)
+				default:
+					return nil, fmt.Errorf("unsupported slice element type: %v", elemType.Kind())
+				}
 			}
 		default:
 			return nil, fmt.Errorf("unsupported field type: %v", fieldOffset.Type)

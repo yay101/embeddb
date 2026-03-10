@@ -57,8 +57,13 @@ func (im *IndexManager[T]) CreateIndex(fieldName string) error {
 		return fmt.Errorf("field '%s' not found in struct", fieldName)
 	}
 
+	indexFieldType := fieldOffset.Type
+	if fieldOffset.IsSlice && fieldOffset.SliceElem != nil {
+		indexFieldType = fieldOffset.SliceElem.Kind()
+	}
+
 	// Create the B-tree index
-	index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, fieldOffset.Type, fieldOffset.IsTime)
+	index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime)
 	if err != nil {
 		return fmt.Errorf("failed to create index for field '%s': %w", fieldName, err)
 	}
@@ -217,6 +222,65 @@ func (im *IndexManager[T]) BuildIndex(fieldName string) error {
 				} else {
 					continue // Skip unsupported struct types
 				}
+			case reflect.Slice:
+				sliceHeader := (*reflect.SliceHeader)(fieldPtr)
+				if sliceHeader.Len == 0 {
+					continue
+				}
+
+				elemType := fieldOffset.SliceElem
+				dataPtr := sliceHeader.Data
+				elemSize := elemType.Size()
+
+				for i := 0; i < sliceHeader.Len; i++ {
+					elemPtr := unsafe.Pointer(dataPtr + uintptr(i)*elemSize)
+					var elem interface{}
+					switch elemType.Kind() {
+					case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+						switch elemType.Kind() {
+						case reflect.Int:
+							elem = *(*int)(elemPtr)
+						case reflect.Int8:
+							elem = *(*int8)(elemPtr)
+						case reflect.Int16:
+							elem = *(*int16)(elemPtr)
+						case reflect.Int32:
+							elem = *(*int32)(elemPtr)
+						case reflect.Int64:
+							elem = *(*int64)(elemPtr)
+						}
+					case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+						switch elemType.Kind() {
+						case reflect.Uint:
+							elem = *(*uint)(elemPtr)
+						case reflect.Uint8:
+							elem = *(*uint8)(elemPtr)
+						case reflect.Uint16:
+							elem = *(*uint16)(elemPtr)
+						case reflect.Uint32:
+							elem = *(*uint32)(elemPtr)
+						case reflect.Uint64:
+							elem = *(*uint64)(elemPtr)
+						}
+					case reflect.Float32, reflect.Float64:
+						if elemType.Kind() == reflect.Float32 {
+							elem = *(*float32)(elemPtr)
+						} else {
+							elem = *(*float64)(elemPtr)
+						}
+					case reflect.String:
+						strHdr := (*reflect.StringHeader)(elemPtr)
+						elem = unsafe.String((*byte)(unsafe.Pointer(strHdr.Data)), strHdr.Len)
+					case reflect.Bool:
+						elem = *(*bool)(elemPtr)
+					default:
+						continue
+					}
+					if err := index.Insert(elem, id); err != nil {
+						return fmt.Errorf("failed to index slice element: %w", err)
+					}
+				}
+				continue
 			default:
 				continue // Skip unsupported types
 			}
@@ -304,6 +368,65 @@ func (im *IndexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 			} else {
 				continue // Skip unsupported struct types
 			}
+		case reflect.Slice:
+			sliceHeader := (*reflect.SliceHeader)(fieldPtr)
+			if sliceHeader.Len == 0 {
+				continue
+			}
+
+			elemType := fieldOffset.SliceElem
+			dataPtr := sliceHeader.Data
+			elemSize := elemType.Size()
+
+			for i := 0; i < sliceHeader.Len; i++ {
+				elemPtr := unsafe.Pointer(dataPtr + uintptr(i)*elemSize)
+				var elem interface{}
+				switch elemType.Kind() {
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					switch elemType.Kind() {
+					case reflect.Int:
+						elem = *(*int)(elemPtr)
+					case reflect.Int8:
+						elem = *(*int8)(elemPtr)
+					case reflect.Int16:
+						elem = *(*int16)(elemPtr)
+					case reflect.Int32:
+						elem = *(*int32)(elemPtr)
+					case reflect.Int64:
+						elem = *(*int64)(elemPtr)
+					}
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					switch elemType.Kind() {
+					case reflect.Uint:
+						elem = *(*uint)(elemPtr)
+					case reflect.Uint8:
+						elem = *(*uint8)(elemPtr)
+					case reflect.Uint16:
+						elem = *(*uint16)(elemPtr)
+					case reflect.Uint32:
+						elem = *(*uint32)(elemPtr)
+					case reflect.Uint64:
+						elem = *(*uint64)(elemPtr)
+					}
+				case reflect.Float32, reflect.Float64:
+					if elemType.Kind() == reflect.Float32 {
+						elem = *(*float32)(elemPtr)
+					} else {
+						elem = *(*float64)(elemPtr)
+					}
+				case reflect.String:
+					strHdr := (*reflect.StringHeader)(elemPtr)
+					elem = unsafe.String((*byte)(unsafe.Pointer(strHdr.Data)), strHdr.Len)
+				case reflect.Bool:
+					elem = *(*bool)(elemPtr)
+				default:
+					continue
+				}
+				if err := index.Insert(elem, recordID); err != nil {
+					return fmt.Errorf("failed to index slice element: %w", err)
+				}
+			}
+			continue
 		default:
 			continue // Skip unsupported types
 		}
@@ -380,6 +503,25 @@ func (im *IndexManager[T]) RemoveFromIndexes(record *T, recordID uint32) error {
 			} else {
 				continue // Skip unsupported struct types
 			}
+		case reflect.Slice:
+			// For slice fields, get the slice header and iterate over elements
+			sliceHeader := (*reflect.SliceHeader)(fieldPtr)
+			if sliceHeader.Len == 0 {
+				continue // Skip empty slices
+			}
+			sliceVal := reflect.NewAt(
+				reflect.SliceOf(fieldOffset.SliceElem),
+				unsafe.Pointer(sliceHeader.Data),
+			).Elem()
+
+			// Remove each element from the index
+			for i := 0; i < sliceVal.Len(); i++ {
+				elem := sliceVal.Index(i).Interface()
+				if err := index.Remove(elem, recordID); err != nil {
+					return fmt.Errorf("failed to remove slice element from index: %w", err)
+				}
+			}
+			continue
 		default:
 			continue // Skip unsupported types
 		}
@@ -592,8 +734,13 @@ func (im *IndexManager[T]) CheckIndexes() error {
 			continue
 		}
 
+		indexFieldType := fieldOffset.Type
+		if fieldOffset.IsSlice && fieldOffset.SliceElem != nil {
+			indexFieldType = fieldOffset.SliceElem.Kind()
+		}
+
 		// Try to load the index
-		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, fieldOffset.Type, fieldOffset.IsTime)
+		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime)
 		if err != nil {
 			// If we fail to load, mark it for rebuild
 			im.pendingIndexes[fieldName] = struct{}{}
@@ -648,8 +795,13 @@ func (im *IndexManager[T]) ExtractIndexesFromDatabase() error {
 			continue
 		}
 
+		indexFieldType := offset.Type
+		if offset.IsSlice && offset.SliceElem != nil {
+			indexFieldType = offset.SliceElem.Kind()
+		}
+
 		// Try to load the extracted index
-		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, offset.Offset, offset.Type, offset.IsTime)
+		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, offset.Offset, indexFieldType, offset.IsTime)
 		if err != nil {
 			// If we fail to load, mark it for rebuild
 			im.pendingIndexes[fieldName] = struct{}{}
