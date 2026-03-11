@@ -65,7 +65,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	}
 
 	// Update index
-	t.db.index[recordID] = nextOffset
+	t.db.setRecordOffset(t.tableID, recordID, nextOffset)
 	t.db.header.nextOffset += uint32(len(completeRecord))
 
 	// Update indexes
@@ -87,7 +87,7 @@ func (t *Table[T]) Get(id uint32) (*T, error) {
 	defer t.db.lock.RUnlock()
 
 	// Look up the record offset
-	offset, exists := t.db.index[id]
+	offset, exists := t.db.getRecordOffset(t.tableID, id)
 	if !exists {
 		return nil, fmt.Errorf("record with id %d not found", id)
 	}
@@ -121,7 +121,7 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 	t.db.lock.Lock()
 
 	// Check if record exists
-	oldOffset, exists := t.db.index[id]
+	oldOffset, exists := t.db.indexes[t.tableID][id]
 	if !exists {
 		t.db.lock.Unlock()
 		return fmt.Errorf("record with id %d not found", id)
@@ -188,7 +188,7 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 	}
 
 	// Update index
-	t.db.index[id] = nextOffset
+	t.db.indexes[t.tableID][id] = nextOffset
 	t.db.header.nextOffset += uint32(len(completeRecord))
 
 	// Update indexes
@@ -213,7 +213,7 @@ func (t *Table[T]) Delete(id uint32) error {
 	t.db.lock.Lock()
 
 	// Check if record exists
-	offset, exists := t.db.index[id]
+	offset, exists := t.db.indexes[t.tableID][id]
 	if !exists {
 		t.db.lock.Unlock()
 		return fmt.Errorf("record with id %d not found", id)
@@ -317,7 +317,7 @@ func (t *Table[T]) Filter(fn func(T) bool) ([]T, error) {
 
 	results := make([]T, 0)
 
-	for id := range t.db.index {
+	for id := range t.db.indexes[t.tableID] {
 		record, err := t.Get(id)
 		if err != nil {
 			continue
@@ -336,7 +336,7 @@ func (t *Table[T]) Scan(fn func(T) bool) error {
 	t.db.lock.RLock()
 	defer t.db.lock.RUnlock()
 
-	for id := range t.db.index {
+	for id := range t.db.indexes[t.tableID] {
 		record, err := t.Get(id)
 		if err != nil {
 			continue
@@ -355,7 +355,7 @@ func (t *Table[T]) Count() int {
 	t.db.lock.RLock()
 	defer t.db.lock.RUnlock()
 
-	return len(t.db.index)
+	return len(t.db.indexes[t.tableID])
 }
 
 // CreateIndex creates an index on a field
@@ -438,7 +438,7 @@ func (t *Table[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedResult
 	totalCount := 0
 	skipped := 0
 
-	for id := range t.db.index {
+	for id := range t.db.indexes[t.tableID] {
 		record, err := t.Get(id)
 		if err != nil {
 			continue

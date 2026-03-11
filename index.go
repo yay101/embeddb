@@ -17,9 +17,11 @@ type index struct {
 }
 
 func (db *Database[T]) IDFromOffset(o uint32) (r uint32) {
-	for p := range db.index {
+	// For backward compatibility, use table 0
+	idx := db.indexes[0]
+	for p := range idx {
 		r = p - 1
-		if db.index[p] > o && db.index[r] < o {
+		if idx[p] > o && idx[r] < o {
 			return r
 		}
 	}
@@ -28,7 +30,9 @@ func (db *Database[T]) IDFromOffset(o uint32) (r uint32) {
 
 // this function isnt needed and should be replaced with db.index[id]. Its just here to get my thoughts out.
 func (db *Database[T]) OffsetFromID(id uint32) uint32 {
-	return db.index[id]
+	// For backward compatibility, use table 0
+	offset, _ := db.getRecordOffset(0, id)
+	return offset
 }
 
 // WriteIndex writes the index to the database file.
@@ -42,70 +46,71 @@ func (db *Database[T]) WriteIndex() (err error) {
 // writeIndexLocked writes the index to the database file.
 // IMPORTANT: Caller must hold db.lock before calling this method.
 func (db *Database[T]) writeIndexLocked() (err error) {
-	// Prepare a buffer for the index data
-	buf := bytes.NewBuffer(nil)
-
-	// Write the number of entries in the index
+	// Calculate total size needed for all table indexes
+	totalContentSize := 0
 	idBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(idBytes, uint32(len(db.index)))
-	buf.Write(idBytes)
 
-	// Write each (id, offset) pair as two uint32 values
-	for id, offset := range db.index {
-		binary.BigEndian.PutUint32(idBytes, id)
-		buf.Write(idBytes)
-		binary.BigEndian.PutUint32(idBytes, offset)
-		buf.Write(idBytes)
+	for _, idx := range db.indexes {
+		// Per table: tableID(1) + count(4) + entries(8 each)
+		tableSize := 1 + 4 + (len(idx) * 8)
+		totalContentSize += tableSize
 	}
 
-	// Calculate required space for the index (content + markers + length header)
-	indexContentSize := buf.Len()
-	totalIndexSize := 1 + 4 + indexContentSize + 1 // startMarker + length + content + endMarker
+	// Calculate required space for the index (content + markers)
+	totalIndexSize := 1 + totalContentSize + 1
 
-	// Determine write position - use existing index location if it fits,
-	// otherwise write at the end of records
+	// Determine write position
 	var writePosition uint32
 
-	// Check if we have an existing index location with enough capacity
 	if db.header.indexStart > 0 && db.header.indexCapacity >= uint32(totalIndexSize) {
-		// Reuse existing index location
 		writePosition = db.header.indexStart
 	} else {
-		// Need to allocate new space - write after all records
 		writePosition = db.header.nextOffset
-
-		// Calculate new capacity (double what we need, minimum defaultIndexPreallocation)
 		newCapacity := uint32(totalIndexSize) * 2
 		if newCapacity < defaultIndexPreallocation {
 			newCapacity = defaultIndexPreallocation
 		}
 		atomic.StoreUint32(&db.header.indexCapacity, newCapacity)
-
-		// Update nextOffset to be after the index area (using capacity, not actual size)
-		// This reserves space for the index to grow without moving
 		atomic.StoreUint32(&db.header.nextOffset, writePosition+newCapacity)
 	}
 
-	// Prepare the full index data with markers
-	headerBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(headerBytes, uint32(indexContentSize))
-	indexData := slices.Concat([]byte{startMarker}, headerBytes, buf.Bytes(), []byte{endMarker})
+	// Build index data
+	indexData := make([]byte, 0, totalIndexSize)
+	indexData = append(indexData, startMarker)
+
+	// Write each table's index block
+	for tableID := uint8(0); tableID < 255; tableID++ {
+		idx, exists := db.indexes[tableID]
+		if !exists || len(idx) == 0 {
+			continue
+		}
+
+		indexData = append(indexData, tableID)
+		binary.BigEndian.PutUint32(idBytes, uint32(len(idx)))
+		indexData = append(indexData, idBytes...)
+
+		for id, offset := range idx {
+			binary.BigEndian.PutUint32(idBytes, id)
+			indexData = append(indexData, idBytes...)
+			binary.BigEndian.PutUint32(idBytes, offset)
+			indexData = append(indexData, idBytes...)
+		}
+	}
+
+	indexData = append(indexData, endMarker)
 
 	// Write the index data
 	if _, err := db.file.WriteAt(indexData, int64(writePosition)); err != nil {
 		return fmt.Errorf("failed to write index: %w", err)
 	}
 
-	// Save the previous index location before updating (only if location changed)
 	if db.header.indexStart != writePosition {
 		db.header.lgIndexStart = db.header.indexStart
 	}
 
-	// Update the header with the index location
 	atomic.StoreUint32(&db.header.indexStart, writePosition)
 	atomic.StoreUint32(&db.header.indexEnd, writePosition+uint32(len(indexData)))
 
-	// Update the header on disk
 	return db.encodeHeaderLocked()
 }
 

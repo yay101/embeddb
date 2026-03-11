@@ -26,8 +26,8 @@ type Database[T any] struct {
 	file         *os.File
 	mfile        *mmap.ReaderAt
 	mlock        sync.RWMutex
-	index        map[uint32]uint32 // Map of record IDs to their file offsets
-	layout       *StructLayout     // Struct layout information using unsafe
+	indexes      map[uint8]map[uint32]uint32 // tableID -> recordID -> file offset
+	layout       *StructLayout               // Struct layout information using unsafe
 	nextRecordID uint32
 	nlock        sync.Mutex
 	transaction  *Transaction     // Transaction manager for atomicity
@@ -111,6 +111,61 @@ func (db *Database[T]) nextId() uint32 {
 	id := db.nextRecordID
 	db.nextRecordID++
 	return id
+}
+
+// getTableIndex returns the index for a specific table, creating if needed
+func (db *Database[T]) getTableIndex(tableID uint8) map[uint32]uint32 {
+	if db.indexes == nil {
+		db.indexes = make(map[uint8]map[uint32]uint32)
+	}
+	if db.indexes[tableID] == nil {
+		db.indexes[tableID] = make(map[uint32]uint32)
+	}
+	return db.indexes[tableID]
+}
+
+// setRecordOffset sets the file offset for a record in a specific table
+func (db *Database[T]) setRecordOffset(tableID uint8, recordID uint32, offset uint32) {
+	db.getTableIndex(tableID)[recordID] = offset
+}
+
+// getRecordOffset gets the file offset for a record in a specific table
+func (db *Database[T]) getRecordOffset(tableID uint8, recordID uint32) (uint32, bool) {
+	if db.indexes == nil {
+		return 0, false
+	}
+	idx, ok := db.indexes[tableID]
+	if !ok {
+		return 0, false
+	}
+	offset, ok := idx[recordID]
+	return offset, ok
+}
+
+// hasRecord checks if a record exists in a specific table
+func (db *Database[T]) hasRecord(tableID uint8, recordID uint32) bool {
+	_, ok := db.getRecordOffset(tableID, recordID)
+	return ok
+}
+
+// deleteRecord removes a record from a specific table's index
+func (db *Database[T]) deleteRecord(tableID uint8, recordID uint32) {
+	if db.indexes != nil {
+		if idx, ok := db.indexes[tableID]; ok {
+			delete(idx, recordID)
+		}
+	}
+}
+
+// tableRecordCount returns the number of records in a specific table
+func (db *Database[T]) tableRecordCount(tableID uint8) int {
+	if db.indexes == nil {
+		return 0
+	}
+	if idx, ok := db.indexes[tableID]; ok {
+		return len(idx)
+	}
+	return 0
 }
 
 // CreateIndex creates an index for the specified field
@@ -235,7 +290,9 @@ func (db *Database[T]) Filter(fn FilterFunc[T]) ([]T, error) {
 
 	results := make([]T, 0)
 
-	for id := range db.index {
+	// For backward compatibility, use table 0 (legacy single-table mode)
+	idx := db.indexes[0]
+	for id := range idx {
 		record, err := db.getLocked(id)
 		if err != nil {
 			continue // Skip records that can't be read
@@ -256,7 +313,9 @@ func (db *Database[T]) Scan(fn func(record T) bool) error {
 	db.lock.RLock()
 	defer db.lock.RUnlock()
 
-	for id := range db.index {
+	// For backward compatibility, use table 0 (legacy single-table mode)
+	idx := db.indexes[0]
+	for id := range idx {
 		record, err := db.getLocked(id)
 		if err != nil {
 			continue // Skip records that can't be read
@@ -275,7 +334,12 @@ func (db *Database[T]) Count() int {
 	db.lock.RLock()
 	defer db.lock.RUnlock()
 
-	return len(db.index)
+	// Sum records across all tables
+	total := 0
+	for _, idx := range db.indexes {
+		total += len(idx)
+	}
+	return total
 }
 
 // QueryPaged finds records that match a field value using an index with pagination
@@ -319,7 +383,9 @@ func (db *Database[T]) FilterPaged(fn FilterFunc[T], offset, limit int) (*PagedR
 	totalCount := 0
 	skipped := 0
 
-	for id := range db.index {
+	// For backward compatibility, use table 0 (legacy single-table mode)
+	idx := db.indexes[0]
+	for id := range idx {
 		record, err := db.getLocked(id)
 		if err != nil {
 			continue

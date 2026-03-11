@@ -332,7 +332,7 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 	db := &Database[T]{
 		file:         file,
-		index:        make(map[uint32]uint32),
+		indexes:      make(map[uint8]map[uint32]uint32),
 		nextRecordID: 1, // Start with ID 1
 		layout:       layout,
 		defaultTable: defaultTableName,
@@ -410,7 +410,8 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 			// Create a record to check if the schema matches
 
 			// Try to read a record to verify schema compatibility
-			for id := range db.index {
+			idx := db.indexes[0]
+			for id := range idx {
 				existingRecord, err := db.Get(id)
 				if err == nil && existingRecord != nil {
 					// Found a valid record, check if migration is needed
@@ -576,7 +577,7 @@ func (db *Database[T]) InsertToTable(record *T, tableName string) (uint32, error
 	}
 
 	// 4. Update the index with the new record
-	db.index[newRecordId] = nextOffset
+	db.setRecordOffset(tableID, newRecordId, nextOffset)
 
 	// 5. Update the next offset
 	db.header.nextOffset += uint32(len(completeRecord))
@@ -622,23 +623,20 @@ func (db *Database[T]) Get(id uint32) (*T, error) {
 // getLocked retrieves a record without acquiring locks.
 // IMPORTANT: Caller must hold db.lock (read or write) before calling this method.
 func (db *Database[T]) getLocked(id uint32) (*T, error) {
-	// 1. Look up the record offset in the index
-	offset, exists := db.index[id]
+	// For backward compatibility, use table 0 (legacy single-table mode)
+	return db.getLockedForTable(id, 0)
+}
+
+// getLockedForTable retrieves a record from a specific table without acquiring locks.
+func (db *Database[T]) getLockedForTable(id uint32, tableID uint8) (*T, error) {
+	// 1. Look up the record offset in the table's index
+	offset, exists := db.getRecordOffset(tableID, id)
 	if !exists {
 		return nil, fmt.Errorf("record with id %d not found", id)
 	}
 
 	// 2. Read the record bytes with table context
-	expectedTableID := uint8(0)
-	if db.tableCatalog != nil && db.defaultTable != "" {
-		var ok bool
-		expectedTableID, ok = db.tableCatalog.GetTableID(db.defaultTable)
-		if !ok {
-			expectedTableID = 0
-		}
-	}
-
-	recordBytes, err := db.readRecordBytesAt(offset, expectedTableID)
+	recordBytes, err := db.readRecordBytesAt(offset, tableID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read record bytes: %w", err)
 	}
@@ -661,6 +659,12 @@ func (db *Database[T]) getLocked(id uint32) (*T, error) {
 
 // Delete marks a record as inactive in the database
 func (db *Database[T]) Delete(id uint32) error {
+	// For backward compatibility, use table 0
+	return db.DeleteFromTable(id, 0)
+}
+
+// DeleteFromTable marks a record as inactive in a specific table
+func (db *Database[T]) DeleteFromTable(id uint32, tableID uint8) error {
 	// Serialize write operations
 	db.writeLock.Lock()
 	defer db.writeLock.Unlock()
@@ -668,22 +672,14 @@ func (db *Database[T]) Delete(id uint32) error {
 	db.lock.Lock()
 
 	// Check if the record exists
-	offset, exists := db.index[id]
+	offset, exists := db.getRecordOffset(tableID, id)
 	if !exists {
 		db.lock.Unlock()
 		return fmt.Errorf("record with id %d not found", id)
 	}
 
 	// Check if the record is already inactive
-	expectedTableID := uint8(0)
-	if db.tableCatalog != nil && db.defaultTable != "" {
-		var ok bool
-		expectedTableID, ok = db.tableCatalog.GetTableID(db.defaultTable)
-		if !ok {
-			expectedTableID = 0
-		}
-	}
-	recordBytes, err := db.readRecordBytesAt(offset, expectedTableID)
+	recordBytes, err := db.readRecordBytesAt(offset, tableID)
 	if err != nil {
 		return fmt.Errorf("failed to read record: %w", err)
 	}
@@ -729,7 +725,6 @@ func (db *Database[T]) Delete(id uint32) error {
 		}
 	}
 
-
 	return nil
 }
 
@@ -746,42 +741,27 @@ func (db *Database[T]) decodeRecord(data []byte) (*T, error) {
 // Update updates an existing record in the database
 // This implementation uses atomic operations to ensure data integrity
 func (db *Database[T]) Update(id uint32, record *T) error {
-	// Begin a transaction to ensure atomicity
-	if err := db.beginTransaction(); err != nil {
-		return fmt.Errorf("failed to begin update transaction: %w", err)
-	}
+	// For backward compatibility, use table 0
+	return db.UpdateInTable(id, record, 0)
+}
 
-	// Use defer to ensure we either commit or rollback
-	committed := false
-	defer func() {
-		if !committed {
-			// Only rollback if not committed
-			if err := db.rollbackTransaction(); err != nil {
-				// Just log the error, we can't return it from defer
-				fmt.Printf("Error rolling back transaction: %v\n", err)
-			}
-		}
-	}()
+// UpdateInTable updates an existing record in a specific table
+func (db *Database[T]) UpdateInTable(id uint32, record *T, tableID uint8) error {
+	// Serialize write operations
+	db.writeLock.Lock()
+	defer db.writeLock.Unlock()
 
 	db.lock.Lock()
 
 	// Check if the record exists
-	oldOffset, exists := db.index[id]
+	oldOffset, exists := db.getRecordOffset(tableID, id)
 	if !exists {
 		db.lock.Unlock()
 		return fmt.Errorf("record with id %d not found", id)
 	}
 
 	// Read old record bytes to verify it's active
-	expectedTableID := uint8(0)
-	if db.tableCatalog != nil && db.defaultTable != "" {
-		var ok bool
-		expectedTableID, ok = db.tableCatalog.GetTableID(db.defaultTable)
-		if !ok {
-			expectedTableID = 0
-		}
-	}
-	oldBytes, err := db.readRecordBytesAt(oldOffset, expectedTableID)
+	oldBytes, err := db.readRecordBytesAt(oldOffset, tableID)
 	if err != nil {
 		return fmt.Errorf("failed to read old record: %w", err)
 	}
@@ -791,8 +771,8 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 		return fmt.Errorf("cannot update inactive record with id %d", id)
 	}
 
-	// Get the old record for index updates (use getLocked since we hold lock)
-	oldRecord, err := db.getLocked(id)
+	// Get the old record for index updates
+	oldRecord, err := db.getLockedForTable(id, tableID)
 	if err != nil {
 		db.lock.Unlock()
 		return fmt.Errorf("failed to get old record for index updates: %w", err)
@@ -818,7 +798,7 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 	headerBytes := make([]byte, 12)
 	headerBytes[0] = escCode
 	headerBytes[1] = startMarker
-	headerBytes[2] = expectedTableID
+	headerBytes[2] = tableID
 
 	// Write the ID (reuse the same ID)
 	binary.BigEndian.PutUint32(headerBytes[3:7], id)
@@ -846,13 +826,10 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 	}
 
 	// Update the index with the new record location
-	db.index[id] = nextOffset
+	db.setRecordOffset(tableID, id, nextOffset)
 
 	// Update the next offset
 	db.header.nextOffset += uint32(len(completeRecord))
-
-	// Index is kept in memory - will be persisted on Close() or Sync()
-	// This avoids O(n^2) file growth from writing the full index on every update
 
 	// Update any indexes
 	if db.indexManager != nil && oldRecord != nil {
@@ -862,19 +839,8 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 		}
 	}
 
-	// Release lock before calling commit
+	// Release lock
 	db.lock.Unlock()
-
-	// Commit the transaction
-	if err := db.commitTransaction(); err != nil {
-		return fmt.Errorf("failed to commit update transaction: %w", err)
-	}
-	committed = true
-
-	// Reload mmap to ensure subsequent reads see the updated data
-	if err := db.ReloadMMap(); err != nil {
-		fmt.Printf("Warning: failed to reload mmap after update: %v\n", err)
-	}
 
 	return nil
 }
