@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 func cleanupStaleIndexFiles(dbFileName string) error {
@@ -399,11 +400,13 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 	defaultTableName := reflect.TypeOf(instance).Name()
 
 	db := &Database[T]{
-		file:         file,
-		indexes:      make(map[uint8]map[uint32]uint32),
-		nextRecordID: 1, // Start with ID 1
-		layout:       layout,
-		defaultTable: defaultTableName,
+		file:              file,
+		indexes:           make(map[uint8]map[uint32]uint32),
+		nextRecordID:      1, // Start with ID 1
+		layout:            layout,
+		defaultTable:      defaultTableName,
+		autoVacuumEnabled: true,
+		lastVacuumTime:    time.Now(),
 	}
 
 	// Create the index manager
@@ -685,6 +688,7 @@ func (db *Database[T]) InsertToTable(record *T, tableName string) (uint32, error
 
 	// Release lock
 	db.lock.Unlock()
+	db.markMutation()
 
 	return newRecordId, nil
 }
@@ -821,6 +825,8 @@ func (db *Database[T]) DeleteFromTable(id uint32, tableID uint8) error {
 			return fmt.Errorf("failed to update indexes: %w", err)
 		}
 	}
+	db.lock.Unlock()
+	db.markMutation()
 
 	return nil
 }
@@ -938,6 +944,7 @@ func (db *Database[T]) UpdateInTable(id uint32, record *T, tableID uint8) error 
 
 	// Release lock
 	db.lock.Unlock()
+	db.markMutation()
 
 	return nil
 }

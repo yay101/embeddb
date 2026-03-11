@@ -182,6 +182,17 @@ err := users.Drop()
 err := db.Vacuum()
 ```
 
+### Auto Vacuum
+
+EmbedDB also performs a conservative automatic vacuum check during `Sync()` / `Close()`:
+
+- at most once per 24 hours
+- and only if either:
+  - at least one table was dropped since the last vacuum, or
+  - at least 50,000 record mutations (insert/update/delete) happened since the last vacuum
+
+This keeps routine writes fast while still compacting files periodically for long-running workloads.
+
 ### Multiple Tables
 
 You can store multiple types in the same database file by opening the same file with the relevant type and table name:

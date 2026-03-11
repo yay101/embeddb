@@ -78,6 +78,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	}
 
 	t.db.lock.Unlock()
+	t.db.markMutation()
 
 	return recordID, nil
 }
@@ -478,6 +479,7 @@ func (t *Table[T]) Drop() error {
 		return nil
 	}
 	t.db.tableCatalog.DropTable(t.name)
+	t.db.markTableDropped()
 	return t.db.writeTableCatalog()
 }
 

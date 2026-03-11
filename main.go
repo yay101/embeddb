@@ -5,6 +5,7 @@ import (
 	"os"
 	"reflect"
 	"sync"
+	"time"
 
 	"golang.org/x/exp/mmap"
 )
@@ -34,6 +35,12 @@ type Database[T any] struct {
 	indexManager *IndexManager[T] // Manager for field indexes
 	tableCatalog *TableCatalog    // Table catalog for multi-table support
 	defaultTable string           // Default table name for single-table mode
+
+	autoVacuumEnabled       bool
+	changesSinceVacuum      uint64
+	tableDroppedSinceVacuum bool
+	lastVacuumTime          time.Time
+	vacuumStateLock         sync.Mutex
 }
 
 type DBHeader struct {
@@ -65,6 +72,8 @@ const (
 	defaultIndexPreallocation uint32       = 10240          // 10KB preallocated for index by default
 	Version                   string       = "0.2.0"
 	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
+	autoVacuumInterval                     = 24 * time.Hour
+	autoVacuumMinChanges      uint64       = 50000
 )
 
 // DB is a non-generic database that can store multiple table types.
@@ -168,6 +177,48 @@ func (db *Database[T]) tableRecordCount(tableID uint8) int {
 	return 0
 }
 
+func (db *Database[T]) markMutation() {
+	db.vacuumStateLock.Lock()
+	db.changesSinceVacuum++
+	db.vacuumStateLock.Unlock()
+}
+
+func (db *Database[T]) markTableDropped() {
+	db.vacuumStateLock.Lock()
+	db.tableDroppedSinceVacuum = true
+	db.vacuumStateLock.Unlock()
+}
+
+func (db *Database[T]) markVacuumCompleted() {
+	db.vacuumStateLock.Lock()
+	db.lastVacuumTime = time.Now()
+	db.changesSinceVacuum = 0
+	db.tableDroppedSinceVacuum = false
+	db.vacuumStateLock.Unlock()
+}
+
+func (db *Database[T]) shouldAutoVacuum() bool {
+	if !db.autoVacuumEnabled {
+		return false
+	}
+	db.vacuumStateLock.Lock()
+	defer db.vacuumStateLock.Unlock()
+	if time.Since(db.lastVacuumTime) < autoVacuumInterval {
+		return false
+	}
+	return db.tableDroppedSinceVacuum || db.changesSinceVacuum >= autoVacuumMinChanges
+}
+
+func (db *Database[T]) maybeAutoVacuum() error {
+	if !db.shouldAutoVacuum() {
+		return nil
+	}
+	if err := db.Vacuum(); err != nil {
+		return fmt.Errorf("auto vacuum failed: %w", err)
+	}
+	return nil
+}
+
 // CreateIndex creates an index for the specified field
 func (db *Database[T]) CreateIndex(fieldName string) error {
 	if db.indexManager == nil {
@@ -215,25 +266,33 @@ func (db *Database[T]) Close() error {
 // called by Close().
 func (db *Database[T]) Sync() error {
 	db.lock.Lock()
-	defer db.lock.Unlock()
 
 	// Write the index to disk
 	if err := db.writeIndexLocked(); err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to write index: %w", err)
 	}
 
 	// Write the table catalog to disk (must be after index to avoid overwrite)
 	if err := db.writeTableCatalogLocked(); err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to write table catalog: %w", err)
 	}
 
 	// Write the header to disk
 	if err := db.encodeHeaderLocked(); err != nil {
+		db.lock.Unlock()
 		return fmt.Errorf("failed to write header: %w", err)
 	}
 
 	// Sync the file
-	return db.file.Sync()
+	if err := db.file.Sync(); err != nil {
+		db.lock.Unlock()
+		return err
+	}
+	db.lock.Unlock()
+
+	return db.maybeAutoVacuum()
 }
 
 // Query finds all records that match a field value using an index

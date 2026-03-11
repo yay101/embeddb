@@ -441,5 +441,7 @@ func (db *Database[T]) Vacuum() error {
 		}
 	}
 
+	db.markVacuumCompleted()
+
 	return nil
 }
