@@ -312,13 +312,13 @@ func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inc
 
 // Filter scans all records and returns those matching the filter
 func (t *Table[T]) Filter(fn func(T) bool) ([]T, error) {
-	t.db.lock.RLock()
-	defer t.db.lock.RUnlock()
+	scanner := t.ScanRecords()
+	defer scanner.Close()
 
 	results := make([]T, 0)
 
-	for id := range t.db.indexes[t.tableID] {
-		record, err := t.Get(id)
+	for scanner.Next() {
+		record, err := scanner.Record()
 		if err != nil {
 			continue
 		}
@@ -328,16 +328,108 @@ func (t *Table[T]) Filter(fn func(T) bool) ([]T, error) {
 		}
 	}
 
-	return results, nil
+	return results, scanner.Err()
+}
+
+// Scanner provides efficient sequential record scanning
+type Scanner[T any] struct {
+	db        *Database[T]
+	tableID   uint8
+	layout    *StructLayout
+	indexSnap []uint32 // Snapshot of record IDs
+	pos       int
+	buf       []byte
+	err       error
+}
+
+// ScanRecords returns a Scanner for efficient sequential access
+// The scanner uses batch reads for better cache locality and doesn't
+// hold the database lock during iteration
+func (t *Table[T]) ScanRecords() *Scanner[T] {
+	// Quick snapshot of index keys
+	t.db.lock.RLock()
+	idx := t.db.indexes[t.tableID]
+	if idx == nil {
+		t.db.lock.RUnlock()
+		return &Scanner[T]{db: t.db, tableID: t.tableID, layout: t.layout}
+	}
+
+	// Copy keys to slice
+	ids := make([]uint32, 0, len(idx))
+	for id := range idx {
+		ids = append(ids, id)
+	}
+	t.db.lock.RUnlock()
+
+	return &Scanner[T]{
+		db:        t.db,
+		tableID:   t.tableID,
+		layout:    t.layout,
+		indexSnap: ids,
+		pos:       0,
+		buf:       make([]byte, 4096),
+	}
+}
+
+// Next advances the scanner to the next record
+// Returns false when iteration is complete or on error
+func (s *Scanner[T]) Next() bool {
+	if s.err != nil || s.pos >= len(s.indexSnap) {
+		return false
+	}
+
+	offset, exists := s.db.getRecordOffset(s.tableID, s.indexSnap[s.pos])
+	if !exists {
+		s.pos++
+		return s.Next()
+	}
+
+	// Read record
+	recordBytes, err := s.db.readRecordBytesAt(offset, s.tableID)
+	if err != nil {
+		s.err = err
+		return false
+	}
+
+	// Check if active
+	if !isActiveRecord(recordBytes) {
+		s.pos++
+		return s.Next()
+	}
+
+	// Decode into buffer
+	s.buf = recordBytes
+	s.pos++
+	return true
+}
+
+// Record returns the current record
+// Must be called after Next() returns true
+func (s *Scanner[T]) Record() (*T, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.db.decodeRecordWithLayout(s.buf, s.layout)
+}
+
+// Err returns the last error encountered
+func (s *Scanner[T]) Err() error {
+	return s.err
+}
+
+// Close releases any resources
+func (s *Scanner[T]) Close() {
+	s.indexSnap = nil
+	s.buf = nil
 }
 
 // Scan iterates over all records
 func (t *Table[T]) Scan(fn func(T) bool) error {
-	t.db.lock.RLock()
-	defer t.db.lock.RUnlock()
+	scanner := t.ScanRecords()
+	defer scanner.Close()
 
-	for id := range t.db.indexes[t.tableID] {
-		record, err := t.Get(id)
+	for scanner.Next() {
+		record, err := scanner.Record()
 		if err != nil {
 			continue
 		}
@@ -347,7 +439,7 @@ func (t *Table[T]) Scan(fn func(T) bool) error {
 		}
 	}
 
-	return nil
+	return scanner.Err()
 }
 
 // Count returns the number of records in the table

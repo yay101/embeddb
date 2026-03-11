@@ -295,17 +295,51 @@ type FilterFunc[T any] func(record T) bool
 // Filter scans all records and returns those that match the filter function.
 // This performs an unindexed full table scan - use only when no index is available.
 func (db *Database[T]) Filter(fn FilterFunc[T]) ([]T, error) {
+	// Quick snapshot of index keys
 	db.lock.RLock()
-	defer db.lock.RUnlock()
+	var idx map[uint32]uint32
+	var tableID uint8 = 0
 
-	results := make([]T, 0)
+	// Find non-empty index (prefer table 0 for legacy, but use any available)
+	for tid, m := range db.indexes {
+		if len(m) > 0 {
+			idx = m
+			tableID = tid
+			break
+		}
+	}
 
-	// For backward compatibility, use table 0 (legacy single-table mode)
-	idx := db.indexes[0]
+	if idx == nil {
+		db.lock.RUnlock()
+		return nil, nil
+	}
+
+	ids := make([]uint32, 0, len(idx))
 	for id := range idx {
-		record, err := db.getLocked(id)
+		ids = append(ids, id)
+	}
+	db.lock.RUnlock()
+
+	// Iterate without holding lock
+	results := make([]T, 0)
+	for _, id := range ids {
+		offset, exists := idx[id]
+		if !exists {
+			continue
+		}
+
+		recordBytes, err := db.readRecordBytesAt(offset, tableID)
 		if err != nil {
-			continue // Skip records that can't be read
+			continue
+		}
+
+		if !isActiveRecord(recordBytes) {
+			continue
+		}
+
+		record, err := db.decodeRecord(recordBytes)
+		if err != nil {
+			continue
 		}
 
 		if fn(*record) {
@@ -386,29 +420,61 @@ func (db *Database[T]) QueryRangeBetweenPaged(fieldName string, min, max interfa
 
 // FilterPaged scans all records and returns those that match the filter function with pagination
 func (db *Database[T]) FilterPaged(fn FilterFunc[T], offset, limit int) (*PagedResult[T], error) {
+	// Quick snapshot of index keys
 	db.lock.RLock()
-	defer db.lock.RUnlock()
+	var idx map[uint32]uint32
+	var tableID uint8
 
+	for tid, m := range db.indexes {
+		if len(m) > 0 {
+			idx = m
+			tableID = tid
+			break
+		}
+	}
+
+	if idx == nil {
+		db.lock.RUnlock()
+		return &PagedResult[T]{Records: []T{}}, nil
+	}
+
+	ids := make([]uint32, 0, len(idx))
+	for id := range idx {
+		ids = append(ids, id)
+	}
+	db.lock.RUnlock()
+
+	// Iterate without holding lock
 	var results []T
 	totalCount := 0
 	skipped := 0
 
-	// For backward compatibility, use table 0 (legacy single-table mode)
-	idx := db.indexes[0]
-	for id := range idx {
-		record, err := db.getLocked(id)
+	for _, id := range ids {
+		offsetVal, exists := idx[id]
+		if !exists {
+			continue
+		}
+
+		recordBytes, err := db.readRecordBytesAt(offsetVal, tableID)
+		if err != nil {
+			continue
+		}
+
+		if !isActiveRecord(recordBytes) {
+			continue
+		}
+
+		record, err := db.decodeRecord(recordBytes)
 		if err != nil {
 			continue
 		}
 
 		if fn(*record) {
 			totalCount++
-			// Skip records before offset
 			if skipped < offset {
 				skipped++
 				continue
 			}
-			// Add records up to limit
 			if len(results) < limit {
 				results = append(results, *record)
 			}
