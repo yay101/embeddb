@@ -24,7 +24,9 @@ func cleanupStaleIndexFiles(dbFileName string) error {
 	return nil
 }
 
-// TableCatalogEntry represents a single table in the database catalog
+// TableCatalogEntry represents a single table in the database catalog.
+//
+// Deprecated: internal use only. This type will be made private in a future release.
 type TableCatalogEntry struct {
 	Name       string
 	LayoutHash string
@@ -32,7 +34,9 @@ type TableCatalogEntry struct {
 	Dropped    bool
 }
 
-// TableCatalog manages the tables in the database
+// TableCatalog manages the tables in the database.
+//
+// Deprecated: internal use only. This type will be made private in a future release.
 type TableCatalog struct {
 	tables   map[string]*TableCatalogEntry
 	tableIDs map[uint8]string // tableID -> table name
@@ -40,6 +44,9 @@ type TableCatalog struct {
 	lock     sync.RWMutex
 }
 
+// NewTableCatalog creates a table catalog.
+//
+// Deprecated: internal use only. This function will be made private in a future release.
 func NewTableCatalog() *TableCatalog {
 	return &TableCatalog{
 		tables:   make(map[string]*TableCatalogEntry),

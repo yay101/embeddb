@@ -21,7 +21,9 @@ type PagedResult[T any] struct {
 	Limit      int  // The limit used for this query
 }
 
-// IndexManager handles the creation, management, and querying of indexes for a database
+// IndexManager handles the creation, management, and querying of indexes for a database.
+//
+// Deprecated: internal use only. This type will be made private in a future release.
 type IndexManager[T any] struct {
 	db             *Database[T]           // Reference to the parent database
 	indexes        map[string]*BTreeIndex // Map of field name to index
@@ -30,7 +32,9 @@ type IndexManager[T any] struct {
 	pendingIndexes map[string]struct{}    // Set of indexes that need to be rebuilt
 }
 
-// NewIndexManager creates a new index manager for a database
+// NewIndexManager creates a new index manager for a database.
+//
+// Deprecated: internal use only. This function will be made private in a future release.
 func NewIndexManager[T any](db *Database[T], layout *StructLayout) *IndexManager[T] {
 	return &IndexManager[T]{
 		db:             db,

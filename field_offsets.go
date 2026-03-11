@@ -35,6 +35,8 @@ type StructLayout struct {
 
 // ComputeStructLayout analyzes the provided struct and returns a StructLayout
 // containing offsets for all fields, used for direct memory access
+//
+// Deprecated: internal use only. This function will be made private in a future release.
 func ComputeStructLayout(data interface{}) (*StructLayout, error) {
 	t := reflect.TypeOf(data)
 	if t.Kind() != reflect.Struct {
@@ -136,6 +138,8 @@ func computeFieldOffsets(t reflect.Type, baseOffset uintptr, byteKey *byte, pare
 
 // GetFieldValue uses the field offset to directly read a field's value from the struct
 // This avoids reflection during database operations
+//
+// Deprecated: internal use only. This function will be made private in a future release.
 func GetFieldValue(data interface{}, offset FieldOffset) (interface{}, error) {
 	ptr := unsafe.Pointer(reflect.ValueOf(data).Pointer())
 	fieldPtr := unsafe.Add(ptr, offset.Offset)
@@ -193,6 +197,8 @@ func GetFieldValue(data interface{}, offset FieldOffset) (interface{}, error) {
 // SetFieldValue uses the field offset to directly set a field's value in the struct
 // This avoids reflection during database operations
 // Handles type conversions from decoded values (e.g., int64 -> int, uint64 -> uint32)
+//
+// Deprecated: internal use only. This function will be made private in a future release.
 func SetFieldValue(data interface{}, offset FieldOffset, value interface{}) error {
 	ptr := unsafe.Pointer(reflect.ValueOf(data).Pointer())
 	fieldPtr := unsafe.Add(ptr, offset.Offset)

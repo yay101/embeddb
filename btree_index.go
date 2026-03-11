@@ -87,7 +87,9 @@ func boolToUint8(b bool) uint8 {
 	return 0
 }
 
-// BTreeIndex represents a memory-mapped B-tree index for a specific field
+// BTreeIndex represents a memory-mapped B-tree index for a specific field.
+//
+// Deprecated: internal use only. This type will be made private in a future release.
 type BTreeIndex struct {
 	file          *os.File       // Index file
 	mmap          *mmap.ReaderAt // Memory-mapped access to the file
@@ -144,7 +146,9 @@ type pendingWrite struct {
 	isDelete bool        // True for delete operations
 }
 
-// NewBTreeIndex creates a new B-tree index for the specified field
+// NewBTreeIndex creates a new B-tree index for the specified field.
+//
+// Deprecated: internal use only. This function will be made private in a future release.
 func NewBTreeIndex(dbFileName, fieldName string, fieldOffset uintptr, fieldType reflect.Kind, isTimeField bool) (*BTreeIndex, error) {
 	// Create the index file in the same directory as the database file
 	dbDir := filepath.Dir(dbFileName)
@@ -2240,7 +2244,9 @@ func (idx *BTreeIndex) mergeWithDatabase() error {
 	return dbFile.Sync()
 }
 
-// extractFromDatabase extracts the index from a database file
+// extractFromDatabase extracts the index from a database file.
+//
+// Deprecated: internal use only. This function will be made private in a future release.
 func ExtractIndexFromDatabase(dbFileName string, indexFileName string) error {
 	// Open the database file
 	dbFile, err := os.Open(dbFileName)
