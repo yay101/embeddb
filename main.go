@@ -18,6 +18,7 @@ import (
 // [escCode,endMarker]2 bytes - Marks the end of a record.
 
 // Database is a generic type that represents a database for storing records of type T.
+// For multi-table support, use db.Table() to get typed table access.
 type Database[T any] struct {
 	header       DBHeader
 	lock         sync.RWMutex
@@ -30,25 +31,29 @@ type Database[T any] struct {
 	nlock        sync.Mutex
 	transaction  *Transaction     // Transaction manager for atomicity
 	indexManager *IndexManager[T] // Manager for field indexes
+	tableCatalog *TableCatalog    // Table catalog for multi-table support
+	defaultTable string           // Default table name for single-table mode
 }
 
 type DBHeader struct {
-	Version       string
-	indexStart    uint32
-	indexEnd      uint32
-	nextRecordID  uint32
-	nextOffset    uint32
-	tocStart      uint32
-	entryStart    uint32
-	lgIndexStart  uint32 // Last good index start position
-	lock          sync.Mutex
-	indexCapacity uint32 // Capacity allocated for the index
+	Version            string
+	indexStart         uint32
+	indexEnd           uint32
+	nextRecordID       uint32
+	nextOffset         uint32
+	tocStart           uint32
+	entryStart         uint32
+	lgIndexStart       uint32 // Last good index start position
+	lock               sync.Mutex
+	indexCapacity      uint32 // Capacity allocated for the index
+	tableCatalogOffset uint32 // Offset to table catalog
+	tableCount         uint32 // Number of tables
 }
 
 // This type is no longer used and has been replaced by FieldOffset in field_offsets.go
 
 const (
-	headerSize                int          = 32
+	headerSize                int          = 48
 	chunkSize                 int          = 4096
 	escCode                   byte         = 0x1B
 	startMarker               byte         = 0x02
@@ -57,9 +62,47 @@ const (
 	valueEndMarker            byte         = 0x1F
 	embeddedStructType        reflect.Kind = reflect.Struct // Use reflect.Struct
 	defaultIndexPreallocation uint32       = 10240          // 10KB preallocated for index by default
-	Version                   string       = "0.0.1"
+	Version                   string       = "0.1.0"
 	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
 )
+
+// DB is a non-generic database that can store multiple table types.
+// Note: For typed table access, use the generic Database[T] with db.Table() method.
+// Example: db, _ := embeddb.New[User]("file.db", false, false); users, _ := db.Table()
+type DB struct {
+	*Database[any]
+}
+
+// Table returns a typed Table[T] for accessing records.
+// If name is not provided or empty, the table name is auto-derived from the type name.
+// Example: db.Table() or db.Table("users")
+func (db *Database[T]) Table(name ...string) (*Table[T], error) {
+	var instance T
+	layout, err := ComputeStructLayout(instance)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute struct layout: %w", err)
+	}
+
+	tableName := reflect.TypeOf(instance).Name()
+	if len(name) > 0 && name[0] != "" {
+		tableName = name[0]
+	}
+
+	if db.tableCatalog == nil {
+		db.tableCatalog = NewTableCatalog()
+	}
+
+	tableID := db.tableCatalog.AddTable(tableName, layout.Hash)
+	indexManager := NewIndexManager(db, layout)
+
+	return &Table[T]{
+		db:           db,
+		name:         tableName,
+		tableID:      tableID,
+		layout:       layout,
+		indexManager: indexManager,
+	}, nil
+}
 
 func (db *Database[T]) nextId() uint32 {
 	db.nlock.Lock()

@@ -6,7 +6,309 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 )
+
+// TableCatalogEntry represents a single table in the database catalog
+type TableCatalogEntry struct {
+	Name       string
+	LayoutHash string
+	NextID     uint32
+}
+
+// TableCatalog manages the tables in the database
+type TableCatalog struct {
+	tables   map[string]*TableCatalogEntry
+	tableIDs map[uint8]string // tableID -> table name
+	nextID   uint8
+	lock     sync.RWMutex
+}
+
+func NewTableCatalog() *TableCatalog {
+	return &TableCatalog{
+		tables:   make(map[string]*TableCatalogEntry),
+		tableIDs: make(map[uint8]string),
+		nextID:   1, // Start at 1 (0 is reserved for legacy format)
+	}
+}
+
+// AddTable adds a new table to the catalog
+func (tc *TableCatalog) AddTable(name string, layoutHash string) uint8 {
+	tc.lock.Lock()
+	defer tc.lock.Unlock()
+
+	// Check if table already exists
+	for id, existingName := range tc.tableIDs {
+		if existingName == name {
+			return id
+		}
+	}
+
+	// Assign new table ID
+	id := tc.nextID
+	tc.nextID++
+
+	tc.tables[name] = &TableCatalogEntry{
+		Name:       name,
+		LayoutHash: layoutHash,
+		NextID:     1,
+	}
+	tc.tableIDs[id] = name
+
+	return id
+}
+
+// GetTableID returns the table ID for a table name
+func (tc *TableCatalog) GetTableID(name string) (uint8, bool) {
+	tc.lock.RLock()
+	defer tc.lock.RUnlock()
+
+	for id, tableName := range tc.tableIDs {
+		if tableName == name {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+// GetTableName returns the table name for a table ID
+func (tc *TableCatalog) GetTableName(id uint8) (string, bool) {
+	tc.lock.RLock()
+	defer tc.lock.RUnlock()
+
+	name, ok := tc.tableIDs[id]
+	return name, ok
+}
+
+// GetTable returns the table entry
+func (tc *TableCatalog) GetTable(name string) (*TableCatalogEntry, bool) {
+	tc.lock.RLock()
+	defer tc.lock.RUnlock()
+
+	entry, ok := tc.tables[name]
+	return entry, ok
+}
+
+// UpdateTableNextID updates the next ID for a table
+func (tc *TableCatalog) UpdateTableNextID(name string, nextID uint32) {
+	tc.lock.Lock()
+	defer tc.lock.Unlock()
+
+	if entry, ok := tc.tables[name]; ok {
+		entry.NextID = nextID
+	}
+}
+
+// GetNextRecordID gets the next record ID for a table
+func (tc *TableCatalog) GetNextRecordID(name string) uint32 {
+	tc.lock.RLock()
+	defer tc.lock.RUnlock()
+
+	if entry, ok := tc.tables[name]; ok {
+		return entry.NextID
+	}
+	return 1
+}
+
+// IncrementNextRecordID increments and returns the next record ID for a table
+func (tc *TableCatalog) IncrementNextRecordID(name string) uint32 {
+	tc.lock.Lock()
+	defer tc.lock.Unlock()
+
+	if entry, ok := tc.tables[name]; ok {
+		id := entry.NextID
+		entry.NextID++
+		return id
+	}
+	return 1
+}
+
+// Count returns the number of tables
+func (tc *TableCatalog) Count() int {
+	tc.lock.RLock()
+	defer tc.lock.RUnlock()
+
+	return len(tc.tables)
+}
+
+// encodeTableCatalog encodes the table catalog to bytes
+func (tc *TableCatalog) encode() ([]byte, error) {
+	tc.lock.RLock()
+	defer tc.lock.RUnlock()
+
+	buf := make([]byte, 0, 4+len(tc.tables)*256) // Rough estimate
+
+	// Write table count
+	countBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(countBuf, uint32(len(tc.tables)))
+	buf = append(buf, countBuf...)
+
+	// Write each table
+	for name, entry := range tc.tables {
+		// Table name length (1 byte) + name
+		nameLen := uint8(len(name))
+		buf = append(buf, nameLen)
+		buf = append(buf, name...)
+
+		// Layout hash length (1 byte) + hash
+		hashLen := uint8(len(entry.LayoutHash))
+		buf = append(buf, hashLen)
+		buf = append(buf, entry.LayoutHash...)
+
+		// Next ID (4 bytes)
+		idBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(idBuf, entry.NextID)
+		buf = append(buf, idBuf...)
+	}
+
+	return buf, nil
+}
+
+// decodeTableCatalog decodes the table catalog from bytes
+func decodeTableCatalog(data []byte) (*TableCatalog, error) {
+	if len(data) < 4 {
+		return nil, fmt.Errorf("table catalog too short")
+	}
+
+	tc := NewTableCatalog()
+
+	count := binary.BigEndian.Uint32(data[:4])
+	offset := 4
+
+	for i := uint32(0); i < count; i++ {
+		if offset >= len(data) {
+			return nil, fmt.Errorf("table catalog truncated at table %d", i)
+		}
+
+		// Read table name
+		nameLen := int(data[offset])
+		offset++
+		if offset+nameLen > len(data) {
+			return nil, fmt.Errorf("table name truncated at table %d", i)
+		}
+		name := string(data[offset : offset+nameLen])
+		offset += nameLen
+
+		// Read layout hash
+		if offset >= len(data) {
+			return nil, fmt.Errorf("table hash length missing at table %d", i)
+		}
+		hashLen := int(data[offset])
+		offset++
+		if offset+hashLen > len(data) {
+			return nil, fmt.Errorf("table hash truncated at table %d", i)
+		}
+		hash := string(data[offset : offset+hashLen])
+		offset += hashLen
+
+		// Read next ID
+		if offset+4 > len(data) {
+			return nil, fmt.Errorf("table next ID truncated at table %d", i)
+		}
+		nextID := binary.BigEndian.Uint32(data[offset : offset+4])
+		offset += 4
+
+		// Add to catalog
+		entry := &TableCatalogEntry{
+			Name:       name,
+			LayoutHash: hash,
+			NextID:     nextID,
+		}
+		tc.tables[name] = entry
+
+		// Track ID mapping (we'll rebuild IDs from iteration order)
+		// Note: This loses the original table IDs - we'll fix this during load
+	}
+
+	// Rebuild table IDs based on map iteration order
+	id := uint8(1)
+	for name := range tc.tables {
+		tc.tableIDs[id] = name
+		if id >= tc.nextID {
+			tc.nextID = id + 1
+		}
+		id++
+	}
+
+	return tc, nil
+}
+
+// writeTableCatalog writes the table catalog to the database file
+func (db *Database[T]) writeTableCatalog() error {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	if db.tableCatalog == nil {
+		return nil // No tables to write
+	}
+
+	data, err := db.tableCatalog.encode()
+	if err != nil {
+		return fmt.Errorf("failed to encode table catalog: %w", err)
+	}
+
+	// Determine where to write the catalog
+	// Write at the end of the current data (after records, before index)
+	writeOffset := db.header.nextOffset
+
+	// Write catalog with markers
+	headerBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(headerBytes, uint32(len(data)))
+	catalogData := append([]byte{startMarker}, headerBytes...)
+	catalogData = append(catalogData, data...)
+	catalogData = append(catalogData, endMarker)
+
+	_, err = db.file.WriteAt(catalogData, int64(writeOffset))
+	if err != nil {
+		return fmt.Errorf("failed to write table catalog: %w", err)
+	}
+
+	// Update header
+	db.header.tableCatalogOffset = writeOffset
+	db.header.tableCount = uint32(db.tableCatalog.Count())
+
+	return db.encodeHeaderLocked()
+}
+
+// readTableCatalog reads the table catalog from the database file
+func (db *Database[T]) readTableCatalog() error {
+	if db.header.tableCatalogOffset == 0 {
+		return nil // No catalog written yet
+	}
+
+	db.mlock.RLock()
+	defer db.mlock.RUnlock()
+
+	// Read catalog header
+	headerBytes := make([]byte, 4)
+	_, err := db.mfile.ReadAt(headerBytes, int64(db.header.tableCatalogOffset+1))
+	if err != nil {
+		return fmt.Errorf("failed to read table catalog header: %w", err)
+	}
+
+	length := binary.BigEndian.Uint32(headerBytes)
+
+	// Check end marker
+	endPos := db.header.tableCatalogOffset + 5 + length
+	if int(endPos) >= db.mfile.Len() {
+		return fmt.Errorf("table catalog extends beyond file")
+	}
+
+	// Read catalog data
+	catalogData := make([]byte, length)
+	_, err = db.mfile.ReadAt(catalogData, int64(db.header.tableCatalogOffset+5))
+	if err != nil {
+		return fmt.Errorf("failed to read table catalog data: %w", err)
+	}
+
+	// Decode
+	db.tableCatalog, err = decodeTableCatalog(catalogData)
+	if err != nil {
+		return fmt.Errorf("failed to decode table catalog: %w", err)
+	}
+
+	return nil
+}
 
 // New creates a new database for storing records of type T.
 // If autoIndex is true, fields with the "db:index" or "db:unique" tag will be automatically indexed
@@ -25,11 +327,15 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 		return nil, fmt.Errorf("failed to compute struct layout: %w", err)
 	}
 
+	// Derive default table name from type
+	defaultTableName := reflect.TypeOf(instance).Name()
+
 	db := &Database[T]{
 		file:         file,
 		index:        make(map[uint32]uint32),
 		nextRecordID: 1, // Start with ID 1
 		layout:       layout,
+		defaultTable: defaultTableName,
 	}
 
 	// Create the index manager
@@ -46,13 +352,19 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 	if fileInfo.Size() == 0 {
 		// Initialize the header for a new file
 		db.header = DBHeader{
-			Version:       Version,
-			nextRecordID:  1,
-			nextOffset:    uint32(headerSize), // Start after the header
-			indexStart:    0,
-			indexEnd:      0,
-			indexCapacity: defaultIndexPreallocation,
+			Version:            Version,
+			nextRecordID:       1,
+			nextOffset:         uint32(headerSize), // Start after the header
+			indexStart:         0,
+			indexEnd:           0,
+			indexCapacity:      defaultIndexPreallocation,
+			tableCatalogOffset: 0,
+			tableCount:         0,
 		}
+
+		// Initialize table catalog for the default table
+		db.tableCatalog = NewTableCatalog()
+		db.tableCatalog.AddTable(defaultTableName, layout.Hash)
 
 		// Write the empty header to disk
 		if err := db.encodeHeader(); err != nil {
@@ -139,6 +451,17 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 // Close function is now defined in main.go
 
+// Open opens an existing database file and returns a non-generic DB handle.
+// This is useful when you want to work with multiple tables of different types.
+// Use Table[T](db) or Table[T](db, "name") to get typed table access.
+func Open(filename string) (*DB, error) {
+	db, err := New[any](filename, false, false)
+	if err != nil {
+		return nil, err
+	}
+	return &DB{Database: db}, nil
+}
+
 // Schema initialization is now handled via the StructLayout using unsafe
 
 // autoIndexFields creates indexes for fields with the db:index or db:unique tag
@@ -187,6 +510,11 @@ func (db *Database[T]) autoIndexFields() error {
 
 // Insert inserts a new record into the database.
 func (db *Database[T]) Insert(record *T) (uint32, error) {
+	return db.InsertToTable(record, db.defaultTable)
+}
+
+// InsertToTable inserts a new record into a specific table
+func (db *Database[T]) InsertToTable(record *T, tableName string) (uint32, error) {
 	// Begin a transaction to ensure atomicity
 	if err := db.beginTransaction(); err != nil {
 		return 0, fmt.Errorf("failed to begin insert transaction: %w", err)
@@ -205,8 +533,19 @@ func (db *Database[T]) Insert(record *T) (uint32, error) {
 		}
 	}()
 
-	// Get the next record ID (has its own lock)
-	newRecordId = db.nextId()
+	// Get table ID and next record ID
+	tableID := uint8(0)
+	if db.tableCatalog != nil && tableName != "" {
+		var ok bool
+		tableID, ok = db.tableCatalog.GetTableID(tableName)
+		if !ok {
+			return 0, fmt.Errorf("table '%s' not found", tableName)
+		}
+		newRecordId = db.tableCatalog.IncrementNextRecordID(tableName)
+	} else {
+		// Legacy single-table mode
+		newRecordId = db.nextId()
+	}
 
 	// 1. Encode the record into the binary format (no lock needed).
 	encoded, err := db.encodeRecord(record)
@@ -217,20 +556,22 @@ func (db *Database[T]) Insert(record *T) (uint32, error) {
 	// Lock for the critical section of writing to file and updating index
 	db.lock.Lock()
 
-	// 2. Write the record header (escCode, startMarker, ID, length, active)
-	headerBytes := make([]byte, 11)
+	// 2. Write the record header (escCode, startMarker, tableID, ID, length, active)
+	// New format: 12 bytes header instead of 11
+	headerBytes := make([]byte, 12)
 	headerBytes[0] = escCode
 	headerBytes[1] = startMarker
+	headerBytes[2] = tableID
 
 	// Write the ID
-	binary.BigEndian.PutUint32(headerBytes[2:6], newRecordId)
+	binary.BigEndian.PutUint32(headerBytes[3:7], newRecordId)
 
 	// Write the length
 	recordLength := uint32(len(encoded))
-	binary.BigEndian.PutUint32(headerBytes[6:10], recordLength)
+	binary.BigEndian.PutUint32(headerBytes[7:11], recordLength)
 
 	// Set active flag
-	headerBytes[10] = 1 // 1 = active
+	headerBytes[11] = 1 // 1 = active
 
 	// Add end marker
 	footerBytes := []byte{escCode, endMarker}
@@ -256,7 +597,7 @@ func (db *Database[T]) Insert(record *T) (uint32, error) {
 	// 6. Index is kept in memory - will be persisted on Close() or Sync()
 	// This avoids O(n^2) file growth from writing the full index on every insert
 
-	// 7. Update any indexes
+	// 7. Update any indexes (table-aware)
 	if db.indexManager != nil {
 		if err := db.indexManager.InsertIntoIndexes(record, newRecordId); err != nil {
 			db.lock.Unlock()
@@ -312,8 +653,17 @@ func (db *Database[T]) getLocked(id uint32) (*T, error) {
 		return nil, fmt.Errorf("record with id %d not found", id)
 	}
 
-	// 2. Read the record bytes
-	recordBytes, err := db.readRecordBytes(offset)
+	// 2. Read the record bytes with table context
+	expectedTableID := uint8(0)
+	if db.tableCatalog != nil && db.defaultTable != "" {
+		var ok bool
+		expectedTableID, ok = db.tableCatalog.GetTableID(db.defaultTable)
+		if !ok {
+			expectedTableID = 0
+		}
+	}
+
+	recordBytes, err := db.readRecordBytesAt(offset, expectedTableID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read record bytes: %w", err)
 	}
@@ -363,7 +713,15 @@ func (db *Database[T]) Delete(id uint32) error {
 	}
 
 	// Check if the record is already inactive
-	recordBytes, err := db.readRecordBytes(offset)
+	expectedTableID := uint8(0)
+	if db.tableCatalog != nil && db.defaultTable != "" {
+		var ok bool
+		expectedTableID, ok = db.tableCatalog.GetTableID(db.defaultTable)
+		if !ok {
+			expectedTableID = 0
+		}
+	}
+	recordBytes, err := db.readRecordBytesAt(offset, expectedTableID)
 	if err != nil {
 		return fmt.Errorf("failed to read record: %w", err)
 	}
@@ -382,11 +740,11 @@ func (db *Database[T]) Delete(id uint32) error {
 		return fmt.Errorf("failed to get record for index updates: %w", err)
 	}
 
-	// The active flag is at offset + 10
+	// The active flag is at offset + 11 (new format with tableID)
 	inactiveFlag := byte(0)
 
 	// Write the inactive flag
-	_, err = db.file.WriteAt([]byte{inactiveFlag}, int64(offset+10))
+	_, err = db.file.WriteAt([]byte{inactiveFlag}, int64(offset+11))
 	if err != nil {
 		db.lock.Unlock()
 		return fmt.Errorf("failed to mark record as deleted: %w", err)
@@ -466,7 +824,15 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 	}
 
 	// Read old record bytes to verify it's active
-	oldBytes, err := db.readRecordBytes(oldOffset)
+	expectedTableID := uint8(0)
+	if db.tableCatalog != nil && db.defaultTable != "" {
+		var ok bool
+		expectedTableID, ok = db.tableCatalog.GetTableID(db.defaultTable)
+		if !ok {
+			expectedTableID = 0
+		}
+	}
+	oldBytes, err := db.readRecordBytesAt(oldOffset, expectedTableID)
 	if err != nil {
 		return fmt.Errorf("failed to read old record: %w", err)
 	}
@@ -484,8 +850,8 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 	}
 
 	// Mark the old record as inactive (soft delete)
-	// This modifies just the active byte at offset+10
-	_, err = db.file.WriteAt([]byte{0}, int64(oldOffset+10))
+	// This modifies just the active byte at offset+11 (new format with tableID)
+	_, err = db.file.WriteAt([]byte{0}, int64(oldOffset+11))
 	if err != nil {
 		db.lock.Unlock()
 		return fmt.Errorf("failed to mark old record as inactive: %w", err)
@@ -498,20 +864,22 @@ func (db *Database[T]) Update(id uint32, record *T) error {
 		return fmt.Errorf("failed to encode record: %w", err)
 	}
 
-	// Write the record header (escCode, startMarker, ID, length, active)
-	headerBytes := make([]byte, 11)
+	// Write the record header (escCode, startMarker, tableID, ID, length, active)
+	// New format: 12 bytes header
+	headerBytes := make([]byte, 12)
 	headerBytes[0] = escCode
 	headerBytes[1] = startMarker
+	headerBytes[2] = expectedTableID
 
 	// Write the ID (reuse the same ID)
-	binary.BigEndian.PutUint32(headerBytes[2:6], id)
+	binary.BigEndian.PutUint32(headerBytes[3:7], id)
 
 	// Write the length
 	recordLength := uint32(len(encoded))
-	binary.BigEndian.PutUint32(headerBytes[6:10], recordLength)
+	binary.BigEndian.PutUint32(headerBytes[7:11], recordLength)
 
 	// Set active flag
-	headerBytes[10] = 1 // 1 = active
+	headerBytes[11] = 1 // 1 = active
 
 	// Add end marker
 	footerBytes := []byte{escCode, endMarker}

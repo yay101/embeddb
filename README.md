@@ -117,6 +117,81 @@ db, err := embeddb.New[User]("app.db", true, false)  // With migration
 db, err := embeddb.New[User]("app.db", false, true)  // Auto-index fields with db:"index"
 ```
 
+## Tables
+
+EmbedDB supports multiple tables within a single database file. Each table is typed and can have its own schema.
+
+```go
+// Get a typed table - table name is auto-derived from the type
+db, _ := embeddb.New[User]("app.db", false, false)
+users, _ := db.Table()  // table name is "User"
+
+// Or specify a custom table name
+users, _ := db.Table("customers")
+```
+
+### Table Operations
+
+```go
+// Insert
+id, err := users.Insert(&User{Name: "Alice", Age: 30})
+
+// Get by ID
+user, err := users.Get(id)
+
+// Update
+err := users.Update(id, &User{Name: "Alice", Age: 31})
+
+// Delete (soft delete)
+err := users.Delete(id)
+
+// Query (requires index)
+results, err := users.Query("Age", 30)
+
+// Filter (full table scan)
+results, err := users.Filter(func(u User) bool {
+    return u.Age > 18
+})
+
+// Scan
+err := users.Scan(func(u User) bool {
+    fmt.Println(u.Name)
+    return true
+})
+
+// Create index on table
+err := users.CreateIndex("Age")
+
+// Drop index
+err := users.DropIndex("Age")
+```
+
+### Multiple Tables
+
+You can work with multiple types in the same database by creating separate tables for each type:
+
+```go
+type User struct {
+    Name string
+    Age  int `db:"index"`
+}
+
+type Order struct {
+    Product string
+    Price   float64
+}
+
+// Same database, different tables
+db, _ := embeddb.New[User]("app.db", false, false)
+
+users, _ := db.Table()
+orders, _ := db.Table()
+
+// Each table has its own records
+users.Insert(&User{Name: "Alice"})
+orders.Insert(&Order{Product: "Widget", Price: 9.99})
+```
+
 ## CRUD Operations
 
 ```go
@@ -286,7 +361,7 @@ The database uses memory-mapped I/O, so most of the "Sys" memory is just the map
 | Cgo required | Pure Go |
 | SQL queries | Go structs |
 | Schema migrations | Just change your struct |
-| Multiple tables | Single struct type |
+| Multiple tables | Multiple typed tables |
 | ACID transactions | Atomic single-record ops |
 | 2MB+ binary | Single .go file |
 
@@ -300,6 +375,6 @@ The database uses memory-mapped I/O, so most of the "Sys" memory is just the map
 
 ## When NOT to use EmbedDB
 
-- Multi-table relational data (use SQLite)
+- Complex relational queries with joins (use SQLite)
 - High-concurrency write workloads (use PostgreSQL/MySQL)
 - Distributed systems (use proper databases)
