@@ -22,6 +22,7 @@ import (
 type Database[T any] struct {
 	header       DBHeader
 	lock         sync.RWMutex
+	writeLock    sync.Mutex // Serializes write operations
 	file         *os.File
 	mfile        *mmap.ReaderAt
 	mlock        sync.RWMutex

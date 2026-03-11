@@ -515,26 +515,13 @@ func (db *Database[T]) Insert(record *T) (uint32, error) {
 
 // InsertToTable inserts a new record into a specific table
 func (db *Database[T]) InsertToTable(record *T, tableName string) (uint32, error) {
-	// Begin a transaction to ensure atomicity
-	if err := db.beginTransaction(); err != nil {
-		return 0, fmt.Errorf("failed to begin insert transaction: %w", err)
-	}
-
-	// Use defer to ensure we either commit or rollback
-	var newRecordId uint32
-	committed := false
-	defer func() {
-		if !committed {
-			// Only rollback if not committed
-			if err := db.rollbackTransaction(); err != nil {
-				// Just log the error, we can't return it from defer
-				fmt.Printf("Error rolling back transaction: %v\n", err)
-			}
-		}
-	}()
+	// Serialize write operations
+	db.writeLock.Lock()
+	defer db.writeLock.Unlock()
 
 	// Get table ID and next record ID
 	tableID := uint8(0)
+	var newRecordId uint32
 	if db.tableCatalog != nil && tableName != "" {
 		var ok bool
 		tableID, ok = db.tableCatalog.GetTableID(tableName)
@@ -605,20 +592,8 @@ func (db *Database[T]) InsertToTable(record *T, tableName string) (uint32, error
 		}
 	}
 
-	// Release lock before calling commit (which acquires its own lock)
+	// Release lock
 	db.lock.Unlock()
-
-	// Commit the transaction
-	if err := db.commitTransaction(); err != nil {
-		return 0, fmt.Errorf("failed to commit insert transaction: %w", err)
-	}
-	committed = true
-
-	// Reload mmap to ensure subsequent reads can see the new data
-	if err := db.ReloadMMap(); err != nil {
-		// Log but don't fail - the insert succeeded
-		fmt.Printf("Warning: failed to reload mmap after insert: %v\n", err)
-	}
 
 	return newRecordId, nil
 }
@@ -686,22 +661,9 @@ func (db *Database[T]) getLocked(id uint32) (*T, error) {
 
 // Delete marks a record as inactive in the database
 func (db *Database[T]) Delete(id uint32) error {
-	// Begin a transaction to ensure atomicity
-	if err := db.beginTransaction(); err != nil {
-		return fmt.Errorf("failed to begin delete transaction: %w", err)
-	}
-
-	// Use defer to ensure we either commit or rollback
-	committed := false
-	defer func() {
-		if !committed {
-			// Only rollback if not committed
-			if err := db.rollbackTransaction(); err != nil {
-				// Just log the error, we can't return it from defer
-				fmt.Printf("Error rolling back transaction: %v\n", err)
-			}
-		}
-	}()
+	// Serialize write operations
+	db.writeLock.Lock()
+	defer db.writeLock.Unlock()
 
 	db.lock.Lock()
 
@@ -767,19 +729,6 @@ func (db *Database[T]) Delete(id uint32) error {
 		}
 	}
 
-	// Release lock before calling commit
-	db.lock.Unlock()
-
-	// Commit the transaction
-	if err := db.commitTransaction(); err != nil {
-		return fmt.Errorf("failed to commit delete transaction: %w", err)
-	}
-	committed = true
-
-	// Reload mmap to ensure subsequent reads see the updated data
-	if err := db.ReloadMMap(); err != nil {
-		fmt.Printf("Warning: failed to reload mmap after delete: %v\n", err)
-	}
 
 	return nil
 }

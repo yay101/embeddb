@@ -62,9 +62,15 @@ func (db *Database[T]) beginTransaction() error {
 // beginTransactionLocked starts a new transaction
 // IMPORTANT: Caller must hold db.lock before calling this method
 func (db *Database[T]) beginTransactionLocked() error {
-	// Check if a transaction is already in progress
+	// If a transaction is already in progress, clean it up first
+	// This can happen when using writeLock to serialize operations
 	if db.transaction != nil && db.transaction.state == TransactionActive {
-		return ErrTransactionInProgress
+		// Clean up old transaction
+		if db.transaction.tempFile != nil {
+			db.transaction.tempFile.Close()
+			os.Remove(db.transaction.tempFile.Name())
+		}
+		db.transaction = nil
 	}
 
 	// Create a temporary file for the transaction

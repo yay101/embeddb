@@ -10,10 +10,7 @@ import (
 // IMPORTANT: Caller must hold db.lock before calling this method.
 func (db *Database[T]) writeData(data []byte, offset int64) error {
 	_, err := db.file.WriteAt(data, offset)
-	if err != nil {
-		return err
-	}
-	return db.file.Sync()
+	return err
 }
 
 // readData reads data from the file at the given offset.

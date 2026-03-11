@@ -30,20 +30,11 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		return 0, fmt.Errorf("failed to encode record: %w", err)
 	}
 
-	// Begin transaction
-	if err := t.db.beginTransaction(); err != nil {
-		return 0, fmt.Errorf("failed to begin insert transaction: %w", err)
-	}
+	// Serialize write operations
+	t.db.writeLock.Lock()
+	defer t.db.writeLock.Unlock()
 
-	committed := false
-	defer func() {
-		if !committed {
-			if err := t.db.rollbackTransaction(); err != nil {
-				fmt.Printf("Error rolling back transaction: %v\n", err)
-			}
-		}
-	}()
-
+	// Use write lock for header/index access
 	t.db.lock.Lock()
 
 	// Write record header: escCode + startMarker + tableID + id + length + active = 12 bytes
@@ -69,6 +60,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	// Write the record
 	nextOffset := t.db.header.nextOffset
 	if err := t.db.writeData(completeRecord, int64(nextOffset)); err != nil {
+		t.db.lock.Unlock()
 		return 0, fmt.Errorf("failed to write record: %w", err)
 	}
 
@@ -85,17 +77,6 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	}
 
 	t.db.lock.Unlock()
-
-	// Commit
-	if err := t.db.commitTransaction(); err != nil {
-		return 0, fmt.Errorf("failed to commit insert transaction: %w", err)
-	}
-	committed = true
-
-	// Reload mmap
-	if err := t.db.ReloadMMap(); err != nil {
-		fmt.Printf("Warning: failed to reload mmap after insert: %v\n", err)
-	}
 
 	return recordID, nil
 }
@@ -133,19 +114,9 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 		return err
 	}
 
-	// Begin transaction
-	if err := t.db.beginTransaction(); err != nil {
-		return fmt.Errorf("failed to begin update transaction: %w", err)
-	}
-
-	committed := false
-	defer func() {
-		if !committed {
-			if err := t.db.rollbackTransaction(); err != nil {
-				fmt.Printf("Error rolling back transaction: %v\n", err)
-			}
-		}
-	}()
+	// Serialize write operations
+	t.db.writeLock.Lock()
+	defer t.db.writeLock.Unlock()
 
 	t.db.lock.Lock()
 
@@ -159,6 +130,7 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 	// Read old record
 	oldBytes, err := t.db.readRecordBytesAt(oldOffset, t.tableID)
 	if err != nil {
+		t.db.lock.Unlock()
 		return fmt.Errorf("failed to read old record: %w", err)
 	}
 
@@ -211,6 +183,7 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 	// Write updated record
 	nextOffset := t.db.header.nextOffset
 	if err := t.db.writeData(completeRecord, int64(nextOffset)); err != nil {
+		t.db.lock.Unlock()
 		return fmt.Errorf("failed to write updated record: %w", err)
 	}
 
@@ -228,35 +201,14 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 
 	t.db.lock.Unlock()
 
-	// Commit
-	if err := t.db.commitTransaction(); err != nil {
-		return fmt.Errorf("failed to commit update transaction: %w", err)
-	}
-	committed = true
-
-	// Reload mmap
-	if err := t.db.ReloadMMap(); err != nil {
-		fmt.Printf("Warning: failed to reload mmap after update: %v\n", err)
-	}
-
 	return nil
 }
 
 // Delete soft-deletes a record
 func (t *Table[T]) Delete(id uint32) error {
-	// Begin transaction
-	if err := t.db.beginTransaction(); err != nil {
-		return fmt.Errorf("failed to begin delete transaction: %w", err)
-	}
-
-	committed := false
-	defer func() {
-		if !committed {
-			if err := t.db.rollbackTransaction(); err != nil {
-				fmt.Printf("Error rolling back transaction: %v\n", err)
-			}
-		}
-	}()
+	// Serialize write operations
+	t.db.writeLock.Lock()
+	defer t.db.writeLock.Unlock()
 
 	t.db.lock.Lock()
 
@@ -270,6 +222,7 @@ func (t *Table[T]) Delete(id uint32) error {
 	// Check if already inactive
 	recordBytes, err := t.db.readRecordBytesAt(offset, t.tableID)
 	if err != nil {
+		t.db.lock.Unlock()
 		return fmt.Errorf("failed to read record: %w", err)
 	}
 
@@ -307,17 +260,6 @@ func (t *Table[T]) Delete(id uint32) error {
 	}
 
 	t.db.lock.Unlock()
-
-	// Commit
-	if err := t.db.commitTransaction(); err != nil {
-		return fmt.Errorf("failed to commit delete transaction: %w", err)
-	}
-	committed = true
-
-	// Reload mmap
-	if err := t.db.ReloadMMap(); err != nil {
-		fmt.Printf("Warning: failed to reload mmap after delete: %v\n", err)
-	}
 
 	return nil
 }
