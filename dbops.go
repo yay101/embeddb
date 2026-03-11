@@ -319,6 +319,7 @@ func (db *Database[T]) writeTableCatalogLocked() error {
 	// Update header
 	db.header.tableCatalogOffset = writeOffset
 	db.header.tableCount = uint32(db.tableCatalog.Count())
+	db.header.nextOffset = writeOffset + uint32(len(catalogData))
 
 	return nil
 }

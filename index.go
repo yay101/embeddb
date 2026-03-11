@@ -206,23 +206,15 @@ func (db *Database[T]) Vacuum() error {
 	// Current write position starts after header
 	writePos := uint32(headerSize)
 
-	// Collect records that will remain after vacuum (all tables)
-	type keptRecord struct {
-		tableID uint8
-		record  *T
-	}
-	keptRecords := make(map[uint32]keptRecord)
-
 	// Copy all table indexes to avoid holding lock while iterating
 	indexesCopy := make(map[uint8]map[uint32]uint32)
-	db.lock.RLock()
 	for tableID, idx := range db.indexes {
 		indexesCopy[tableID] = make(map[uint32]uint32)
+		newIndex[tableID] = make(map[uint32]uint32)
 		for id, offset := range idx {
 			indexesCopy[tableID][id] = offset
 		}
 	}
-	db.lock.RUnlock()
 
 	// Release lock temporarily to read records
 	db.lock.Unlock()
@@ -234,24 +226,14 @@ func (db *Database[T]) Vacuum() error {
 			// Read the record
 			recordBytes, err := db.readRecordBytesAt(oldOffset, tableID)
 			if err != nil {
-				vacuumErr = fmt.Errorf("failed to read record %d during vacuum: %w", id, err)
-				break
+				// Skip unreadable/corrupt entries during compaction
+				continue
 			}
 
 			// Skip inactive records
 			if !isActiveRecord(recordBytes) {
 				continue
 			}
-
-			// Decode the record for index maintenance
-			record, err := db.decodeRecord(recordBytes)
-			if err != nil {
-				vacuumErr = fmt.Errorf("failed to decode record %d during vacuum: %w", id, err)
-				break
-			}
-
-			// Store the record for index rebuilding (use recordID as key, tableID in struct)
-			keptRecords[id] = keptRecord{tableID: tableID, record: record}
 
 			// Write the record to the temporary file
 			if _, err := tempFile.WriteAt(recordBytes, int64(writePos)); err != nil {
@@ -285,6 +267,8 @@ func (db *Database[T]) Vacuum() error {
 		indexEnd:     0, // Will be set when writing the index
 		nextRecordID: db.header.nextRecordID,
 		nextOffset:   writePos,
+		entryStart:   db.header.entryStart,
+		tocStart:     db.header.tocStart,
 	}
 
 	// Build index data in per-table format
@@ -321,8 +305,13 @@ func (db *Database[T]) Vacuum() error {
 	newHeader.indexStart = writePos
 	newHeader.indexEnd = writePos + uint32(len(indexData))
 	newHeader.indexCapacity = uint32(len(indexData)) * 2 // Double for future growth
+	newHeader.nextOffset = newHeader.indexStart + newHeader.indexCapacity
+	newHeader.tableCatalogOffset = 0
+	if db.tableCatalog != nil {
+		newHeader.tableCount = uint32(db.tableCatalog.Count())
+	}
 
-	// Write the header to the temporary file
+	// Write the header placeholder to the temporary file (real header is written after file swap)
 	headerBytes := make([]byte, headerSize)
 	if _, err := tempFile.WriteAt(headerBytes, 0); err != nil {
 		db.rollbackTransactionLocked()
@@ -387,7 +376,14 @@ func (db *Database[T]) Vacuum() error {
 	db.header.entryStart = newHeader.entryStart
 	db.header.lgIndexStart = newHeader.lgIndexStart
 	db.header.indexCapacity = newHeader.indexCapacity
+	db.header.tableCatalogOffset = newHeader.tableCatalogOffset
+	db.header.tableCount = newHeader.tableCount
 	db.indexes = newIndex
+
+	if err := db.encodeHeaderLocked(); err != nil {
+		db.lock.Unlock()
+		return fmt.Errorf("failed to write header after vacuum: %w", err)
+	}
 
 	// Release lock before reloading mmap (ReloadMMap uses mlock)
 	db.lock.Unlock()
@@ -408,8 +404,7 @@ func (db *Database[T]) Vacuum() error {
 	}
 
 	// Rebuild indexes if needed
-	// Note: Full index rebuild after vacuum requires tableID support in IndexManager
-	// For now, we rely on the indexes being rebuilt on next use via ExtractIndexesFromDatabase
+	// Note: Full index rebuild after vacuum requires tableID support in IndexManager.
 	if indexManager != nil {
 		db.indexManager = indexManager
 		fmt.Printf("Warning: index rebuild after vacuum skipped - will be rebuilt on next use\n")
@@ -430,16 +425,10 @@ func (db *Database[T]) Vacuum() error {
 				// Get tableID to clean up indexes
 				if tableID, ok := db.tableCatalog.GetTableID(name); ok {
 					delete(db.indexes, tableID)
+					delete(db.tableCatalog.tableIDs, tableID)
 				}
 				// Remove from catalog
 				delete(db.tableCatalog.tables, name)
-			}
-		}
-		// Rebuild tableIDs map
-		db.tableCatalog.tableIDs = make(map[uint8]string)
-		for name := range db.tableCatalog.tables {
-			if tableID, ok := db.tableCatalog.GetTableID(name); ok {
-				db.tableCatalog.tableIDs[tableID] = name
 			}
 		}
 		db.lock.Unlock()
