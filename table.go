@@ -21,7 +21,11 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		return 0, err
 	}
 
-	// Get next record ID from catalog
+	// Serialize write operations
+	t.db.writeLock.Lock()
+	defer t.db.writeLock.Unlock()
+
+	// Get next record ID from catalog (now inside write lock)
 	recordID := t.db.tableCatalog.IncrementNextRecordID(t.name)
 
 	// Encode the record
@@ -30,11 +34,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		return 0, fmt.Errorf("failed to encode record: %w", err)
 	}
 
-	// Serialize write operations
-	t.db.writeLock.Lock()
-	defer t.db.writeLock.Unlock()
-
-	// Use write lock for header/index access
+	// Use main lock for header/index access
 	t.db.lock.Lock()
 
 	// Write record header: escCode + startMarker + tableID + id + length + active = 12 bytes
