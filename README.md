@@ -28,6 +28,7 @@ package main
 import (
     "fmt"
     "log"
+    "time"
 
     "github.com/yay101/embeddb"
 )
@@ -176,11 +177,14 @@ err := users.DropIndex("Age")
 
 // Drop table - soft delete, cleaned up on Vacuum
 err := users.Drop()
+
+// Vacuum - compacts file and cleans dropped-table data
+err := db.Vacuum()
 ```
 
 ### Multiple Tables
 
-You can work with multiple types in the same database by creating separate tables for each type:
+You can store multiple types in the same database file by opening the same file with the relevant type and table name:
 
 ```go
 type User struct {
@@ -193,16 +197,20 @@ type Order struct {
     Price   float64
 }
 
-// Same database, different tables
-db, _ := embeddb.New[User]("app.db", false, false)
-
-users, _ := db.Table()
-orders, _ := db.Table()
-
-// Each table has its own records
+// Same database file, user table
+userDB, _ := embeddb.New[User]("app.db", false, false)
+users, _ := userDB.Table("users")
 users.Insert(&User{Name: "Alice"})
+userDB.Close()
+
+// Same database file, order table
+orderDB, _ := embeddb.New[Order]("app.db", false, false)
+orders, _ := orderDB.Table("orders")
 orders.Insert(&Order{Product: "Widget", Price: 9.99})
+orderDB.Close()
 ```
+
+Each table keeps its own index block and record offsets inside the same `.db` file.
 
 ## CRUD Operations
 
@@ -391,10 +399,12 @@ db, err := embeddb.New[MyStruct]("data.db", true, false)
 ## Performance
 
 ### Insert Performance
-~100k records/sec sequential inserts
+- ~350k-400k records/sec without secondary indexes
+- ~30k-40k records/sec with multiple secondary indexes on 100k-scale workloads
 
 ### Query Performance  
-- Exact match (indexed): <10ms for 100k records
+- Exact match (indexed): ~1-2ms/query for moderate-cardinality keys on 100k rows
+- Exact match (indexed): ~20-30ms/query for low-cardinality keys on 100k rows
 - Filter/Scan (full table): ~80ms for 100k records
 
 ### Memory Usage
