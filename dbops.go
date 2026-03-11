@@ -760,7 +760,14 @@ func (db *Database[T]) getLockedForTable(id uint32, tableID uint8) (*T, error) {
 
 // Delete marks a record as inactive in the database
 func (db *Database[T]) Delete(id uint32) error {
-	// For backward compatibility, use table 0
+	// Prefer the default table in multi-table mode.
+	if db.tableCatalog != nil && db.defaultTable != "" {
+		if tableID, ok := db.tableCatalog.GetTableID(db.defaultTable); ok {
+			return db.DeleteFromTable(id, tableID)
+		}
+	}
+
+	// Legacy single-table fallback.
 	return db.DeleteFromTable(id, 0)
 }
 
@@ -793,7 +800,7 @@ func (db *Database[T]) DeleteFromTable(id uint32, tableID uint8) error {
 
 	// Get the record for index updates before marking it inactive
 	// Use getLocked since we already hold the lock
-	record, err := db.getLocked(id)
+	record, err := db.getLockedForTable(id, tableID)
 	if err != nil {
 		db.lock.Unlock()
 		return fmt.Errorf("failed to get record for index updates: %w", err)
@@ -844,7 +851,14 @@ func (db *Database[T]) decodeRecord(data []byte) (*T, error) {
 // Update updates an existing record in the database
 // This implementation uses atomic operations to ensure data integrity
 func (db *Database[T]) Update(id uint32, record *T) error {
-	// For backward compatibility, use table 0
+	// Prefer the default table in multi-table mode.
+	if db.tableCatalog != nil && db.defaultTable != "" {
+		if tableID, ok := db.tableCatalog.GetTableID(db.defaultTable); ok {
+			return db.UpdateInTable(id, record, tableID)
+		}
+	}
+
+	// Legacy single-table fallback.
 	return db.UpdateInTable(id, record, 0)
 }
 
