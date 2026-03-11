@@ -129,17 +129,16 @@ func (db *Database[T]) ReadIndex() (err error) {
 	currentPos := db.header.indexStart + 1
 	idBytes := make([]byte, 4)
 
-	for currentPos < db.header.indexEnd {
-		marker := db.mfile.At(int(currentPos))
-		if marker == endMarker {
-			break
-		}
+	for currentPos < db.header.indexEnd-1 {
 
 		// Read tableID
 		tableID := uint8(db.mfile.At(int(currentPos)))
 		currentPos++
 
 		// Read count
+		if currentPos+4 > db.header.indexEnd-1 {
+			return fmt.Errorf("corrupt index: table %d count out of bounds", tableID)
+		}
 		_, err = db.mfile.ReadAt(idBytes, int64(currentPos))
 		if err != nil {
 			return fmt.Errorf("failed to read count: %w", err)
@@ -152,6 +151,9 @@ func (db *Database[T]) ReadIndex() (err error) {
 
 		// Read record entries
 		for i := uint32(0); i < count; i++ {
+			if currentPos+8 > db.header.indexEnd-1 {
+				return fmt.Errorf("corrupt index: table %d entries out of bounds", tableID)
+			}
 			_, err = db.mfile.ReadAt(idBytes, int64(currentPos))
 			if err != nil {
 				return fmt.Errorf("failed to read record ID: %w", err)
