@@ -73,17 +73,17 @@ func (db *Database[T]) MigrateWithOptions(oldLayout *StructLayout, opts Migratio
 		}
 	}()
 
-	// Create a temporary backup of the index (table 0 for backward compat)
-	oldIndex := make(map[uint32]uint32)
-	idx := db.indexes[0]
-	for k, v := range idx {
-		oldIndex[k] = v
-	}
-
-	// Get all record IDs
+	// Create a temporary backup of the index (first table with data)
+	oldIndex := make(map[uint8]map[uint32]uint32)
 	var recordIDs []uint32
-	for id := range idx {
-		recordIDs = append(recordIDs, id)
+
+	for tid, idx := range db.indexes {
+		oldIndex[tid] = make(map[uint32]uint32)
+		for k, v := range idx {
+			oldIndex[tid][k] = v
+			recordIDs = append(recordIDs, k)
+		}
+		break // Just migrate first table for now
 	}
 
 	logMessage(fmt.Sprintf("Found %d records to migrate", len(recordIDs)))

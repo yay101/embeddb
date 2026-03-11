@@ -113,11 +113,6 @@ func (db *Database[T]) nextId() uint32 {
 	return id
 }
 
-// LegacyIndex returns the index for table 0 (backward compatibility)
-func (db *Database[T]) LegacyIndex() map[uint32]uint32 {
-	return db.indexes[0]
-}
-
 // getTableIndex returns the index for a specific table, creating if needed
 func (db *Database[T]) getTableIndex(tableID uint8) map[uint32]uint32 {
 	if db.indexes == nil {

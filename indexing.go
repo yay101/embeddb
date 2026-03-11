@@ -165,12 +165,14 @@ func (im *IndexManager[T]) BuildIndex(fieldName string) error {
 	}
 	im.lock.Unlock()
 
-	// Get all record IDs from the database (use table 0 for backward compat)
+	// Get all record IDs from the database (first table with data)
 	im.db.lock.RLock()
-	idx := im.db.indexes[0]
-	recordIDs := make([]uint32, 0, len(idx))
-	for id := range idx {
-		recordIDs = append(recordIDs, id)
+	var recordIDs []uint32
+	for _, idx := range im.db.indexes {
+		for id := range idx {
+			recordIDs = append(recordIDs, id)
+		}
+		break // Just get first table for now
 	}
 	im.db.lock.RUnlock()
 

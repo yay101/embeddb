@@ -16,25 +16,6 @@ type index struct {
 	next uint32
 }
 
-func (db *Database[T]) IDFromOffset(o uint32) (r uint32) {
-	// For backward compatibility, use table 0
-	idx := db.indexes[0]
-	for p := range idx {
-		r = p - 1
-		if idx[p] > o && idx[r] < o {
-			return r
-		}
-	}
-	return 0
-}
-
-// this function isnt needed and should be replaced with db.index[id]. Its just here to get my thoughts out.
-func (db *Database[T]) OffsetFromID(id uint32) uint32 {
-	// For backward compatibility, use table 0
-	offset, _ := db.getRecordOffset(0, id)
-	return offset
-}
-
 // WriteIndex writes the index to the database file.
 // This is the public API that acquires locks.
 func (db *Database[T]) WriteIndex() (err error) {

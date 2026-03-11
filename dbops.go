@@ -464,29 +464,34 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 		// Check if we need to migrate the database
 		if migrate {
-			// Create a record to check if the schema matches
-
-			// Try to read a record to verify schema compatibility
-			idx := db.indexes[0]
-			for id := range idx {
-				existingRecord, err := db.Get(id)
-				if err == nil && existingRecord != nil {
-					// Found a valid record, check if migration is needed
-					oldLayout, err := ComputeStructLayout(*existingRecord)
-					if err != nil {
-						db.Close()
-						return nil, fmt.Errorf("failed to compute layout of existing record: %w", err)
-					}
-
-					// If layouts don't match, migrate
-					if oldLayout.Hash != layout.Hash {
-						if err := db.Migrate(oldLayout); err != nil {
-							db.Close()
-							return nil, fmt.Errorf("failed to migrate database: %w", err)
-						}
-					}
-					break
+			// Try to read a record from any table to verify schema compatibility
+			for tableID, idx := range db.indexes {
+				if len(idx) == 0 {
+					continue
 				}
+				for id := range idx {
+					offset, _ := db.getRecordOffset(tableID, id)
+					recordBytes, err := db.readRecordBytesAt(offset, tableID)
+					if err != nil || !isActiveRecord(recordBytes) {
+						continue
+					}
+					existingRecord, err := db.decodeRecord(recordBytes)
+					if err == nil && existingRecord != nil {
+						oldLayout, err := ComputeStructLayout(*existingRecord)
+						if err != nil {
+							db.Close()
+							return nil, fmt.Errorf("failed to compute layout of existing record: %w", err)
+						}
+						if oldLayout.Hash != layout.Hash {
+							if err := db.Migrate(oldLayout); err != nil {
+								db.Close()
+								return nil, fmt.Errorf("failed to migrate database: %w", err)
+							}
+						}
+						break
+					}
+				}
+				break // Only check first table
 			}
 		}
 
