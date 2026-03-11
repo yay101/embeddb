@@ -354,19 +354,53 @@ func (db *Database[T]) Filter(fn FilterFunc[T]) ([]T, error) {
 // This performs an unindexed full table scan - use only when no index is available.
 // The callback can return false to stop iteration early.
 func (db *Database[T]) Scan(fn func(record T) bool) error {
+	// Quick snapshot of index keys
 	db.lock.RLock()
-	defer db.lock.RUnlock()
+	var idx map[uint32]uint32
+	var tableID uint8
 
-	// For backward compatibility, use table 0 (legacy single-table mode)
-	idx := db.indexes[0]
+	for tid, m := range db.indexes {
+		if len(m) > 0 {
+			idx = m
+			tableID = tid
+			break
+		}
+	}
+
+	if idx == nil {
+		db.lock.RUnlock()
+		return nil
+	}
+
+	ids := make([]uint32, 0, len(idx))
 	for id := range idx {
-		record, err := db.getLocked(id)
+		ids = append(ids, id)
+	}
+	db.lock.RUnlock()
+
+	// Iterate without holding lock
+	for _, id := range ids {
+		offsetVal, exists := idx[id]
+		if !exists {
+			continue
+		}
+
+		recordBytes, err := db.readRecordBytesAt(offsetVal, tableID)
 		if err != nil {
-			continue // Skip records that can't be read
+			continue
+		}
+
+		if !isActiveRecord(recordBytes) {
+			continue
+		}
+
+		record, err := db.decodeRecord(recordBytes)
+		if err != nil {
+			continue
 		}
 
 		if !fn(*record) {
-			break // Stop iteration if callback returns false
+			break
 		}
 	}
 
