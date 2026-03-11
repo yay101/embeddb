@@ -8,10 +8,11 @@ import (
 
 // Version constant is now defined in main.go
 
-// Header format (expanded to 32 bytes):
+// Header format (expanded to 48 bytes):
 // [Version (3 bytes)] [tocStart (4 bytes)] [indexStart (4 bytes)] [entryStart (4 bytes)]
-// [nextOffset (4 bytes)] [nextRecordID (4 bytes)] [indexCapacity (4 bytes)] [lgIndexStart (4 bytes)] [reserved (1 byte)]
-// Total: 32 bytes
+// [nextOffset (4 bytes)] [nextRecordID (4 bytes)] [indexCapacity (4 bytes)] [lgIndexStart (4 bytes)]
+// [tableCatalogOffset (4 bytes)] [tableCount (4 bytes)] [reserved (7 bytes)]
+// Total: 48 bytes
 
 // encodeHeader writes the header to the database file.
 // This is the public API that acquires locks.
@@ -79,11 +80,23 @@ func (db *Database[T]) encodeHeaderLocked() error {
 	// Append the encoded lgIndexStart (4 bytes) to the header buffer.
 	hb = append(hb, ub...)
 
-	// Add reserved byte for future expansion
-	hb = append(hb, 0)
+	// Encode the tableCatalogOffset (uint32) in BigEndian.
+	binary.BigEndian.PutUint32(ub, db.header.tableCatalogOffset)
+	// Append the encoded tableCatalogOffset (4 bytes) to the header buffer.
+	hb = append(hb, ub...)
+
+	// Encode the tableCount (uint32) in BigEndian.
+	binary.BigEndian.PutUint32(ub, db.header.tableCount)
+	// Append the encoded tableCount (4 bytes) to the header buffer.
+	hb = append(hb, ub...)
+
+	// Add reserved bytes for future expansion (7 bytes)
+	for i := 0; i < 7; i++ {
+		hb = append(hb, 0)
+	}
 
 	// Write the complete header buffer to the beginning of the file (offset 0).
-	// Total header size written is 32 bytes.
+	// Total header size written is 48 bytes.
 	_, err := db.file.WriteAt(hb, 0)
 
 	if err != nil {
@@ -140,6 +153,8 @@ func (db *Database[T]) decodeHeaderLocked() error {
 	db.header.nextOffset = binary.BigEndian.Uint32(hb[15:19])
 	db.header.indexCapacity = binary.BigEndian.Uint32(hb[23:27])
 	db.header.lgIndexStart = binary.BigEndian.Uint32(hb[27:31])
+	db.header.tableCatalogOffset = binary.BigEndian.Uint32(hb[31:35])
+	db.header.tableCount = binary.BigEndian.Uint32(hb[35:39])
 
 	// Read nextRecordID and set it on the database
 	db.nextRecordID = binary.BigEndian.Uint32(hb[19:23])

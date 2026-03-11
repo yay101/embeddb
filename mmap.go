@@ -47,32 +47,32 @@ func (db *Database[T]) ScanNext(o uint32) (id uint32, buf *bytes.Buffer, active 
 	start := uint32(bytes.Index(data[o:], []byte{escCode, startMarker})) + o
 
 	// Check the 'active' byte in the record header.
-	// The active byte is at offset `start + 10` (2 for startMarker + 4 for id + 4 for length).
-	if db.mfile.At(int(start+10)) == byte(1) {
+	// The active byte is at offset `start + 11` (new format: 2 for markers + 1 for tableID + 4 for id + 4 for length).
+	if db.mfile.At(int(start+11)) == byte(1) {
 		active = true
 	} else {
 		active = false
 	}
 
 	// Extract the 'id' (4 bytes) from the record header.
-	// ID is located at `start + 2` (after the 2-byte start marker).
-	id = binary.BigEndian.Uint32(data[start+2 : start+6])
+	// ID is located at `start + 3` (after the 2-byte start marker and 1-byte tableID).
+	id = binary.BigEndian.Uint32(data[start+3 : start+7])
 
 	// Extract the 'length' (4 bytes) of the record data.
-	// Length is located at `start + 6` (after the 2-byte start marker and 4-byte ID).
-	length := binary.BigEndian.Uint32(data[start+6 : start+10]) // Corrected: start+6 to start+10 for length
+	// Length is located at `start + 7` (after the 2-byte start marker + 1-byte tableID + 4-byte ID).
+	length := binary.BigEndian.Uint32(data[start+7 : start+11])
 
 	// Search for the end marker sequence, starting from the current record's start.
 	end := uint32(bytes.Index(data[start:], []byte{escCode, endMarker})) + start // Add 'start' to get absolute index
 
-	// Validate the record: The calculated length (end - (start + 11)) should match the stored 'length'.
-	// `start + 11` is the beginning of the actual data payload:
-	// 2 (start marker) + 4 (id) + 4 (length) + 1 (active byte) = 11 bytes.
-	if (end - (start + 11)) != length {
+	// Validate the record: The calculated length (end - (start + 12)) should match the stored 'length'.
+	// `start + 12` is the beginning of the actual data payload:
+	// 2 (start marker) + 1 (tableID) + 4 (id) + 4 (length) + 1 (active byte) = 12 bytes.
+	if (end - (start + 12)) != length {
 		return 0, nil, false, errors.New("record invalid: length mismatch")
 	}
 
 	// Create a new bytes.Buffer containing the raw record data, including markers and headers.
-	buf = bytes.NewBuffer(data[start+11 : end])
+	buf = bytes.NewBuffer(data[start+12 : end])
 	return id, buf, active, nil
 }

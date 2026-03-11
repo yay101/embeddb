@@ -251,6 +251,40 @@ endOfYear := time.Date(2024, 12, 31, 23, 59, 59, 0, time.UTC)
 thisYear, err := db.QueryRangeBetween("CreatedAt", startOfYear, endOfYear, true, true)
 ```
 
+### Pagination
+
+All query methods have Paged variants that return paginated results with metadata:
+
+```go
+// QueryPaged - exact match with pagination
+result, err := db.QueryPaged("Age", 30, 0, 10) // offset=0, limit=10
+fmt.Printf("Page 1: %d of %d total\n", len(result.Records), result.TotalCount)
+if result.HasMore {
+    // Fetch next page
+    result, _ = db.QueryPaged("Age", 30, 10, 10) // offset=10
+}
+
+// QueryRangeGreaterThanPaged - range query with pagination
+result, err := db.QueryRangeGreaterThanPaged("Age", 18, true, 0, 10)
+
+// QueryRangeLessThanPaged - less than with pagination
+result, err := db.QueryRangeLessThanPaged("Age", 65, false, 0, 10)
+
+// QueryRangeBetweenPaged - between range with pagination
+result, err := db.QueryRangeBetweenPaged("Balance", 100.0, 500.0, true, true, 0, 10)
+
+// FilterPaged - full table scan with pagination
+result, err := db.FilterPaged(func(u User) bool {
+    return u.Age > 18
+}, 0, 10) // Skip first 0, return max 10
+```
+
+The `PagedResult[T]` type provides:
+- `Records` - the records for the current page
+- `TotalCount` - total matching records
+- `HasMore` - whether more pages are available
+- `Offset` / `Limit` - the pagination parameters used
+
 ### Nested Struct Queries
 
 ```go

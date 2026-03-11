@@ -891,7 +891,8 @@ func (idx *BTreeIndex) decodeNode(buf []byte, node *BTreeNode) error {
 }
 
 // Find searches for a key in the B-tree and returns the associated values
-func (idx *BTreeIndex) Find(key interface{}) ([]uint32, error) {
+// If limit > 0, returns at most that many values
+func (idx *BTreeIndex) Find(key interface{}, limit ...int) ([]uint32, error) {
 	idx.lock.RLock()
 	defer idx.lock.RUnlock()
 
@@ -968,11 +969,21 @@ func (idx *BTreeIndex) Find(key interface{}) ([]uint32, error) {
 	}
 
 	// Start search at the root
-	return idx.searchInNode(idx.rootPageNum, searchKey)
+	results, err := idx.searchInNode(idx.rootPageNum, searchKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply limit if specified
+	if len(limit) > 0 && limit[0] > 0 && len(results) > limit[0] {
+		return results[:limit[0]], nil
+	}
+	return results, nil
 }
 
 // FindGreaterThan finds all keys greater than the given key
-func (idx *BTreeIndex) FindGreaterThan(key interface{}, inclusive bool) ([]uint32, error) {
+// If limit > 0, returns at most that many values
+func (idx *BTreeIndex) FindGreaterThan(key interface{}, inclusive bool, limit ...int) ([]uint32, error) {
 	idx.lock.RLock()
 	defer idx.lock.RUnlock()
 
@@ -980,11 +991,20 @@ func (idx *BTreeIndex) FindGreaterThan(key interface{}, inclusive bool) ([]uint3
 		return nil, err
 	}
 
-	return idx.searchRange(idx.rootPageNum, key, nil, inclusive, true)
+	results, err := idx.searchRange(idx.rootPageNum, key, nil, inclusive, true)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(limit) > 0 && limit[0] > 0 && len(results) > limit[0] {
+		return results[:limit[0]], nil
+	}
+	return results, nil
 }
 
 // FindLessThan finds all keys less than the given key
-func (idx *BTreeIndex) FindLessThan(key interface{}, inclusive bool) ([]uint32, error) {
+// If limit > 0, returns at most that many values
+func (idx *BTreeIndex) FindLessThan(key interface{}, inclusive bool, limit ...int) ([]uint32, error) {
 	idx.lock.RLock()
 	defer idx.lock.RUnlock()
 
@@ -992,11 +1012,20 @@ func (idx *BTreeIndex) FindLessThan(key interface{}, inclusive bool) ([]uint32, 
 		return nil, err
 	}
 
-	return idx.searchRange(idx.rootPageNum, nil, key, true, inclusive)
+	results, err := idx.searchRange(idx.rootPageNum, nil, key, true, inclusive)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(limit) > 0 && limit[0] > 0 && len(results) > limit[0] {
+		return results[:limit[0]], nil
+	}
+	return results, nil
 }
 
 // FindBetween finds all keys between min and max (inclusive if specified)
-func (idx *BTreeIndex) FindBetween(min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
+// If limit > 0, returns at most that many values
+func (idx *BTreeIndex) FindBetween(min, max interface{}, inclusiveMin, inclusiveMax bool, limit ...int) ([]uint32, error) {
 	idx.lock.RLock()
 	defer idx.lock.RUnlock()
 
@@ -1007,7 +1036,15 @@ func (idx *BTreeIndex) FindBetween(min, max interface{}, inclusiveMin, inclusive
 		return nil, err
 	}
 
-	return idx.searchRange(idx.rootPageNum, min, max, inclusiveMin, inclusiveMax)
+	results, err := idx.searchRange(idx.rootPageNum, min, max, inclusiveMin, inclusiveMax)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(limit) > 0 && limit[0] > 0 && len(results) > limit[0] {
+		return results[:limit[0]], nil
+	}
+	return results, nil
 }
 
 // searchRange searches for keys in a range [min, max]

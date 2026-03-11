@@ -12,6 +12,15 @@ import (
 	"unsafe"
 )
 
+// PagedResult represents a paginated query result
+type PagedResult[T any] struct {
+	Records    []T  // The records for the current page
+	TotalCount int  // Total number of matching records
+	HasMore    bool // Whether there are more records beyond this page
+	Offset     int  // The offset used for this query
+	Limit      int  // The limit used for this query
+}
+
 // IndexManager handles the creation, management, and querying of indexes for a database
 type IndexManager[T any] struct {
 	db             *Database[T]           // Reference to the parent database
@@ -832,4 +841,220 @@ func (im *IndexManager[T]) GetIndexedFields() []string {
 		fields = append(fields, field)
 	}
 	return fields
+}
+
+// QueryPaged finds records that match a field value with pagination
+func (im *IndexManager[T]) QueryPaged(fieldName string, value interface{}, offset, limit int) (*PagedResult[T], error) {
+	im.lock.RLock()
+	index, exists := im.indexes[fieldName]
+	im.lock.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+
+	if err := index.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush index before query: %w", err)
+	}
+
+	allIDs, err := index.Find(value)
+	if err != nil {
+		return nil, err
+	}
+	totalCount := len(allIDs)
+
+	end := offset + limit
+	if offset >= len(allIDs) {
+		return &PagedResult[T]{
+			Records:     []T{},
+			TotalCount:  totalCount,
+			HasMore:     false,
+			Offset:      offset,
+			Limit:       limit,
+		}, nil
+	}
+
+	if end > len(allIDs) {
+		end = len(allIDs)
+	}
+
+	pagedIDs := allIDs[offset:end]
+
+	results := make([]T, 0, len(pagedIDs))
+	for _, id := range pagedIDs {
+		record, err := im.db.Get(id)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+
+	return &PagedResult[T]{
+		Records:     results,
+		TotalCount:  totalCount,
+		HasMore:     end < len(allIDs),
+		Offset:      offset,
+		Limit:       limit,
+	}, nil
+}
+
+// QueryRangeGreaterThanPaged finds records where field > value with pagination
+func (im *IndexManager[T]) QueryRangeGreaterThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
+	im.lock.RLock()
+	index, exists := im.indexes[fieldName]
+	im.lock.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+
+	if err := index.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush index before query: %w", err)
+	}
+
+	allIDs, err := index.FindGreaterThan(value, inclusive)
+	if err != nil {
+		return nil, err
+	}
+	totalCount := len(allIDs)
+
+	end := offset + limit
+	if offset >= len(allIDs) {
+		return &PagedResult[T]{
+			Records:     []T{},
+			TotalCount:  totalCount,
+			HasMore:     false,
+			Offset:      offset,
+			Limit:       limit,
+		}, nil
+	}
+
+	if end > len(allIDs) {
+		end = len(allIDs)
+	}
+
+	pagedIDs := allIDs[offset:end]
+
+	results := make([]T, 0, len(pagedIDs))
+	for _, id := range pagedIDs {
+		record, err := im.db.Get(id)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+
+	return &PagedResult[T]{
+		Records:     results,
+		TotalCount:  totalCount,
+		HasMore:     end < len(allIDs),
+		Offset:      offset,
+		Limit:       limit,
+	}, nil
+}
+
+// QueryRangeLessThanPaged finds records where field < value with pagination
+func (im *IndexManager[T]) QueryRangeLessThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
+	im.lock.RLock()
+	index, exists := im.indexes[fieldName]
+	im.lock.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+
+	if err := index.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush index before query: %w", err)
+	}
+
+	allIDs, err := index.FindLessThan(value, inclusive)
+	if err != nil {
+		return nil, err
+	}
+	totalCount := len(allIDs)
+
+	end := offset + limit
+	if offset >= len(allIDs) {
+		return &PagedResult[T]{
+			Records:     []T{},
+			TotalCount:  totalCount,
+			HasMore:     false,
+			Offset:      offset,
+			Limit:       limit,
+		}, nil
+	}
+
+	if end > len(allIDs) {
+		end = len(allIDs)
+	}
+
+	pagedIDs := allIDs[offset:end]
+
+	results := make([]T, 0, len(pagedIDs))
+	for _, id := range pagedIDs {
+		record, err := im.db.Get(id)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+
+	return &PagedResult[T]{
+		Records:     results,
+		TotalCount:  totalCount,
+		HasMore:     end < len(allIDs),
+		Offset:      offset,
+		Limit:       limit,
+	}, nil
+}
+
+// QueryRangeBetweenPaged finds records where min <= field <= max with pagination
+func (im *IndexManager[T]) QueryRangeBetweenPaged(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool, offset, limit int) (*PagedResult[T], error) {
+	im.lock.RLock()
+	index, exists := im.indexes[fieldName]
+	im.lock.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+
+	if err := index.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush index before query: %w", err)
+	}
+
+	allIDs, err := index.FindBetween(min, max, inclusiveMin, inclusiveMax)
+	if err != nil {
+		return nil, err
+	}
+	totalCount := len(allIDs)
+
+	end := offset + limit
+	if offset >= len(allIDs) {
+		return &PagedResult[T]{
+			Records:     []T{},
+			TotalCount:  totalCount,
+			HasMore:     false,
+			Offset:      offset,
+			Limit:       limit,
+		}, nil
+	}
+
+	if end > len(allIDs) {
+		end = len(allIDs)
+	}
+
+	pagedIDs := allIDs[offset:end]
+
+	results := make([]T, 0, len(pagedIDs))
+	for _, id := range pagedIDs {
+		record, err := im.db.Get(id)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+
+	return &PagedResult[T]{
+		Records:     results,
+		TotalCount:  totalCount,
+		HasMore:     end < len(allIDs),
+		Offset:      offset,
+		Limit:       limit,
+	}, nil
 }

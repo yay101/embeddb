@@ -173,6 +173,11 @@ func (db *Database[T]) MigrateWithOptions(oldLayout *StructLayout, opts Migratio
 
 // readRecordBytes reads the raw bytes of a record at the given offset
 func (db *Database[T]) readRecordBytes(offset uint32) ([]byte, error) {
+	return db.readRecordBytesAt(offset, 0)
+}
+
+// readRecordBytesAt reads the raw bytes of a record at the given offset with optional tableID
+func (db *Database[T]) readRecordBytesAt(offset uint32, expectedTableID uint8) ([]byte, error) {
 	// Check if mmap needs to be loaded before acquiring read lock
 	// (ReloadMMap acquires write lock, so we can't call it while holding read lock)
 	if db.mfile == nil {
@@ -185,9 +190,11 @@ func (db *Database[T]) readRecordBytes(offset uint32) ([]byte, error) {
 	defer db.mlock.RUnlock()
 
 	// First, determine the length of the record
-	// Read the length bytes (4 bytes at offset+6)
+	// Read the length bytes (4 bytes at offset+7 for new format)
+	// We check the format by looking at the first byte after markers
+	lengthOffset := int64(offset + 7) // new format: offset+2(tableID) + offset+3-6(id) = offset+7 for length
 	lengthBytes := make([]byte, 4)
-	_, err := db.mfile.ReadAt(lengthBytes, int64(offset+6))
+	_, err := db.mfile.ReadAt(lengthBytes, lengthOffset)
 	if err != nil {
 		return nil, err
 	}
@@ -196,9 +203,9 @@ func (db *Database[T]) readRecordBytes(offset uint32) ([]byte, error) {
 	recordLength := binary.BigEndian.Uint32(lengthBytes)
 
 	// Read the entire record including the header and markers
-	// Header is 11 bytes: [escCode,startMarker](2) + id(4) + length(4) + active(1)
+	// Header is 12 bytes: [escCode,startMarker](2) + tableID(1) + id(4) + length(4) + active(1)
 	// The footer is 2 bytes: [escCode,endMarker]
-	totalLength := 11 + recordLength + 2
+	totalLength := 12 + recordLength + 2
 
 	recordBytes := make([]byte, totalLength)
 	_, err = db.mfile.ReadAt(recordBytes, int64(offset))
@@ -213,6 +220,11 @@ func (db *Database[T]) readRecordBytes(offset uint32) ([]byte, error) {
 
 	if recordBytes[totalLength-2] != escCode || recordBytes[totalLength-1] != endMarker {
 		return nil, errors.New("invalid record: missing end marker")
+	}
+
+	// Verify tableID if specified
+	if expectedTableID != 0 && recordBytes[2] != expectedTableID {
+		return nil, fmt.Errorf("record table mismatch: expected %d, got %d", expectedTableID, recordBytes[2])
 	}
 
 	return recordBytes, nil
@@ -240,8 +252,8 @@ func (db *Database[T]) writeRecordBytes(id uint32, recordBytes []byte) (uint32, 
 
 // isActiveRecord checks if a record is active by examining its active byte
 func isActiveRecord(recordBytes []byte) bool {
-	// The active byte is at offset 10 in the record header
-	return len(recordBytes) > 10 && recordBytes[10] == 1
+	// The active byte is at offset 11 in the record header (after escCode, startMarker, tableID, id)
+	return len(recordBytes) > 11 && recordBytes[11] == 1
 }
 
 // decodeRecordWithLayout decodes a record using the specified struct layout
@@ -250,8 +262,8 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 	record := new(T)
 
 	// Extract the ID from the header before skipping it
-	// Header: [escCode,startMarker](2) + id(4) + length(4) + active(1)
-	recordID := binary.BigEndian.Uint32(data[2:6])
+	// Header: [escCode,startMarker](2) + tableID(1) + id(4) + length(4) + active(1)
+	recordID := binary.BigEndian.Uint32(data[3:7])
 
 	// If there's a primary key field, set the ID
 	if layout.PrimaryKey < 255 {
@@ -264,8 +276,8 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 		}
 	}
 
-	// Skip the header (first 11 bytes)
-	data = data[11:]
+	// Skip the header (first 12 bytes: escCode + startMarker + tableID + id + length + active)
+	data = data[12:]
 
 	// Remove the end marker (last 2 bytes)
 	data = data[:len(data)-2]

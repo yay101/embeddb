@@ -454,3 +454,77 @@ func (t *Table[T]) ensureTableRegistered() error {
 func (t *Table[T]) Name() string {
 	return t.name
 }
+
+// QueryPaged finds records that match a field value with pagination
+func (t *Table[T]) QueryPaged(fieldName string, value interface{}, offset, limit int) (*PagedResult[T], error) {
+	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+	return t.indexManager.QueryPaged(fieldName, value, offset, limit)
+}
+
+// QueryRangeGreaterThanPaged finds records where field > value with pagination
+func (t *Table[T]) QueryRangeGreaterThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
+	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+	return t.indexManager.QueryRangeGreaterThanPaged(fieldName, value, inclusive, offset, limit)
+}
+
+// QueryRangeLessThanPaged finds records where field < value with pagination
+func (t *Table[T]) QueryRangeLessThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
+	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+	return t.indexManager.QueryRangeLessThanPaged(fieldName, value, inclusive, offset, limit)
+}
+
+// QueryRangeBetweenPaged finds records where min <= field <= max with pagination
+func (t *Table[T]) QueryRangeBetweenPaged(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool, offset, limit int) (*PagedResult[T], error) {
+	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
+	return t.indexManager.QueryRangeBetweenPaged(fieldName, min, max, inclusiveMin, inclusiveMax, offset, limit)
+}
+
+// FilterPaged scans all records and returns those matching the filter with pagination
+func (t *Table[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedResult[T], error) {
+	t.db.lock.RLock()
+	defer t.db.lock.RUnlock()
+
+	var results []T
+	totalCount := 0
+	skipped := 0
+
+	for id := range t.db.index {
+		record, err := t.Get(id)
+		if err != nil {
+			continue
+		}
+
+		if fn(*record) {
+			totalCount++
+			if skipped < offset {
+				skipped++
+				continue
+			}
+			if len(results) < limit {
+				results = append(results, *record)
+			}
+		}
+	}
+
+	if results == nil {
+		results = []T{}
+	}
+
+	hasMore := (skipped + len(results)) < totalCount
+
+	return &PagedResult[T]{
+		Records:    results,
+		TotalCount: totalCount,
+		HasMore:    hasMore,
+		Offset:     offset,
+		Limit:      limit,
+	}, nil
+}
