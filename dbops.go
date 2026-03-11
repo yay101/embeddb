@@ -14,6 +14,7 @@ type TableCatalogEntry struct {
 	Name       string
 	LayoutHash string
 	NextID     uint32
+	Dropped    bool
 }
 
 // TableCatalog manages the tables in the database
@@ -99,6 +100,28 @@ func (tc *TableCatalog) UpdateTableNextID(name string, nextID uint32) {
 	}
 }
 
+// DropTable marks a table as dropped (soft delete)
+// The table's data will be cleaned up during Vacuum
+func (tc *TableCatalog) DropTable(name string) {
+	tc.lock.Lock()
+	defer tc.lock.Unlock()
+
+	if entry, ok := tc.tables[name]; ok {
+		entry.Dropped = true
+	}
+}
+
+// IsTableDropped checks if a table is marked as dropped
+func (tc *TableCatalog) IsTableDropped(name string) bool {
+	tc.lock.RLock()
+	defer tc.lock.RUnlock()
+
+	if entry, ok := tc.tables[name]; ok {
+		return entry.Dropped
+	}
+	return false
+}
+
 // GetNextRecordID gets the next record ID for a table
 func (tc *TableCatalog) GetNextRecordID(name string) uint32 {
 	tc.lock.RLock()
@@ -138,13 +161,19 @@ func (tc *TableCatalog) encode() ([]byte, error) {
 
 	buf := make([]byte, 0, 4+len(tc.tables)*256) // Rough estimate
 
-	// Write table count
+	// Write table count (including dropped tables so vacuum can clean them)
 	countBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(countBuf, uint32(len(tc.tables)))
 	buf = append(buf, countBuf...)
 
 	// Write each table
-	for name, entry := range tc.tables {
+	// Format: [tableID:1][nameLen:1][name][hashLen:1][hash][nextID:4][dropped:1]
+	for tableID, name := range tc.tableIDs {
+		entry := tc.tables[name]
+
+		// Table ID (1 byte)
+		buf = append(buf, tableID)
+
 		// Table name length (1 byte) + name
 		nameLen := uint8(len(name))
 		buf = append(buf, nameLen)
@@ -159,6 +188,13 @@ func (tc *TableCatalog) encode() ([]byte, error) {
 		idBuf := make([]byte, 4)
 		binary.BigEndian.PutUint32(idBuf, entry.NextID)
 		buf = append(buf, idBuf...)
+
+		// Dropped flag (1 byte: 0 = active, 1 = dropped)
+		if entry.Dropped {
+			buf = append(buf, 1)
+		} else {
+			buf = append(buf, 0)
+		}
 	}
 
 	return buf, nil
@@ -179,6 +215,10 @@ func decodeTableCatalog(data []byte) (*TableCatalog, error) {
 		if offset >= len(data) {
 			return nil, fmt.Errorf("table catalog truncated at table %d", i)
 		}
+
+		// Read table ID (1 byte)
+		tableID := uint8(data[offset])
+		offset++
 
 		// Read table name
 		nameLen := int(data[offset])
@@ -208,36 +248,34 @@ func decodeTableCatalog(data []byte) (*TableCatalog, error) {
 		nextID := binary.BigEndian.Uint32(data[offset : offset+4])
 		offset += 4
 
+		// Read dropped flag (optional - for backward compatibility)
+		dropped := false
+		if offset < len(data) {
+			dropped = data[offset] == 1
+			offset++
+		}
+
 		// Add to catalog
 		entry := &TableCatalogEntry{
 			Name:       name,
 			LayoutHash: hash,
 			NextID:     nextID,
+			Dropped:    dropped,
 		}
 		tc.tables[name] = entry
+		tc.tableIDs[tableID] = name
 
-		// Track ID mapping (we'll rebuild IDs from iteration order)
-		// Note: This loses the original table IDs - we'll fix this during load
-	}
-
-	// Rebuild table IDs based on map iteration order
-	id := uint8(1)
-	for name := range tc.tables {
-		tc.tableIDs[id] = name
-		if id >= tc.nextID {
-			tc.nextID = id + 1
+		// Update nextID to ensure we don't reuse IDs
+		if tableID >= tc.nextID {
+			tc.nextID = tableID + 1
 		}
-		id++
 	}
 
 	return tc, nil
 }
 
-// writeTableCatalog writes the table catalog to the database file
-func (db *Database[T]) writeTableCatalog() error {
-	db.lock.Lock()
-	defer db.lock.Unlock()
-
+// writeTableCatalog writes the table catalog to the database file (assumes lock is held)
+func (db *Database[T]) writeTableCatalogLocked() error {
 	if db.tableCatalog == nil {
 		return nil // No tables to write
 	}
@@ -251,7 +289,7 @@ func (db *Database[T]) writeTableCatalog() error {
 	// Write at the end of the current data (after records, before index)
 	writeOffset := db.header.nextOffset
 
-	// Write catalog with markers
+	// Write catalog with markers: [startMarker][length:4][data][endMarker]
 	headerBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(headerBytes, uint32(len(data)))
 	catalogData := append([]byte{startMarker}, headerBytes...)
@@ -267,7 +305,14 @@ func (db *Database[T]) writeTableCatalog() error {
 	db.header.tableCatalogOffset = writeOffset
 	db.header.tableCount = uint32(db.tableCatalog.Count())
 
-	return db.encodeHeaderLocked()
+	return nil
+}
+
+// writeTableCatalog writes the table catalog to the database file
+func (db *Database[T]) writeTableCatalog() error {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+	return db.writeTableCatalogLocked()
 }
 
 // readTableCatalog reads the table catalog from the database file
@@ -288,10 +333,10 @@ func (db *Database[T]) readTableCatalog() error {
 
 	length := binary.BigEndian.Uint32(headerBytes)
 
-	// Check end marker
-	endPos := db.header.tableCatalogOffset + 5 + length
-	if int(endPos) >= db.mfile.Len() {
-		return fmt.Errorf("table catalog extends beyond file")
+	// Check end marker position: startMarker(1) + length(4) + data(length) + endMarker(1)
+	endPos := db.header.tableCatalogOffset + 6 + length
+	if int(endPos) > db.mfile.Len() {
+		return fmt.Errorf("table catalog extends beyond file: endPos=%d, fileLen=%d", endPos, db.mfile.Len())
 	}
 
 	// Read catalog data
@@ -372,6 +417,12 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 			return nil, fmt.Errorf("failed to write header: %w", err)
 		}
 
+		// Write the table catalog to disk
+		if err := db.writeTableCatalog(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to write table catalog: %w", err)
+		}
+
 		// Auto-index fields if requested (for new files)
 		if autoIndex {
 			if err := db.autoIndexFields(); err != nil {
@@ -389,6 +440,12 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 		if err := db.ReadIndex(); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("failed to read index: %w", err)
+		}
+
+		// Read the existing table catalog
+		if err := db.readTableCatalog(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to read table catalog: %w", err)
 		}
 
 		// No legacy schema initialization needed

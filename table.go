@@ -374,6 +374,25 @@ func (t *Table[T]) DropIndex(fieldName string) error {
 	return t.indexManager.DropIndex(fieldName)
 }
 
+// Drop marks the table as dropped (soft delete)
+// The table's data will be cleaned up during Vacuum()
+// After Drop, the table can no longer be used for inserts/queries
+func (t *Table[T]) Drop() error {
+	if t.db.tableCatalog == nil {
+		return nil
+	}
+	t.db.tableCatalog.DropTable(t.name)
+	return t.db.writeTableCatalog()
+}
+
+// IsDropped returns true if the table has been dropped
+func (t *Table[T]) IsDropped() bool {
+	if t.db.tableCatalog == nil {
+		return false
+	}
+	return t.db.tableCatalog.IsTableDropped(t.name)
+}
+
 // ensureTableRegistered ensures the table is registered in the catalog
 func (t *Table[T]) ensureTableRegistered() error {
 	if t.db.tableCatalog == nil {

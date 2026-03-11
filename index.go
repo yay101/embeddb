@@ -134,7 +134,7 @@ func (db *Database[T]) ReadIndex() (err error) {
 	db.mlock.Lock()
 	defer db.mlock.Unlock()
 
-	// Check for start marker
+	// Check for start marker at indexStart
 	if db.mfile.At(int(db.header.indexStart)) != startMarker {
 		// Try the last known good index location
 		if db.header.lgIndexStart > 0 && db.header.lgIndexStart != db.header.indexStart {
@@ -145,34 +145,8 @@ func (db *Database[T]) ReadIndex() (err error) {
 		return errors.New("index location doesn't start correctly")
 	}
 
-	// Read the index length
-	lengthBytes := make([]byte, 4)
-	_, err = db.mfile.ReadAt(lengthBytes, int64(db.header.indexStart+1))
-	if err != nil {
-		return fmt.Errorf("failed to read index length: %w", err)
-	}
-	length := binary.BigEndian.Uint32(lengthBytes)
-
-	// Check for end marker
-	endMarkerPos := db.header.indexStart + 5 + length
-	if int(endMarkerPos) >= db.mfile.Len() || db.mfile.At(int(endMarkerPos)) != endMarker {
-		// Try the last known good index location
-		if db.header.lgIndexStart > 0 && db.header.lgIndexStart != db.header.indexStart {
-			log.Printf("Current index appears corrupted, trying last good index at offset %d", db.header.lgIndexStart)
-			atomic.StoreUint32(&db.header.indexStart, db.header.lgIndexStart)
-			return db.ReadIndex()
-		}
-		return errors.New("index location doesn't end correctly")
-	}
-
-	// Read the index data
-	indexBytes := make([]byte, int(length))
-	_, err = db.mfile.ReadAt(indexBytes, int64(db.header.indexStart+5))
-	if err != nil {
-		return fmt.Errorf("failed to read index data: %w", err)
-	}
-
 	// Parse per-table index blocks
+	// Format: [startMarker][tableID:1][count:4][(id:4,offset:4)*n]...[endMarker]
 	currentPos := db.header.indexStart + 1
 	idBytes := make([]byte, 4)
 
@@ -181,15 +155,23 @@ func (db *Database[T]) ReadIndex() (err error) {
 		if marker == endMarker {
 			break
 		}
+
+		// Read tableID
 		tableID := uint8(db.mfile.At(int(currentPos)))
 		currentPos++
+
+		// Read count
 		_, err = db.mfile.ReadAt(idBytes, int64(currentPos))
 		if err != nil {
 			return fmt.Errorf("failed to read count: %w", err)
 		}
 		count := binary.BigEndian.Uint32(idBytes)
 		currentPos += 4
+
+		// Get or create the table index
 		idx := db.getTableIndex(tableID)
+
+		// Read record entries
 		for i := uint32(0); i < count; i++ {
 			_, err = db.mfile.ReadAt(idBytes, int64(currentPos))
 			if err != nil {
@@ -197,12 +179,14 @@ func (db *Database[T]) ReadIndex() (err error) {
 			}
 			recordID := binary.BigEndian.Uint32(idBytes)
 			currentPos += 4
+
 			_, err = db.mfile.ReadAt(idBytes, int64(currentPos))
 			if err != nil {
 				return fmt.Errorf("failed to read offset: %w", err)
 			}
 			offset := binary.BigEndian.Uint32(idBytes)
 			currentPos += 4
+
 			idx[recordID] = offset
 		}
 	}
@@ -464,6 +448,34 @@ func (db *Database[T]) Vacuum() error {
 	if err := db.commitTransaction(); err != nil {
 		// Log but don't fail - the vacuum itself succeeded
 		fmt.Printf("Warning: failed to commit vacuum transaction: %v\n", err)
+	}
+
+	// Clean up dropped tables from catalog and indexes
+	if db.tableCatalog != nil {
+		db.lock.Lock()
+		for name, entry := range db.tableCatalog.tables {
+			if entry.Dropped {
+				// Get tableID to clean up indexes
+				if tableID, ok := db.tableCatalog.GetTableID(name); ok {
+					delete(db.indexes, tableID)
+				}
+				// Remove from catalog
+				delete(db.tableCatalog.tables, name)
+			}
+		}
+		// Rebuild tableIDs map
+		db.tableCatalog.tableIDs = make(map[uint8]string)
+		for name := range db.tableCatalog.tables {
+			if tableID, ok := db.tableCatalog.GetTableID(name); ok {
+				db.tableCatalog.tableIDs[tableID] = name
+			}
+		}
+		db.lock.Unlock()
+
+		// Write updated catalog
+		if err := db.writeTableCatalog(); err != nil {
+			fmt.Printf("Warning: failed to write table catalog after vacuum: %v\n", err)
+		}
 	}
 
 	return nil

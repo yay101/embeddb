@@ -54,7 +54,7 @@ type DBHeader struct {
 // This type is no longer used and has been replaced by FieldOffset in field_offsets.go
 
 const (
-	headerSize                int          = 48
+	headerSize                int          = 52
 	chunkSize                 int          = 4096
 	escCode                   byte         = 0x1B
 	startMarker               byte         = 0x02
@@ -225,6 +225,11 @@ func (db *Database[T]) Sync() error {
 	// Write the index to disk
 	if err := db.writeIndexLocked(); err != nil {
 		return fmt.Errorf("failed to write index: %w", err)
+	}
+
+	// Write the table catalog to disk (must be after index to avoid overwrite)
+	if err := db.writeTableCatalogLocked(); err != nil {
+		return fmt.Errorf("failed to write table catalog: %w", err)
 	}
 
 	// Write the header to disk

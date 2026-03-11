@@ -8,11 +8,11 @@ import (
 
 // Version constant is now defined in main.go
 
-// Header format (expanded to 48 bytes):
+// Header format (expanded to 52 bytes):
 // [Version (3 bytes)] [tocStart (4 bytes)] [indexStart (4 bytes)] [entryStart (4 bytes)]
 // [nextOffset (4 bytes)] [nextRecordID (4 bytes)] [indexCapacity (4 bytes)] [lgIndexStart (4 bytes)]
-// [tableCatalogOffset (4 bytes)] [tableCount (4 bytes)] [reserved (7 bytes)]
-// Total: 48 bytes
+// [indexEnd (4 bytes)] [tableCatalogOffset (4 bytes)] [tableCount (4 bytes)] [reserved (3 bytes)]
+// Total: 52 bytes
 
 // encodeHeader writes the header to the database file.
 // This is the public API that acquires locks.
@@ -78,6 +78,11 @@ func (db *Database[T]) encodeHeaderLocked() error {
 	// Encode the lgIndexStart (uint32) in BigEndian.
 	binary.BigEndian.PutUint32(ub, db.header.lgIndexStart)
 	// Append the encoded lgIndexStart (4 bytes) to the header buffer.
+	hb = append(hb, ub...)
+
+	// Encode the indexEnd (uint32) in BigEndian.
+	binary.BigEndian.PutUint32(ub, db.header.indexEnd)
+	// Append the encoded indexEnd (4 bytes) to the header buffer.
 	hb = append(hb, ub...)
 
 	// Encode the tableCatalogOffset (uint32) in BigEndian.
@@ -153,8 +158,9 @@ func (db *Database[T]) decodeHeaderLocked() error {
 	db.header.nextOffset = binary.BigEndian.Uint32(hb[15:19])
 	db.header.indexCapacity = binary.BigEndian.Uint32(hb[23:27])
 	db.header.lgIndexStart = binary.BigEndian.Uint32(hb[27:31])
-	db.header.tableCatalogOffset = binary.BigEndian.Uint32(hb[31:35])
-	db.header.tableCount = binary.BigEndian.Uint32(hb[35:39])
+	db.header.indexEnd = binary.BigEndian.Uint32(hb[31:35])
+	db.header.tableCatalogOffset = binary.BigEndian.Uint32(hb[35:39])
+	db.header.tableCount = binary.BigEndian.Uint32(hb[39:43])
 
 	// Read nextRecordID and set it on the database
 	db.nextRecordID = binary.BigEndian.Uint32(hb[19:23])
