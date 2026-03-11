@@ -68,6 +68,58 @@ func expectNestedCityCount(t *testing.T, table *Table[mockMultiRow], city string
 	}
 }
 
+func expectNestedCityQueryPaged(t *testing.T, table *Table[mockMultiRow], city string, pageSize, wantTotal int) {
+	t.Helper()
+
+	p1, err := table.QueryPaged("Loc.City", city, 0, pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1.TotalCount != wantTotal {
+		t.Fatalf("query paged total expected %d got %d", wantTotal, p1.TotalCount)
+	}
+	if len(p1.Records) != pageSize {
+		t.Fatalf("query paged page1 expected %d got %d", pageSize, len(p1.Records))
+	}
+	if !p1.HasMore {
+		t.Fatal("query paged page1 expected HasMore=true")
+	}
+
+	p2, err := table.QueryPaged("Loc.City", city, pageSize, pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p2.Records) != pageSize {
+		t.Fatalf("query paged page2 expected %d got %d", pageSize, len(p2.Records))
+	}
+}
+
+func expectNestedCityFilterPaged(t *testing.T, table *Table[mockMultiRow], city string, pageSize, wantTotal int) {
+	t.Helper()
+
+	p1, err := table.FilterPaged(func(r mockMultiRow) bool { return r.Loc.City == city }, 0, pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1.TotalCount != wantTotal {
+		t.Fatalf("filter paged total expected %d got %d", wantTotal, p1.TotalCount)
+	}
+	if len(p1.Records) != pageSize {
+		t.Fatalf("filter paged page1 expected %d got %d", pageSize, len(p1.Records))
+	}
+	if !p1.HasMore {
+		t.Fatal("filter paged page1 expected HasMore=true")
+	}
+
+	p2, err := table.FilterPaged(func(r mockMultiRow) bool { return r.Loc.City == city }, pageSize, pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p2.Records) != pageSize {
+		t.Fatalf("filter paged page2 expected %d got %d", pageSize, len(p2.Records))
+	}
+}
+
 func TestMockMultiTableVacuumReopenNested100K(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping heavy 100k-per-table mock test")
@@ -136,9 +188,14 @@ func TestMockMultiTableVacuumReopenNested100K(t *testing.T) {
 	}
 	t.Logf("tableIDs reopen: t1=%d t2=%d t3=%d", t1r0.tableID, t2r0.tableID, t3r0.tableID)
 	t.Logf("counts before vacuum: t1=%d t2=%d t3=%d", t1r0.Count(), t2r0.Count(), t3r0.Count())
+	if err := t1r0.CreateIndex("Loc.City"); err != nil {
+		t.Fatal(err)
+	}
 	expectNestedCityCount(t, t1r0, "City_2", n/5)
 	expectNestedCityCount(t, t2r0, "City_3", n/5)
 	expectNestedCityCount(t, t3r0, "City_1", n/5)
+	expectNestedCityQueryPaged(t, t1r0, "City_2", 250, n/5)
+	expectNestedCityFilterPaged(t, t3r0, "City_1", 250, n/5)
 
 	// Drop one table, vacuum, then close.
 	if err := t2r0.Drop(); err != nil {
@@ -175,6 +232,8 @@ func TestMockMultiTableVacuumReopenNested100K(t *testing.T) {
 
 	expectNestedCityCount(t, t1r, "City_2", n/5)
 	expectNestedCityCount(t, t3r, "City_1", n/5)
+	expectNestedCityFilterPaged(t, t1r, "City_2", 250, n/5)
+	expectNestedCityFilterPaged(t, t3r, "City_1", 250, n/5)
 
 	t2r, err := db2.Table("table_two")
 	if err != nil {

@@ -706,7 +706,14 @@ func (db *Database[T]) Get(id uint32) (*T, error) {
 // getLocked retrieves a record without acquiring locks.
 // IMPORTANT: Caller must hold db.lock (read or write) before calling this method.
 func (db *Database[T]) getLocked(id uint32) (*T, error) {
-	// For backward compatibility, use table 0 (legacy single-table mode)
+	// Prefer the default table in multi-table mode.
+	if db.tableCatalog != nil && db.defaultTable != "" {
+		if tableID, ok := db.tableCatalog.GetTableID(db.defaultTable); ok {
+			return db.getLockedForTable(id, tableID)
+		}
+	}
+
+	// Legacy single-table fallback.
 	return db.getLockedForTable(id, 0)
 }
 

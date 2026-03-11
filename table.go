@@ -517,7 +517,11 @@ func (t *Table[T]) QueryPaged(fieldName string, value interface{}, offset, limit
 	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {
 		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
 	}
-	return t.indexManager.QueryPaged(fieldName, value, offset, limit)
+	all, err := t.Query(fieldName, value)
+	if err != nil {
+		return nil, err
+	}
+	return paginateTableResults(all, offset, limit), nil
 }
 
 // QueryRangeGreaterThanPaged finds records where field > value with pagination
@@ -525,7 +529,11 @@ func (t *Table[T]) QueryRangeGreaterThanPaged(fieldName string, value interface{
 	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {
 		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
 	}
-	return t.indexManager.QueryRangeGreaterThanPaged(fieldName, value, inclusive, offset, limit)
+	all, err := t.QueryRangeGreaterThan(fieldName, value, inclusive)
+	if err != nil {
+		return nil, err
+	}
+	return paginateTableResults(all, offset, limit), nil
 }
 
 // QueryRangeLessThanPaged finds records where field < value with pagination
@@ -533,7 +541,11 @@ func (t *Table[T]) QueryRangeLessThanPaged(fieldName string, value interface{}, 
 	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {
 		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
 	}
-	return t.indexManager.QueryRangeLessThanPaged(fieldName, value, inclusive, offset, limit)
+	all, err := t.QueryRangeLessThan(fieldName, value, inclusive)
+	if err != nil {
+		return nil, err
+	}
+	return paginateTableResults(all, offset, limit), nil
 }
 
 // QueryRangeBetweenPaged finds records where min <= field <= max with pagination
@@ -541,7 +553,41 @@ func (t *Table[T]) QueryRangeBetweenPaged(fieldName string, min, max interface{}
 	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {
 		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
 	}
-	return t.indexManager.QueryRangeBetweenPaged(fieldName, min, max, inclusiveMin, inclusiveMax, offset, limit)
+	all, err := t.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
+	if err != nil {
+		return nil, err
+	}
+	return paginateTableResults(all, offset, limit), nil
+}
+
+func paginateTableResults[T any](all []T, offset, limit int) *PagedResult[T] {
+	if limit < 0 {
+		limit = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	total := len(all)
+	if offset >= total || limit == 0 {
+		return &PagedResult[T]{
+			Records:    []T{},
+			TotalCount: total,
+			HasMore:    false,
+			Offset:     offset,
+			Limit:      limit,
+		}
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return &PagedResult[T]{
+		Records:    all[offset:end],
+		TotalCount: total,
+		HasMore:    end < total,
+		Offset:     offset,
+		Limit:      limit,
+	}
 }
 
 // FilterPaged scans all records and returns those matching the filter with pagination
