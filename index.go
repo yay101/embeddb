@@ -172,38 +172,39 @@ func (db *Database[T]) ReadIndex() (err error) {
 		return fmt.Errorf("failed to read index data: %w", err)
 	}
 
-	// Clear the existing index
-	db.index = make(map[uint32]uint32)
-
-	// Parse the index data
-	buf := bytes.NewReader(indexBytes)
-
-	// Read the number of entries
-	countBytes := make([]byte, 4)
-	if _, err := buf.Read(countBytes); err != nil {
-		return fmt.Errorf("failed to read index entry count: %w", err)
-	}
-	count := binary.BigEndian.Uint32(countBytes)
-
-	// Read each (id, offset) pair
+	// Parse per-table index blocks
+	currentPos := db.header.indexStart + 1
 	idBytes := make([]byte, 4)
-	offsetBytes := make([]byte, 4)
 
-	for i := uint32(0); i < count; i++ {
-		// Read the record ID
-		if _, err := buf.Read(idBytes); err != nil {
-			return fmt.Errorf("failed to read record ID: %w", err)
+	for currentPos < db.header.indexEnd {
+		marker := db.mfile.At(int(currentPos))
+		if marker == endMarker {
+			break
 		}
-		id := binary.BigEndian.Uint32(idBytes)
-
-		// Read the record offset
-		if _, err := buf.Read(offsetBytes); err != nil {
-			return fmt.Errorf("failed to read record offset: %w", err)
+		tableID := uint8(db.mfile.At(int(currentPos)))
+		currentPos++
+		_, err = db.mfile.ReadAt(idBytes, int64(currentPos))
+		if err != nil {
+			return fmt.Errorf("failed to read count: %w", err)
 		}
-		offset := binary.BigEndian.Uint32(offsetBytes)
-
-		// Add to the index
-		db.index[id] = offset
+		count := binary.BigEndian.Uint32(idBytes)
+		currentPos += 4
+		idx := db.getTableIndex(tableID)
+		for i := uint32(0); i < count; i++ {
+			_, err = db.mfile.ReadAt(idBytes, int64(currentPos))
+			if err != nil {
+				return fmt.Errorf("failed to read record ID: %w", err)
+			}
+			recordID := binary.BigEndian.Uint32(idBytes)
+			currentPos += 4
+			_, err = db.mfile.ReadAt(idBytes, int64(currentPos))
+			if err != nil {
+				return fmt.Errorf("failed to read offset: %w", err)
+			}
+			offset := binary.BigEndian.Uint32(idBytes)
+			currentPos += 4
+			idx[recordID] = offset
+		}
 	}
 
 	return nil
@@ -242,12 +243,12 @@ func (db *Database[T]) Vacuum() error {
 	// Current write position starts after header
 	writePos := uint32(headerSize)
 
-	// Collect records that will remain after vacuum
+	// Collect records that will remain after vacuum (table 0)
 	keptRecords := make(map[uint32]*T)
 
 	// Copy the index keys to avoid holding lock while iterating
 	indexCopy := make(map[uint32]uint32)
-	for k, v := range db.index {
+	for k, v := range db.indexes[0] {
 		indexCopy[k] = v
 	}
 
@@ -412,7 +413,7 @@ func (db *Database[T]) Vacuum() error {
 	db.header.entryStart = newHeader.entryStart
 	db.header.lgIndexStart = newHeader.lgIndexStart
 	db.header.indexCapacity = newHeader.indexCapacity
-	db.index = newIndex
+	db.indexes[0] = newIndex
 
 	// Release lock before reloading mmap (ReloadMMap uses mlock)
 	db.lock.Unlock()

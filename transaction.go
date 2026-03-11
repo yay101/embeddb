@@ -33,8 +33,8 @@ type Transaction struct {
 	state TransactionState
 	// The temporary file for the transaction
 	tempFile *os.File
-	// The temporary index for the transaction
-	tempIndex map[uint32]uint32
+	// The temporary index for the transaction (per-table)
+	tempIndex map[uint8]map[uint32]uint32
 	// The original header state values (not the entire header with mutex)
 	originalIndexStart    uint32
 	originalIndexEnd      uint32
@@ -90,10 +90,13 @@ func (db *Database[T]) beginTransactionLocked() error {
 	var originalLgIndexStart uint32 = db.header.lgIndexStart
 	var originalIndexCapacity uint32 = db.header.indexCapacity
 
-	// Create a copy of the current index
-	tempIndex := make(map[uint32]uint32)
-	for k, v := range db.index {
-		tempIndex[k] = v
+	// Create a copy of the current index (all tables, for rollback)
+	tempIndex := make(map[uint8]map[uint32]uint32)
+	for tableID, idx := range db.indexes {
+		tempIndex[tableID] = make(map[uint32]uint32)
+		for k, v := range idx {
+			tempIndex[tableID][k] = v
+		}
 	}
 
 	// Create a new transaction
@@ -179,10 +182,13 @@ func (db *Database[T]) rollbackTransactionLocked() error {
 	atomic.StoreUint32(&db.header.lgIndexStart, db.transaction.originalLgIndexStart)
 	atomic.StoreUint32(&db.header.indexCapacity, db.transaction.originalIndexCapacity)
 
-	// Restore the original index
-	db.index = make(map[uint32]uint32)
-	for k, v := range db.transaction.tempIndex {
-		db.index[k] = v
+	// Restore the original index (all tables)
+	db.indexes = make(map[uint8]map[uint32]uint32)
+	for tableID, idx := range db.transaction.tempIndex {
+		db.indexes[tableID] = make(map[uint32]uint32)
+		for k, v := range idx {
+			db.indexes[tableID][k] = v
+		}
 	}
 
 	// Clean up the temporary file

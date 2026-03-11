@@ -73,15 +73,16 @@ func (db *Database[T]) MigrateWithOptions(oldLayout *StructLayout, opts Migratio
 		}
 	}()
 
-	// Create a temporary backup of the index
+	// Create a temporary backup of the index (table 0 for backward compat)
 	oldIndex := make(map[uint32]uint32)
-	for k, v := range db.index {
+	idx := db.indexes[0]
+	for k, v := range idx {
 		oldIndex[k] = v
 	}
 
 	// Get all record IDs
 	var recordIDs []uint32
-	for id := range db.index {
+	for id := range idx {
 		recordIDs = append(recordIDs, id)
 	}
 
@@ -111,8 +112,8 @@ func (db *Database[T]) MigrateWithOptions(oldLayout *StructLayout, opts Migratio
 
 		// Process each record in the batch
 		for _, id := range batch {
-			// Get the old record bytes at the old offset
-			oldOffset := db.index[id]
+			// Get the old record bytes at the old offset (use table 0)
+			oldOffset, _ := db.getRecordOffset(0, id)
 
 			// Read the record bytes
 			recordBytes, err := db.readRecordBytes(oldOffset)
@@ -154,10 +155,10 @@ func (db *Database[T]) MigrateWithOptions(oldLayout *StructLayout, opts Migratio
 		logMessage(fmt.Sprintf("Migrated %d records so far", totalMigrated))
 	}
 
-	// Update the index with the migrated offsets
+	// Update the index with the migrated offsets (table 0)
 	db.lock.Lock()
 	for id, offset := range migratedRecords {
-		db.index[id] = offset
+		db.setRecordOffset(0, id, offset)
 	}
 	db.lock.Unlock()
 

@@ -165,10 +165,11 @@ func (im *IndexManager[T]) BuildIndex(fieldName string) error {
 	}
 	im.lock.Unlock()
 
-	// Get all record IDs from the database
+	// Get all record IDs from the database (use table 0 for backward compat)
 	im.db.lock.RLock()
-	recordIDs := make([]uint32, 0, len(im.db.index))
-	for id := range im.db.index {
+	idx := im.db.indexes[0]
+	recordIDs := make([]uint32, 0, len(idx))
+	for id := range idx {
 		recordIDs = append(recordIDs, id)
 	}
 	im.db.lock.RUnlock()
@@ -866,11 +867,11 @@ func (im *IndexManager[T]) QueryPaged(fieldName string, value interface{}, offse
 	end := offset + limit
 	if offset >= len(allIDs) {
 		return &PagedResult[T]{
-			Records:     []T{},
-			TotalCount:  totalCount,
-			HasMore:     false,
-			Offset:      offset,
-			Limit:       limit,
+			Records:    []T{},
+			TotalCount: totalCount,
+			HasMore:    false,
+			Offset:     offset,
+			Limit:      limit,
 		}, nil
 	}
 
@@ -889,11 +890,11 @@ func (im *IndexManager[T]) QueryPaged(fieldName string, value interface{}, offse
 	}
 
 	return &PagedResult[T]{
-		Records:     results,
-		TotalCount:  totalCount,
-		HasMore:     end < len(allIDs),
-		Offset:      offset,
-		Limit:       limit,
+		Records:    results,
+		TotalCount: totalCount,
+		HasMore:    end < len(allIDs),
+		Offset:     offset,
+		Limit:      limit,
 	}, nil
 }
 
@@ -920,11 +921,11 @@ func (im *IndexManager[T]) QueryRangeGreaterThanPaged(fieldName string, value in
 	end := offset + limit
 	if offset >= len(allIDs) {
 		return &PagedResult[T]{
-			Records:     []T{},
-			TotalCount:  totalCount,
-			HasMore:     false,
-			Offset:      offset,
-			Limit:       limit,
+			Records:    []T{},
+			TotalCount: totalCount,
+			HasMore:    false,
+			Offset:     offset,
+			Limit:      limit,
 		}, nil
 	}
 
@@ -943,11 +944,11 @@ func (im *IndexManager[T]) QueryRangeGreaterThanPaged(fieldName string, value in
 	}
 
 	return &PagedResult[T]{
-		Records:     results,
-		TotalCount:  totalCount,
-		HasMore:     end < len(allIDs),
-		Offset:      offset,
-		Limit:       limit,
+		Records:    results,
+		TotalCount: totalCount,
+		HasMore:    end < len(allIDs),
+		Offset:     offset,
+		Limit:      limit,
 	}, nil
 }
 
@@ -974,11 +975,11 @@ func (im *IndexManager[T]) QueryRangeLessThanPaged(fieldName string, value inter
 	end := offset + limit
 	if offset >= len(allIDs) {
 		return &PagedResult[T]{
-			Records:     []T{},
-			TotalCount:  totalCount,
-			HasMore:     false,
-			Offset:      offset,
-			Limit:       limit,
+			Records:    []T{},
+			TotalCount: totalCount,
+			HasMore:    false,
+			Offset:     offset,
+			Limit:      limit,
 		}, nil
 	}
 
@@ -997,11 +998,11 @@ func (im *IndexManager[T]) QueryRangeLessThanPaged(fieldName string, value inter
 	}
 
 	return &PagedResult[T]{
-		Records:     results,
-		TotalCount:  totalCount,
-		HasMore:     end < len(allIDs),
-		Offset:      offset,
-		Limit:       limit,
+		Records:    results,
+		TotalCount: totalCount,
+		HasMore:    end < len(allIDs),
+		Offset:     offset,
+		Limit:      limit,
 	}, nil
 }
 
@@ -1028,11 +1029,11 @@ func (im *IndexManager[T]) QueryRangeBetweenPaged(fieldName string, min, max int
 	end := offset + limit
 	if offset >= len(allIDs) {
 		return &PagedResult[T]{
-			Records:     []T{},
-			TotalCount:  totalCount,
-			HasMore:     false,
-			Offset:      offset,
-			Limit:       limit,
+			Records:    []T{},
+			TotalCount: totalCount,
+			HasMore:    false,
+			Offset:     offset,
+			Limit:      limit,
 		}, nil
 	}
 
@@ -1051,10 +1052,10 @@ func (im *IndexManager[T]) QueryRangeBetweenPaged(fieldName string, min, max int
 	}
 
 	return &PagedResult[T]{
-		Records:     results,
-		TotalCount:  totalCount,
-		HasMore:     end < len(allIDs),
-		Offset:      offset,
-		Limit:       limit,
+		Records:    results,
+		TotalCount: totalCount,
+		HasMore:    end < len(allIDs),
+		Offset:     offset,
+		Limit:      limit,
 	}, nil
 }
