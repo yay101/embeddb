@@ -4,10 +4,25 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 )
+
+func cleanupStaleIndexFiles(dbFileName string) error {
+	pattern := filepath.Join(filepath.Dir(dbFileName), fmt.Sprintf("%s.*.idx", filepath.Base(dbFileName)))
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
 
 // TableCatalogEntry represents a single table in the database catalog
 type TableCatalogEntry struct {
@@ -395,6 +410,11 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 	// For a new file, initialize the header and index
 	if fileInfo.Size() == 0 {
+		if err := cleanupStaleIndexFiles(file.Name()); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to clean stale index files: %w", err)
+		}
+
 		// Initialize the header for a new file
 		db.header = DBHeader{
 			Version:            Version,

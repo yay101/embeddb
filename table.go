@@ -3,6 +3,7 @@ package embeddb
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 )
 
 // Table provides typed table access for a specific struct type
@@ -276,8 +277,11 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 	}
 
 	results := make([]T, 0, len(recordIDs))
+	slices.Sort(recordIDs)
+	t.db.lock.RLock()
+	defer t.db.lock.RUnlock()
 	for _, id := range recordIDs {
-		record, err := t.Get(id)
+		record, err := t.db.getLockedForTable(id, t.tableID)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
