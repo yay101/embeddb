@@ -1769,57 +1769,42 @@ func (idx *BTreeIndex) insertIntoNode(pageNum uint32, key interface{}, recordID 
 				// Need overflow pages
 				overflowStart := MaxInlineValues
 				if pos < len(node.OverflowPages) && node.OverflowPages[pos] != 0 {
-					// Already have overflow - append to existing chain
-					// For simplicity, we'll just add to the end of the chain
-					// A more sophisticated approach would track the last page
-					lastPage := node.OverflowPages[pos]
-					for {
-						overflow, err := idx.readOverflowPage(lastPage)
+					// Already have overflow - use head page for O(1) append.
+					// If head is full, prepend a new page as the new head.
+					headPage := node.OverflowPages[pos]
+					overflow, err := idx.readOverflowPage(headPage)
+					if err != nil {
+						return nil, err
+					}
+
+					if int(overflow.ValueCount) < ValuesPerOverflowPage {
+						overflow.Values = append(overflow.Values, recordID)
+						overflow.ValueCount++
+						if err := idx.writeOverflowPage(headPage, overflow); err != nil {
+							return nil, err
+						}
+					} else {
+						newPage, err := idx.allocatePage()
 						if err != nil {
 							return nil, err
 						}
-						if overflow.NextPage == 0 {
-							// Found the last page - add values here or create new page
-							if int(overflow.ValueCount) < ValuesPerOverflowPage {
-								// Add to this page
-								overflow.Values = append(overflow.Values, recordID)
-								overflow.ValueCount++
-								if err := idx.writeOverflowPage(lastPage, overflow); err != nil {
-									return nil, err
-								}
-								// Remove the extra value we added to inline
-								node.Values[pos] = node.Values[pos][:MaxInlineValues]
-								if err := idx.writeNode(pageNum, node); err != nil {
-									return nil, err
-								}
-								return nil, nil
-							}
-							// Page is full, create new overflow page
-							newPage, err := idx.allocatePage()
-							if err != nil {
-								return nil, err
-							}
-							newOverflow := &OverflowPage{
-								NextPage:   0,
-								ValueCount: 1,
-								Values:     []uint32{recordID},
-							}
-							if err := idx.writeOverflowPage(newPage, newOverflow); err != nil {
-								return nil, err
-							}
-							overflow.NextPage = newPage
-							if err := idx.writeOverflowPage(lastPage, overflow); err != nil {
-								return nil, err
-							}
-							// Remove the extra value we added to inline
-							node.Values[pos] = node.Values[pos][:MaxInlineValues]
-							if err := idx.writeNode(pageNum, node); err != nil {
-								return nil, err
-							}
-							return nil, nil
+						newOverflow := &OverflowPage{
+							NextPage:   headPage,
+							ValueCount: 1,
+							Values:     []uint32{recordID},
 						}
-						lastPage = overflow.NextPage
+						if err := idx.writeOverflowPage(newPage, newOverflow); err != nil {
+							return nil, err
+						}
+						node.OverflowPages[pos] = newPage
 					}
+
+					// Remove the extra value we added to inline
+					node.Values[pos] = node.Values[pos][:MaxInlineValues]
+					if err := idx.writeNode(pageNum, node); err != nil {
+						return nil, err
+					}
+					return nil, nil
 				} else {
 					// First time needing overflow for this key
 					overflowPageNum, err := idx.allocateOverflowPages(node.Values[pos], overflowStart)
@@ -1849,22 +1834,23 @@ func (idx *BTreeIndex) insertIntoNode(pageNum uint32, key interface{}, recordID 
 		// Insert the key and value at the found position
 		node.Keys = append(node.Keys, nil) // Make room
 		node.Values = append(node.Values, nil)
+		if len(node.OverflowPages) < int(node.KeyCount) {
+			grown := make([]uint32, node.KeyCount)
+			copy(grown, node.OverflowPages)
+			node.OverflowPages = grown
+		}
+		node.OverflowPages = append(node.OverflowPages, 0)
 
 		// Shift elements to make room for the new key
 		for i := int(node.KeyCount); i > pos; i-- {
 			node.Keys[i] = node.Keys[i-1]
 			node.Values[i] = node.Values[i-1]
+			node.OverflowPages[i] = node.OverflowPages[i-1]
 		}
 
 		// Insert the new key and value
 		node.Keys[pos] = key
 		node.Values[pos] = []uint32{recordID}
-		// Ensure OverflowPages slice is large enough
-		if len(node.OverflowPages) <= pos {
-			newOverflow := make([]uint32, pos+1)
-			copy(newOverflow, node.OverflowPages)
-			node.OverflowPages = newOverflow
-		}
 		node.OverflowPages[pos] = 0 // No overflow for new key
 		node.KeyCount++
 
