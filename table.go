@@ -458,7 +458,7 @@ func (t *Table[T]) Count() int {
 // CreateIndex creates an index on a field
 func (t *Table[T]) CreateIndex(fieldName string) error {
 	if t.indexManager == nil {
-		t.indexManager = NewIndexManager(t.db, t.layout)
+		t.indexManager = NewIndexManager(t.db, t.layout, t.name)
 	}
 	return t.indexManager.CreateIndex(fieldName)
 }

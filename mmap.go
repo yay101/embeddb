@@ -11,6 +11,26 @@ import (
 func (db *Database[T]) ReloadMMap() error {
 	db.mlock.Lock()
 	defer db.mlock.Unlock()
+	return db.reloadMMapLocked()
+}
+
+func (db *Database[T]) reloadMMapLocked() error {
+	// Check if we need to reload (either not loaded or file has grown)
+	shouldReload := db.mfile == nil
+
+	// Get current file size
+	fileInfo, err := db.file.Stat()
+	if err == nil && fileInfo.Size() > 0 {
+		// If mfile exists, check if file has grown beyond current mmap
+		if db.mfile != nil && int64(db.mfile.Len()) < fileInfo.Size() {
+			shouldReload = true
+		}
+	}
+
+	if !shouldReload {
+		return nil
+	}
+
 	if db.mfile != nil {
 		db.mfile.Close()
 	}
@@ -22,11 +42,40 @@ func (db *Database[T]) ReloadMMap() error {
 	return nil
 }
 
-func (db *Database[T]) ScanNext(o uint32) (id uint32, buf *bytes.Buffer, active bool, err error) {
-	// If the memory-mapped file is not open, attempt to reload it.
+// EnsureMmapSize ensures the memory-mapped file is large enough for the current file size
+func (db *Database[T]) EnsureMmapSize() error {
+	db.mlock.Lock()
+	defer db.mlock.Unlock()
+	return db.ensureMmapSizeLocked()
+}
+
+// ensureMmapSizeLocked is the internal version that assumes the write lock is already held
+func (db *Database[T]) ensureMmapSizeLocked() error {
 	if db.mfile == nil {
-		db.ReloadMMap()
+		return db.reloadMMapLocked()
 	}
+
+	// Check if file has grown
+	fileInfo, err := db.file.Stat()
+	if err != nil {
+		return err
+	}
+
+	if int64(db.mfile.Len()) < fileInfo.Size() {
+		return db.reloadMMapLocked()
+	}
+
+	return nil
+}
+
+func (db *Database[T]) ScanNext(o uint32) (id uint32, buf *bytes.Buffer, active bool, err error) {
+	// Ensure mmap is sized correctly before scanning
+	db.mlock.Lock()
+	if err := db.ensureMmapSizeLocked(); err != nil {
+		db.mlock.Unlock()
+		return 0, nil, false, err
+	}
+	db.mlock.Unlock()
 
 	// Acquire a read lock on the mmap file to ensure data consistency during read operations.
 	db.mlock.RLock()

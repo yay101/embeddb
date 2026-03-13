@@ -409,8 +409,8 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 		lastVacuumTime:    time.Now(),
 	}
 
-	// Create the index manager
-	db.indexManager = NewIndexManager(db, layout)
+	// Create the index manager (empty tableName for database-level)
+	db.indexManager = NewIndexManager(db, layout, "")
 
 	// Check if the file is new or existing
 	fileInfo, err := file.Stat()

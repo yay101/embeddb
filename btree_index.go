@@ -149,10 +149,15 @@ type pendingWrite struct {
 // NewBTreeIndex creates a new B-tree index for the specified field.
 //
 // Deprecated: internal use only. This function will be made private in a future release.
-func NewBTreeIndex(dbFileName, fieldName string, fieldOffset uintptr, fieldType reflect.Kind, isTimeField bool) (*BTreeIndex, error) {
+func NewBTreeIndex(dbFileName, tableName, fieldName string, fieldOffset uintptr, fieldType reflect.Kind, isTimeField bool) (*BTreeIndex, error) {
 	// Create the index file in the same directory as the database file
 	dbDir := filepath.Dir(dbFileName)
-	indexFileName := filepath.Join(dbDir, fmt.Sprintf("%s.%s.idx", filepath.Base(dbFileName), fieldName))
+	var indexFileName string
+	if tableName != "" {
+		indexFileName = filepath.Join(dbDir, fmt.Sprintf("%s.%s.%s.idx", filepath.Base(dbFileName), tableName, fieldName))
+	} else {
+		indexFileName = filepath.Join(dbDir, fmt.Sprintf("%s.%s.idx", filepath.Base(dbFileName), fieldName))
+	}
 
 	idx := &BTreeIndex{
 		fieldName:     fieldName,

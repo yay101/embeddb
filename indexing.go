@@ -26,6 +26,7 @@ type PagedResult[T any] struct {
 // Deprecated: internal use only. This type will be made private in a future release.
 type IndexManager[T any] struct {
 	db             *Database[T]           // Reference to the parent database
+	tableName      string                 // Table name for multi-table support
 	indexes        map[string]*BTreeIndex // Map of field name to index
 	layout         *StructLayout          // Struct layout for fast field access
 	lock           sync.RWMutex           // Lock for concurrent access
@@ -33,11 +34,13 @@ type IndexManager[T any] struct {
 }
 
 // NewIndexManager creates a new index manager for a database.
+// The tableName parameter is used for multi-table support to namespace index files.
 //
 // Deprecated: internal use only. This function will be made private in a future release.
-func NewIndexManager[T any](db *Database[T], layout *StructLayout) *IndexManager[T] {
+func NewIndexManager[T any](db *Database[T], layout *StructLayout, tableName string) *IndexManager[T] {
 	return &IndexManager[T]{
 		db:             db,
+		tableName:      tableName,
 		indexes:        make(map[string]*BTreeIndex),
 		layout:         layout,
 		pendingIndexes: make(map[string]struct{}),
@@ -76,7 +79,7 @@ func (im *IndexManager[T]) CreateIndex(fieldName string) error {
 	}
 
 	// Create the B-tree index
-	index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime)
+	index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime)
 	if err != nil {
 		return fmt.Errorf("failed to create index for field '%s': %w", fieldName, err)
 	}
@@ -716,18 +719,39 @@ func (im *IndexManager[T]) CheckIndexes() error {
 		return fmt.Errorf("failed to read directory: %w", err)
 	}
 
-	// Pattern for index files: <dbname>.<fieldname>.idx
-	prefix := dbBaseName + "."
 	suffix := ".idx"
 
+	// Determine prefixes to check
+	// New format: <dbname>.<tableName>.<fieldname>.idx (with table)
+	// Legacy format: <dbname>.<fieldname>.idx (without table - backwards compat)
+	var prefixes []string
+	if im.tableName != "" {
+		prefixes = []string{dbBaseName + "." + im.tableName + ".", dbBaseName + "."}
+	} else {
+		prefixes = []string{dbBaseName + "."}
+	}
+
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) || !strings.HasSuffix(entry.Name(), suffix) {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
 			continue
 		}
 
-		// Extract field name
-		fieldName := strings.TrimPrefix(entry.Name(), prefix)
-		fieldName = strings.TrimSuffix(fieldName, suffix)
+		var fieldName string
+		var prefixMatched bool
+
+		// Try each prefix
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(entry.Name(), prefix) {
+				fieldName = strings.TrimPrefix(entry.Name(), prefix)
+				fieldName = strings.TrimSuffix(fieldName, suffix)
+				prefixMatched = true
+				break
+			}
+		}
+
+		if !prefixMatched {
+			continue
+		}
 
 		// Check if we already have this index
 		if _, exists := im.indexes[fieldName]; exists {
@@ -756,7 +780,7 @@ func (im *IndexManager[T]) CheckIndexes() error {
 		}
 
 		// Try to load the index
-		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime)
+		index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime)
 		if err != nil {
 			// If we fail to load, mark it for rebuild
 			im.pendingIndexes[fieldName] = struct{}{}
@@ -817,7 +841,7 @@ func (im *IndexManager[T]) ExtractIndexesFromDatabase() error {
 		}
 
 		// Try to load the extracted index
-		index, err := NewBTreeIndex(im.db.file.Name(), fieldName, offset.Offset, indexFieldType, offset.IsTime)
+		index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, offset.Offset, indexFieldType, offset.IsTime)
 		if err != nil {
 			// If we fail to load, mark it for rebuild
 			im.pendingIndexes[fieldName] = struct{}{}

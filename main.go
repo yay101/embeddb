@@ -21,20 +21,21 @@ import (
 // Database is a generic type that represents a database for storing records of type T.
 // For multi-table support, use db.Table() to get typed table access.
 type Database[T any] struct {
-	header       DBHeader
-	lock         sync.RWMutex
-	writeLock    sync.Mutex // Serializes write operations
-	file         *os.File
-	mfile        *mmap.ReaderAt
-	mlock        sync.RWMutex
-	indexes      map[uint8]map[uint32]uint32 // tableID -> recordID -> file offset
-	layout       *StructLayout               // Struct layout information using unsafe
-	nextRecordID uint32
-	nlock        sync.Mutex
-	transaction  *Transaction     // Transaction manager for atomicity
-	indexManager *IndexManager[T] // Manager for field indexes
-	tableCatalog *TableCatalog    // Table catalog for multi-table support
-	defaultTable string           // Default table name for single-table mode
+	header             DBHeader
+	lock               sync.RWMutex
+	writeLock          sync.Mutex // Serializes write operations
+	file               *os.File
+	mfile              *mmap.ReaderAt
+	mlock              sync.RWMutex
+	indexes            map[uint8]map[uint32]uint32 // tableID -> recordID -> file offset
+	layout             *StructLayout               // Struct layout information using unsafe
+	nextRecordID       uint32
+	nlock              sync.Mutex
+	transaction        *Transaction       // Transaction manager for atomicity
+	indexManager       *IndexManager[T]   // Manager for field indexes
+	tableCatalog       *TableCatalog      // Table catalog for multi-table support
+	defaultTable       string             // Default table name for single-table mode
+	tableIndexManagers []*IndexManager[T] // Track table index managers for cleanup
 
 	autoVacuumEnabled       bool
 	changesSinceVacuum      uint64
@@ -103,7 +104,15 @@ func (db *Database[T]) Table(name ...string) (*Table[T], error) {
 	}
 
 	tableID := db.tableCatalog.AddTable(tableName, layout.Hash)
-	indexManager := NewIndexManager(db, layout)
+	indexManager := NewIndexManager(db, layout, tableName)
+
+	// Check for existing indexes on disk and load them
+	if err := indexManager.CheckIndexes(); err != nil {
+		fmt.Printf("Warning: failed to check indexes for table '%s': %v\n", tableName, err)
+	}
+
+	// Track the table's index manager for cleanup when database closes
+	db.tableIndexManagers = append(db.tableIndexManagers, indexManager)
 
 	return &Table[T]{
 		db:           db,
@@ -220,9 +229,11 @@ func (db *Database[T]) maybeAutoVacuum() error {
 }
 
 // CreateIndex creates an index for the specified field
+// Note: When used on Database directly (not via Table), tableName is empty
+// so indexes are stored without table prefix for backward compatibility
 func (db *Database[T]) CreateIndex(fieldName string) error {
 	if db.indexManager == nil {
-		db.indexManager = NewIndexManager(db, db.layout)
+		db.indexManager = NewIndexManager(db, db.layout, "")
 	}
 	return db.indexManager.CreateIndex(fieldName)
 }
@@ -242,9 +253,16 @@ func (db *Database[T]) Close() error {
 		return fmt.Errorf("failed to sync before close: %w", err)
 	}
 
-	// Close indexes
+	// Close database-level indexes
 	if db.indexManager != nil {
 		if err := db.indexManager.Close(); err != nil {
+			return err
+		}
+	}
+
+	// Close all table-level index managers
+	for _, im := range db.tableIndexManagers {
+		if err := im.Close(); err != nil {
 			return err
 		}
 	}

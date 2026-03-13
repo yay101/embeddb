@@ -179,13 +179,12 @@ func (db *Database[T]) readRecordBytes(offset uint32) ([]byte, error) {
 
 // readRecordBytesAt reads the raw bytes of a record at the given offset with optional tableID
 func (db *Database[T]) readRecordBytesAt(offset uint32, expectedTableID uint8) ([]byte, error) {
-	// Check if mmap needs to be loaded before acquiring read lock
-	// (ReloadMMap acquires write lock, so we can't call it while holding read lock)
-	if db.mfile == nil {
-		if err := db.ReloadMMap(); err != nil {
-			return nil, err
-		}
+	db.mlock.Lock()
+	if err := db.ensureMmapSizeLocked(); err != nil {
+		db.mlock.Unlock()
+		return nil, err
 	}
+	db.mlock.Unlock()
 
 	db.mlock.RLock()
 	defer db.mlock.RUnlock()
