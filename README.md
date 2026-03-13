@@ -465,7 +465,7 @@ The database uses memory-mapped I/O, so most of the "Sys" memory is just the map
 | Schema migrations | Just change your struct |
 | Multiple tables | Multiple table handles |
 | ACID transactions | Atomic single-record ops |
-| 2MB+ binary | Single .go file |
+| 2MB+ binary | Pure Go module |
 
 ## When to use EmbedDB
 
