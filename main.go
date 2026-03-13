@@ -24,6 +24,8 @@ type Database[T any] struct {
 	header             DBHeader
 	lock               sync.RWMutex
 	writeLock          *sync.Mutex // Serializes writes per database file
+	fileKey            string
+	sharedState        *sharedFileState
 	file               *os.File
 	mfile              *mmap.ReaderAt
 	mlock              sync.RWMutex
@@ -102,8 +104,10 @@ func (db *Database[T]) Table(name ...string) (*Table[T], error) {
 	db.writeLock.Lock()
 	defer db.writeLock.Unlock()
 
-	if err := db.syncStateFromDiskForWrite(); err != nil {
-		return nil, fmt.Errorf("failed to sync database state for table access: %w", err)
+	if db.needsCrossHandleSync() {
+		if err := db.syncStateFromDiskForWrite(); err != nil {
+			return nil, fmt.Errorf("failed to sync database state for table access: %w", err)
+		}
 	}
 
 	if db.tableCatalog == nil {
@@ -264,6 +268,8 @@ func (db *Database[T]) DropIndex(fieldName string) error {
 
 // Close closes the database and any open indexes
 func (db *Database[T]) Close() error {
+	defer db.unregisterHandle()
+
 	// Persist the index and header before closing
 	if err := db.Sync(); err != nil {
 		return fmt.Errorf("failed to sync before close: %w", err)

@@ -1,17 +1,56 @@
 package embeddb
 
-import "sync"
+import (
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+)
 
-var sharedWriteLocks sync.Map // map[string]*sync.Mutex
+type sharedFileState struct {
+	writeLock sync.Mutex
+	refCount  int32
+}
 
-func getSharedWriteLock(path string) *sync.Mutex {
-	if lock, ok := sharedWriteLocks.Load(path); ok {
-		return lock.(*sync.Mutex)
+var sharedFileStates sync.Map // map[string]*sharedFileState
+
+func normalizeFileKey(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(abs)
+}
+
+func getSharedFileState(path string) *sharedFileState {
+	if state, ok := sharedFileStates.Load(path); ok {
+		return state.(*sharedFileState)
 	}
 
-	newLock := &sync.Mutex{}
-	actual, _ := sharedWriteLocks.LoadOrStore(path, newLock)
-	return actual.(*sync.Mutex)
+	newState := &sharedFileState{}
+	actual, _ := sharedFileStates.LoadOrStore(path, newState)
+	return actual.(*sharedFileState)
+}
+
+func (db *Database[T]) registerHandle(path string) {
+	key := normalizeFileKey(path)
+	db.fileKey = key
+	db.sharedState = getSharedFileState(key)
+	atomic.AddInt32(&db.sharedState.refCount, 1)
+	db.writeLock = &db.sharedState.writeLock
+}
+
+func (db *Database[T]) unregisterHandle() {
+	if db.sharedState == nil {
+		return
+	}
+	atomic.AddInt32(&db.sharedState.refCount, -1)
+}
+
+func (db *Database[T]) needsCrossHandleSync() bool {
+	if db.sharedState == nil {
+		return false
+	}
+	return atomic.LoadInt32(&db.sharedState.refCount) > 1
 }
 
 func (db *Database[T]) syncStateFromDiskForWrite() error {
