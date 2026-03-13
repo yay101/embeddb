@@ -546,17 +546,6 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 // Close function is now defined in main.go
 
-// Open opens an existing database file and returns a non-generic DB handle.
-// This is useful when you want to work with multiple tables of different types.
-// Use Table[T](db) or Table[T](db, "name") to get typed table access.
-func Open(filename string) (*DB, error) {
-	db, err := New[any](filename, false, false)
-	if err != nil {
-		return nil, err
-	}
-	return &DB{Database: db}, nil
-}
-
 // Schema initialization is now handled via the StructLayout using unsafe
 
 // autoIndexFields creates indexes for fields with the db:index or db:unique tag

@@ -33,10 +33,15 @@ func main() {
 	os.Remove("people.db.Email.idx")
 	os.Remove("people.db.Address.City.idx")
 
-	// Create a new database with migration enabled (true) and auto-indexing enabled (true)
-	db, err := embeddb.New[Person]("people.db", true, true)
+	// Open database, then attach a typed table handle
+	db, err := embeddb.Open("people.db", embeddb.OpenOptions{Migrate: true, AutoIndex: true})
 	if err != nil {
-		log.Fatalf("Failed to create database: %v", err)
+		log.Fatalf("Failed to open database: %v", err)
+	}
+
+	peopleTable, err := embeddb.Use[Person](db, "people")
+	if err != nil {
+		log.Fatalf("Failed to open people table: %v", err)
 	}
 
 	// Remember to close the database when done
@@ -49,7 +54,7 @@ func main() {
 	}()
 
 	// Manually create an index for the Age field
-	if err := db.CreateIndex("Age"); err != nil {
+	if err := peopleTable.CreateIndex("Age"); err != nil {
 		log.Fatalf("Failed to create index on Age: %v", err)
 	}
 	log.Println("Created index on Age field")
@@ -120,7 +125,7 @@ func main() {
 
 	// Insert the records
 	for _, person := range people {
-		id, err := db.Insert(&person)
+		id, err := peopleTable.Insert(&person)
 		if err != nil {
 			log.Printf("Failed to insert %s: %v", person.Name, err)
 		} else {
@@ -129,7 +134,7 @@ func main() {
 	}
 
 	// Basic retrieval by ID
-	firstPerson, err := db.Get(1)
+	firstPerson, err := peopleTable.Get(1)
 	if err != nil {
 		log.Printf("Failed to retrieve person with ID 1: %v", err)
 	} else {
@@ -140,7 +145,7 @@ func main() {
 
 	// 1. Query by Name (string field)
 	fmt.Println("\n--- Querying by Name ---")
-	nameResults, err := db.Query("Name", "John Doe")
+	nameResults, err := peopleTable.Query("Name", "John Doe")
 	if err != nil {
 		log.Printf("Query by name failed: %v", err)
 	} else {
@@ -152,7 +157,7 @@ func main() {
 
 	// 2. Query by Age (int field)
 	fmt.Println("\n--- Querying by Age ---")
-	ageResults, err := db.Query("Age", 25)
+	ageResults, err := peopleTable.Query("Age", 25)
 	if err != nil {
 		log.Printf("Query by age failed: %v", err)
 	} else {
@@ -164,7 +169,7 @@ func main() {
 
 	// 3. Query by City (nested field)
 	fmt.Println("\n--- Querying by City (nested field) ---")
-	cityResults, err := db.Query("Address.City", "New York")
+	cityResults, err := peopleTable.Query("Address.City", "New York")
 	if err != nil {
 		log.Printf("Query by city failed: %v", err)
 	} else {
@@ -176,17 +181,17 @@ func main() {
 
 	// Update a record
 	fmt.Println("\n--- Updating a Record ---")
-	if personToUpdate, err := db.Get(1); err == nil {
+	if personToUpdate, err := peopleTable.Get(1); err == nil {
 		personToUpdate.Age = 31
 		personToUpdate.Address.ZipCode = "10002"
 
-		if err := db.Update(1, personToUpdate); err != nil {
+		if err := peopleTable.Update(1, personToUpdate); err != nil {
 			log.Printf("Failed to update person: %v", err)
 		} else {
 			log.Println("Updated person successfully")
 
 			// Verify the update
-			if updated, err := db.Get(1); err == nil {
+			if updated, err := peopleTable.Get(1); err == nil {
 				fmt.Printf("Updated person: %+v\n", updated)
 			}
 		}
@@ -194,13 +199,13 @@ func main() {
 
 	// Delete a record
 	fmt.Println("\n--- Deleting a Record ---")
-	if err := db.Delete(3); err != nil {
+	if err := peopleTable.Delete(3); err != nil {
 		log.Printf("Failed to delete person: %v", err)
 	} else {
 		log.Println("Deleted person with ID 3")
 
 		// Verify the delete
-		if deleted, err := db.Get(3); err != nil {
+		if deleted, err := peopleTable.Get(3); err != nil {
 			log.Println("Person was successfully deleted (not found)")
 		} else {
 			fmt.Printf("Warning: Person was not deleted: %+v\n", deleted)
@@ -218,7 +223,7 @@ func main() {
 	// Final database status
 	fmt.Println("\n--- All Records After Operations ---")
 	for i := uint32(1); i <= 5; i++ {
-		if person, err := db.Get(i); err == nil {
+		if person, err := peopleTable.Get(i); err == nil {
 			fmt.Printf("ID %d: %s (Age: %d, City: %s)\n",
 				i, person.Name, person.Age, person.Address.City)
 		} else {

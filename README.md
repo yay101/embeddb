@@ -44,14 +44,19 @@ type User struct {
 }
 
 func main() {
-    db, err := embeddb.New[User]("users.db", false, true)
+    db, err := embeddb.Open("users.db", embeddb.OpenOptions{AutoIndex: true})
     if err != nil {
         log.Fatal(err)
     }
     defer db.Close()
 
+    users, err := embeddb.Use[User](db, "users")
+    if err != nil {
+        log.Fatal(err)
+    }
+
     // Insert
-    id, _ := db.Insert(&User{
+    id, _ := users.Insert(&User{
         Name:      "Alice",
         Email:     "alice@example.com",
         Age:       30,
@@ -60,13 +65,15 @@ func main() {
     })
 
     // Get by ID
-    user, _ := db.Get(id)
+    user, _ := users.Get(id)
 
     // Query by exact match
-    results, _ := db.Query("Name", "Alice")
+    results, _ := users.Query("Name", "Alice")
 
     // Query by range
-    adults, _ := db.QueryRangeGreaterThan("Age", 18, true)
+    adults, _ := users.QueryRangeGreaterThan("Age", 18, true)
+
+    fmt.Println(user, len(results), len(adults))
 }
 ```
 
@@ -108,31 +115,45 @@ type Metadata struct {
 }
 ```
 
-## Database Options
+## Open Options
 
 ```go
-// New creates a database
-// Parameters: filename, migrate (auto-migrate on struct change), autoIndex (auto-create indexes)
+db, err := embeddb.Open("app.db")
 
+// Enable migration and/or auto-index for tables opened via Use[T]
+db, err := embeddb.Open("app.db", embeddb.OpenOptions{Migrate: true})
+db, err := embeddb.Open("app.db", embeddb.OpenOptions{AutoIndex: true})
+db, err := embeddb.Open("app.db", embeddb.OpenOptions{Migrate: true, AutoIndex: true})
+```
+
+## Tables
+
+EmbedDB supports multiple tables within a single database file. Each table can have its own schema.
+
+```go
+db, _ := embeddb.Open("app.db")
+defer db.Close()
+
+// Table name defaults to the type name
+users, _ := embeddb.Use[User](db) // table name is "User"
+
+// Or specify a custom table name
+customers, _ := embeddb.Use[User](db, "customers")
+
+_, _ = users, customers
+```
+
+## Legacy New[T] API (compatibility)
+
+`New[T]` remains available as a legacy API:
+
+```go
 db, err := embeddb.New[User]("app.db", false, false)  // No migration, no auto-index
 db, err := embeddb.New[User]("app.db", true, false)  // With migration
 db, err := embeddb.New[User]("app.db", false, true)  // Auto-index fields with db:"index"
 ```
 
-## Tables
-
-EmbedDB supports multiple tables within a single database file. Each table is typed and can have its own schema.
-
-```go
-// Get a typed table - table name is auto-derived from the type
-db, _ := embeddb.New[User]("app.db", false, false)
-users, _ := db.Table()  // table name is "User"
-
-// Or specify a custom table name
-users, _ := db.Table("customers")
-```
-
-### Table Operations
+## Table Operations
 
 ```go
 // Insert
@@ -195,7 +216,7 @@ This keeps routine writes fast while still compacting files periodically for lon
 
 ### Multiple Tables
 
-You can store multiple types in the same database file by opening the same file with the relevant type and table name:
+You can store multiple types in the same database file from one `Open` call:
 
 ```go
 type User struct {
@@ -208,35 +229,34 @@ type Order struct {
     Price   float64
 }
 
-// Same database file, user table
-userDB, _ := embeddb.New[User]("app.db", false, false)
-users, _ := userDB.Table("users")
-users.Insert(&User{Name: "Alice"})
-userDB.Close()
+db, _ := embeddb.Open("app.db")
+defer db.Close()
 
-// Same database file, order table
-orderDB, _ := embeddb.New[Order]("app.db", false, false)
-orders, _ := orderDB.Table("orders")
+users, _ := embeddb.Use[User](db, "users")
+orders, _ := embeddb.Use[Order](db, "orders")
+
+users.Insert(&User{Name: "Alice"})
 orders.Insert(&Order{Product: "Widget", Price: 9.99})
-orderDB.Close()
 ```
 
 Each table keeps its own index block and record offsets inside the same `.db` file.
 
 ## CRUD Operations
 
+The examples below assume `users, _ := embeddb.Use[User](db, "users")`.
+
 ```go
 // Insert - returns new ID
-id, err := db.Insert(&user)
+id, err := users.Insert(&user)
 
 // Get by ID
-user, err := db.Get(id)
+user, err := users.Get(id)
 
 // Update
-err := db.Update(id, &user)
+err := users.Update(id, &user)
 
 // Delete (soft delete)
-err := db.Delete(id)
+err := users.Delete(id)
 
 // Close - flushes all data to disk
 err := db.Close()
@@ -250,36 +270,37 @@ EmbedDB supports two types of queries:
 2. **Unindexed queries** - Full table scans using Filter/Scan
 
 Use indexed queries when possible for best performance.
+All examples below use a table handle, for example `users := embeddb.Use[User](db, "users")`.
 
 ### Exact Match (Indexed)
 
 ```go
 // Find all users named "Alice"
-results, err := db.Query("Name", "Alice")
+results, err := users.Query("Name", "Alice")
 
 // Find all active users
-results, err := db.Query("IsActive", true)
+results, err := users.Query("IsActive", true)
 
 // Find user created at specific time
-results, err := db.Query("CreatedAt", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
+results, err := users.Query("CreatedAt", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
 ```
 
 ### Range Queries
 
 ```go
 // Age >= 18 (inclusive)
-adults, err := db.QueryRangeGreaterThan("Age", 18, true)
+adults, err := users.QueryRangeGreaterThan("Age", 18, true)
 
 // Age < 65 (exclusive)
-seniors, err := db.QueryRangeLessThan("Age", 65, false)
+seniors, err := users.QueryRangeLessThan("Age", 65, false)
 
 // Balance between 100 and 500 (inclusive)
-rangeResults, err := db.QueryRangeBetween("Balance", 100.0, 500.0, true, true)
+rangeResults, err := users.QueryRangeBetween("Balance", 100.0, 500.0, true, true)
 
 // Created in year 2024
 startOfYear := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 endOfYear := time.Date(2024, 12, 31, 23, 59, 59, 0, time.UTC)
-thisYear, err := db.QueryRangeBetween("CreatedAt", startOfYear, endOfYear, true, true)
+thisYear, err := users.QueryRangeBetween("CreatedAt", startOfYear, endOfYear, true, true)
 ```
 
 ### Pagination
@@ -288,24 +309,24 @@ All query methods have Paged variants that return paginated results with metadat
 
 ```go
 // QueryPaged - exact match with pagination
-result, err := db.QueryPaged("Age", 30, 0, 10) // offset=0, limit=10
+result, err := users.QueryPaged("Age", 30, 0, 10) // offset=0, limit=10
 fmt.Printf("Page 1: %d of %d total\n", len(result.Records), result.TotalCount)
 if result.HasMore {
     // Fetch next page
-    result, _ = db.QueryPaged("Age", 30, 10, 10) // offset=10
+    result, _ = users.QueryPaged("Age", 30, 10, 10) // offset=10
 }
 
 // QueryRangeGreaterThanPaged - range query with pagination
-result, err := db.QueryRangeGreaterThanPaged("Age", 18, true, 0, 10)
+result, err := users.QueryRangeGreaterThanPaged("Age", 18, true, 0, 10)
 
 // QueryRangeLessThanPaged - less than with pagination
-result, err := db.QueryRangeLessThanPaged("Age", 65, false, 0, 10)
+result, err := users.QueryRangeLessThanPaged("Age", 65, false, 0, 10)
 
 // QueryRangeBetweenPaged - between range with pagination
-result, err := db.QueryRangeBetweenPaged("Balance", 100.0, 500.0, true, true, 0, 10)
+result, err := users.QueryRangeBetweenPaged("Balance", 100.0, 500.0, true, true, 0, 10)
 
 // FilterPaged - full table scan with pagination
-result, err := db.FilterPaged(func(u User) bool {
+result, err := users.FilterPaged(func(u User) bool {
     return u.Age > 18
 }, 0, 10) // Skip first 0, return max 10
 ```
@@ -320,13 +341,13 @@ The `PagedResult[T]` type provides:
 
 ```go
 // Query nested struct fields using dot notation
-results, err := db.Query("Address.City", "New York")
+results, err := users.Query("Address.City", "New York")
 
 // Range query on nested field
-results, err := db.QueryRangeBetween("Address.ZipCode", 10000, 99999, true, true)
+results, err := users.QueryRangeBetween("Address.ZipCode", 10000, 99999, true, true)
 
 // Query embedded time in nested struct
-results, err := db.Query("Metadata.DeletedAt", time.Time{})
+results, err := users.Query("Metadata.DeletedAt", time.Time{})
 ```
 
 ### Unindexed Queries (Full Table Scan)
@@ -335,28 +356,28 @@ For fields without indexes, use `Filter` or `Scan` to perform full table scans:
 
 ```go
 // Filter - returns all matching records
-results, err := db.Filter(func(u User) bool {
+results, err := users.Filter(func(u User) bool {
     return u.Age > 18 && u.IsActive
 })
 
 // Filter with nested struct access
-results, err := db.Filter(func(u User) bool {
+results, err := users.Filter(func(u User) bool {
     return u.Address.City == "New York"
 })
 
 // Filter with time
-results, err := db.Filter(func(u User) bool {
+results, err := users.Filter(func(u User) bool {
     return u.CreatedAt.After(time.Now().AddDate(-1, 0, 0)) // Created in last year
 })
 
 // Scan - iterate over all records, stop early if needed
-err := db.Scan(func(u User) bool {
+err := users.Scan(func(u User) bool {
     fmt.Println(u.Name)
     return true // return false to stop iteration
 })
 
 // Count - total records in database (including soft-deleted)
-total := db.Count()
+total := users.Count()
 ```
 
 **Note:** Filter and Scan skip soft-deleted records automatically.
@@ -368,7 +389,7 @@ Use Go's built-in `sort` package - no need for database-level sorting:
 ```go
 import "sort"
 
-results, _ := db.Filter(func(u User) bool { return u.Age > 18 })
+results, _ := users.Filter(func(u User) bool { return u.Age > 18 })
 
 // Sort by age ascending
 sort.Slice(results, func(i, j int) bool {
@@ -388,11 +409,11 @@ sort.Slice(results, func(i, j int) bool {
 
 ```go
 // Create index on any field (even after database creation)
-err := db.CreateIndex("Age")
-err := db.CreateIndex("Address.City")
+err := users.CreateIndex("Age")
+err := users.CreateIndex("Address.City")
 
 // Drop index
-err := db.DropIndex("Age")
+err := users.DropIndex("Age")
 
 // Indexes persist with the database file
 // They load automatically when you reopen the database
@@ -404,7 +425,13 @@ If you change your struct and already have data, enable migration:
 
 ```go
 // migrate=true will automatically migrate your data to the new schema
-db, err := embeddb.New[MyStruct]("data.db", true, false)
+db, err := embeddb.Open("data.db", embeddb.OpenOptions{Migrate: true})
+records, err := embeddb.Use[MyStruct](db, "MyStruct")
+_ = records
+
+// Legacy New[T] equivalent
+db2, err := embeddb.New[MyStruct]("data.db", true, false)
+_ = db2
 ```
 
 ## Performance
@@ -436,7 +463,7 @@ The database uses memory-mapped I/O, so most of the "Sys" memory is just the map
 | Cgo required | Pure Go |
 | SQL queries | Go structs |
 | Schema migrations | Just change your struct |
-| Multiple tables | Multiple typed tables |
+| Multiple tables | Multiple table handles |
 | ACID transactions | Atomic single-record ops |
 | 2MB+ binary | Single .go file |
 

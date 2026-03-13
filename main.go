@@ -79,13 +79,6 @@ const (
 	autoVacuumMinChanges      uint64       = 50000
 )
 
-// DB is a non-generic database that can store multiple table types.
-// Note: For typed table access, use the generic Database[T] with db.Table() method.
-// Example: db, _ := embeddb.New[User]("file.db", false, false); users, _ := db.Table()
-type DB struct {
-	*Database[any]
-}
-
 // Table returns a typed Table[T] for accessing records.
 // If name is not provided or empty, the table name is auto-derived from the type name.
 // Example: db.Table() or db.Table("users")
