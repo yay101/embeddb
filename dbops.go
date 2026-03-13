@@ -401,6 +401,7 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 	db := &Database[T]{
 		file:              file,
+		writeLock:         getSharedWriteLock(filename),
 		indexes:           make(map[uint8]map[uint32]uint32),
 		nextRecordID:      1, // Start with ID 1
 		layout:            layout,
@@ -613,6 +614,10 @@ func (db *Database[T]) InsertToTable(record *T, tableName string) (uint32, error
 	db.writeLock.Lock()
 	defer db.writeLock.Unlock()
 
+	if err := db.syncStateFromDiskForWrite(); err != nil {
+		return 0, fmt.Errorf("failed to sync database state before insert: %w", err)
+	}
+
 	// Get table ID and next record ID
 	tableID := uint8(0)
 	var newRecordId uint32
@@ -684,6 +689,11 @@ func (db *Database[T]) InsertToTable(record *T, tableName string) (uint32, error
 			db.lock.Unlock()
 			return 0, fmt.Errorf("failed to update indexes: %w", err)
 		}
+	}
+
+	if err := db.writeIndexLocked(); err != nil {
+		db.lock.Unlock()
+		return 0, fmt.Errorf("failed to persist index after insert: %w", err)
 	}
 
 	// Release lock
@@ -777,6 +787,10 @@ func (db *Database[T]) DeleteFromTable(id uint32, tableID uint8) error {
 	db.writeLock.Lock()
 	defer db.writeLock.Unlock()
 
+	if err := db.syncStateFromDiskForWrite(); err != nil {
+		return fmt.Errorf("failed to sync database state before delete: %w", err)
+	}
+
 	db.lock.Lock()
 
 	// Check if the record exists
@@ -868,6 +882,10 @@ func (db *Database[T]) UpdateInTable(id uint32, record *T, tableID uint8) error 
 	db.writeLock.Lock()
 	defer db.writeLock.Unlock()
 
+	if err := db.syncStateFromDiskForWrite(); err != nil {
+		return fmt.Errorf("failed to sync database state before update: %w", err)
+	}
+
 	db.lock.Lock()
 
 	// Check if the record exists
@@ -954,6 +972,11 @@ func (db *Database[T]) UpdateInTable(id uint32, record *T, tableID uint8) error 
 			db.lock.Unlock()
 			return fmt.Errorf("failed to update indexes: %w", err)
 		}
+	}
+
+	if err := db.writeIndexLocked(); err != nil {
+		db.lock.Unlock()
+		return fmt.Errorf("failed to persist index after update: %w", err)
 	}
 
 	// Release lock

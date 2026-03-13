@@ -26,6 +26,10 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	t.db.writeLock.Lock()
 	defer t.db.writeLock.Unlock()
 
+	if err := t.db.syncStateFromDiskForWrite(); err != nil {
+		return 0, fmt.Errorf("failed to sync database state before insert: %w", err)
+	}
+
 	// Get next record ID from catalog (now inside write lock)
 	recordID := t.db.tableCatalog.IncrementNextRecordID(t.name)
 
@@ -77,6 +81,11 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		}
 	}
 
+	if err := t.db.writeIndexLocked(); err != nil {
+		t.db.lock.Unlock()
+		return 0, fmt.Errorf("failed to persist index after insert: %w", err)
+	}
+
 	t.db.lock.Unlock()
 	t.db.markMutation()
 
@@ -119,6 +128,10 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 	// Serialize write operations
 	t.db.writeLock.Lock()
 	defer t.db.writeLock.Unlock()
+
+	if err := t.db.syncStateFromDiskForWrite(); err != nil {
+		return fmt.Errorf("failed to sync database state before update: %w", err)
+	}
 
 	t.db.lock.Lock()
 
@@ -201,6 +214,11 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 		}
 	}
 
+	if err := t.db.writeIndexLocked(); err != nil {
+		t.db.lock.Unlock()
+		return fmt.Errorf("failed to persist index after update: %w", err)
+	}
+
 	t.db.lock.Unlock()
 
 	return nil
@@ -211,6 +229,10 @@ func (t *Table[T]) Delete(id uint32) error {
 	// Serialize write operations
 	t.db.writeLock.Lock()
 	defer t.db.writeLock.Unlock()
+
+	if err := t.db.syncStateFromDiskForWrite(); err != nil {
+		return fmt.Errorf("failed to sync database state before delete: %w", err)
+	}
 
 	t.db.lock.Lock()
 

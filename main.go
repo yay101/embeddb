@@ -23,7 +23,7 @@ import (
 type Database[T any] struct {
 	header             DBHeader
 	lock               sync.RWMutex
-	writeLock          sync.Mutex // Serializes write operations
+	writeLock          *sync.Mutex // Serializes writes per database file
 	file               *os.File
 	mfile              *mmap.ReaderAt
 	mlock              sync.RWMutex
@@ -99,11 +99,27 @@ func (db *Database[T]) Table(name ...string) (*Table[T], error) {
 		tableName = name[0]
 	}
 
+	db.writeLock.Lock()
+	defer db.writeLock.Unlock()
+
+	if err := db.syncStateFromDiskForWrite(); err != nil {
+		return nil, fmt.Errorf("failed to sync database state for table access: %w", err)
+	}
+
 	if db.tableCatalog == nil {
 		db.tableCatalog = NewTableCatalog()
 	}
 
-	tableID := db.tableCatalog.AddTable(tableName, layout.Hash)
+	tableID, exists := db.tableCatalog.GetTableID(tableName)
+	if !exists {
+		tableID = db.tableCatalog.AddTable(tableName, layout.Hash)
+		db.lock.Lock()
+		if err := db.writeTableCatalogLocked(); err != nil {
+			db.lock.Unlock()
+			return nil, fmt.Errorf("failed to persist table catalog: %w", err)
+		}
+		db.lock.Unlock()
+	}
 	indexManager := NewIndexManager(db, layout, tableName)
 
 	// Check for existing indexes on disk and load them

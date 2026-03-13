@@ -96,8 +96,15 @@ func (db *Database[T]) writeIndexLocked() (err error) {
 func (db *Database[T]) ReadIndex() (err error) {
 	// If no index has been written yet
 	if db.header.indexStart == 0 {
+		db.lock.Lock()
+		db.indexes = make(map[uint8]map[uint32]uint32)
+		db.lock.Unlock()
 		return nil
 	}
+
+	db.lock.Lock()
+	db.indexes = make(map[uint8]map[uint32]uint32)
+	db.lock.Unlock()
 
 	// Ensure we have a memory-mapped file (ReloadMMap acquires its own lock)
 	db.mlock.RLock()
