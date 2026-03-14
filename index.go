@@ -120,6 +120,15 @@ func (db *Database[T]) ReadIndex() (err error) {
 	db.mlock.Lock()
 	defer db.mlock.Unlock()
 
+	// Validate index offsets against file size
+	fileLen := db.mfile.Len()
+	if int(db.header.indexStart) >= fileLen {
+		return fmt.Errorf("indexStart %d out of bounds (file length %d)", db.header.indexStart, fileLen)
+	}
+	if int(db.header.indexEnd) > fileLen {
+		return fmt.Errorf("indexEnd %d out of bounds (file length %d)", db.header.indexEnd, fileLen)
+	}
+
 	// Check for start marker at indexStart
 	if db.mfile.At(int(db.header.indexStart)) != startMarker {
 		// Try the last known good index location
@@ -180,6 +189,80 @@ func (db *Database[T]) ReadIndex() (err error) {
 	}
 
 	return nil
+}
+
+// RebuildPrimaryIndex scans the database file to rebuild the primary index mapping record IDs to offsets.
+// This is used for recovery when the persisted index is corrupt.
+func (db *Database[T]) RebuildPrimaryIndex() error {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Clear current index
+	db.indexes = make(map[uint8]map[uint32]uint32)
+
+	// Reload mmap to ensure we have the latest file content
+	if err := db.ReloadMMap(); err != nil {
+		return fmt.Errorf("failed to reload memory mapping: %w", err)
+	}
+
+	db.mlock.RLock()
+	defer db.mlock.RUnlock()
+
+	dataLen := db.mfile.Len()
+	if dataLen <= headerSize {
+		// New or empty file, no records to index
+		db.header.nextOffset = uint32(headerSize)
+		return db.writeIndexLocked()
+	}
+
+	// Read everything into a buffer for fast scanning
+	data := make([]byte, dataLen)
+	_, err := db.mfile.ReadAt(data, 0)
+	if err != nil {
+		return fmt.Errorf("failed to read file data for index rebuild: %w", err)
+	}
+
+	maxID := uint32(0)
+	lastOffset := uint32(headerSize)
+
+	// Scan through the file starting after the header
+	// Record format: [escCode,startMarker,tableID][id:4][length:4][active:1]...[escCode,endMarker]
+	for i := headerSize; i < dataLen-13; {
+		// Minimum record size is 14 bytes: 3(start) + 4(id) + 4(len) + 1(active) + 2(end)
+		if data[i] == escCode && data[i+1] == startMarker {
+			tableID := data[i+2]
+			recordID := binary.BigEndian.Uint32(data[i+3 : i+7])
+			recordDataLen := binary.BigEndian.Uint32(data[i+7 : i+11])
+			active := data[i+11] == 1
+
+			// Expected end marker position
+			endPos := i + 12 + int(recordDataLen)
+			if endPos+1 < dataLen && data[endPos] == escCode && data[endPos+1] == endMarker {
+				if active {
+					db.getTableIndex(tableID)[recordID] = uint32(i)
+					if recordID > maxID {
+						maxID = recordID
+					}
+				}
+				// Record is valid, skip to the end of it
+				i = endPos + 2
+				lastOffset = uint32(i)
+				continue
+			}
+		}
+		i++
+	}
+
+	// Update header fields based on recovered state
+	if maxID >= db.nextRecordID {
+		db.nextRecordID = maxID + 1
+	}
+	if lastOffset > db.header.nextOffset {
+		db.header.nextOffset = lastOffset
+	}
+
+	// Persist the recovered index
+	return db.writeIndexLocked()
 }
 
 func (db *Database[T]) Vacuum() error {

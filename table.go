@@ -548,6 +548,14 @@ func (t *Table[T]) Name() string {
 	return t.name
 }
 
+// GetIndexedFields returns a list of fields that have indexes
+func (t *Table[T]) GetIndexedFields() []string {
+	if t.indexManager == nil {
+		return nil
+	}
+	return t.indexManager.GetIndexedFields()
+}
+
 // QueryPaged finds records that match a field value with pagination
 func (t *Table[T]) QueryPaged(fieldName string, value interface{}, offset, limit int) (*PagedResult[T], error) {
 	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {

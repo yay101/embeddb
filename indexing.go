@@ -770,7 +770,6 @@ func (im *IndexManager[T]) CheckIndexes() error {
 		}
 
 		if !fieldFound {
-			// Field doesn't exist in current struct - skip or delete the index
 			continue
 		}
 
