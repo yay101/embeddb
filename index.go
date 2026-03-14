@@ -43,6 +43,10 @@ func (db *Database[T]) writeIndexLocked() (err error) {
 
 	if db.header.indexStart > 0 && db.header.indexCapacity >= uint32(totalIndexSize) {
 		writePosition = db.header.indexStart
+		// Ensure nextOffset is beyond the current index capacity
+		if db.header.nextOffset < writePosition+db.header.indexCapacity {
+			atomic.StoreUint32(&db.header.nextOffset, writePosition+db.header.indexCapacity)
+		}
 	} else {
 		writePosition = db.header.nextOffset
 		newCapacity := uint32(totalIndexSize) * 2
@@ -224,6 +228,7 @@ func (db *Database[T]) RebuildPrimaryIndex() error {
 
 	maxID := uint32(0)
 	lastOffset := uint32(headerSize)
+	recoveredCount := 0
 
 	// Scan through the file starting after the header
 	// Record format: [escCode,startMarker,tableID][id:4][length:4][active:1]...[escCode,endMarker]
@@ -243,6 +248,7 @@ func (db *Database[T]) RebuildPrimaryIndex() error {
 					if recordID > maxID {
 						maxID = recordID
 					}
+					recoveredCount++
 				}
 				// Record is valid, skip to the end of it
 				i = endPos + 2
@@ -262,6 +268,7 @@ func (db *Database[T]) RebuildPrimaryIndex() error {
 	}
 
 	// Persist the recovered index
+	fmt.Printf("Recovered %d records. Persisting index...\n", recoveredCount)
 	return db.writeIndexLocked()
 }
 

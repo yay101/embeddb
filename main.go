@@ -73,7 +73,7 @@ const (
 	valueEndMarker            byte         = 0x1F
 	embeddedStructType        reflect.Kind = reflect.Struct // Use reflect.Struct
 	defaultIndexPreallocation uint32       = 10240          // 10KB preallocated for index by default
-	Version                   string       = "0.3.1"
+	Version                   string       = "0.3.3"
 	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
 	autoVacuumInterval                     = 24 * time.Hour
 	autoVacuumMinChanges      uint64       = 50000
@@ -326,6 +326,32 @@ func (db *Database[T]) Sync() error {
 	db.lock.Unlock()
 
 	return db.maybeAutoVacuum()
+}
+
+// RebuildAllIndexes scans the database file to rebuild the primary index mapping
+// and all secondary field indexes.
+func (db *Database[T]) RebuildAllIndexes() error {
+	// 1. Rebuild primary index (record ID -> offset)
+	if err := db.RebuildPrimaryIndex(); err != nil {
+		return fmt.Errorf("failed to rebuild primary index: %w", err)
+	}
+
+	// 2. Rebuild database-level field indexes
+	if db.indexManager != nil {
+		if err := db.indexManager.RebuildAll(); err != nil {
+			return fmt.Errorf("failed to rebuild database field indexes: %w", err)
+		}
+	}
+
+	// 3. Rebuild table-level field indexes
+	// Note: We only rebuild already loaded index managers.
+	for _, im := range db.tableIndexManagers {
+		if err := im.RebuildAll(); err != nil {
+			return fmt.Errorf("failed to rebuild table field indexes: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // Query finds all records that match a field value using an index

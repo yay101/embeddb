@@ -470,12 +470,12 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 		// Read the existing index
 		if err := db.ReadIndex(); err != nil {
-			fmt.Printf("Warning: failed to read index: %v. Attempting to rebuild...\n", err)
-			if err := db.RebuildPrimaryIndex(); err != nil {
+			fmt.Printf("Warning: failed to read index: %v. Attempting to rebuild all indexes...\n", err)
+			if err := db.RebuildAllIndexes(); err != nil {
 				db.Close()
-				return nil, fmt.Errorf("failed to recover index: %w", err)
+				return nil, fmt.Errorf("failed to recover indexes: %w", err)
 			}
-			fmt.Printf("Successfully recovered index.\n")
+			fmt.Printf("Successfully recovered all indexes.\n")
 		}
 
 		// Read the existing table catalog

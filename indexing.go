@@ -704,6 +704,41 @@ func (im *IndexManager[T]) Close() error {
 	return nil
 }
 
+// RebuildAll rebuilds all indexes managed by this manager
+func (im *IndexManager[T]) RebuildAll() error {
+	im.lock.Lock()
+	fields := make([]string, 0, len(im.indexes))
+	for fieldName := range im.indexes {
+		fields = append(fields, fieldName)
+	}
+	im.lock.Unlock()
+
+	for _, fieldName := range fields {
+		im.lock.Lock()
+		index, exists := im.indexes[fieldName]
+		if exists {
+			// Re-initialize the index file to clear it
+			if err := index.initializeFile(); err != nil {
+				im.lock.Unlock()
+				return fmt.Errorf("failed to re-initialize index for field '%s': %w", fieldName, err)
+			}
+			// Update memory mapping
+			if err := index.remapFile(); err != nil {
+				im.lock.Unlock()
+				return fmt.Errorf("failed to remap index for field '%s': %w", fieldName, err)
+			}
+		}
+		im.lock.Unlock()
+
+		// Rebuild the index by scanning the database
+		if err := im.BuildIndex(fieldName); err != nil {
+			return fmt.Errorf("failed to rebuild index for field '%s': %w", fieldName, err)
+		}
+	}
+
+	return nil
+}
+
 // CheckIndexes checks if all indexes exist and creates any missing ones
 func (im *IndexManager[T]) CheckIndexes() error {
 	im.lock.Lock()
