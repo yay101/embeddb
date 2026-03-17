@@ -183,3 +183,123 @@ func TestRegionHeaderPointersGrowSafely(t *testing.T) {
 		t.Logf("capacity grew in place: start=%d cap %d->%d", start2, cap1, cap2)
 	}
 }
+
+func TestRegionCatalogRecoversFromCorruptFooter(t *testing.T) {
+	t.Setenv("EMBEDDB_EXPERIMENTAL_REGION_INDEX", "1")
+	t.Setenv("EMBEDDB_EXPERIMENTAL_REGION_INDEX_UNSAFE", "")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "region_corrupt_footer.db")
+
+	db, err := New[RegionRecord](path, false, true)
+	if err != nil {
+		t.Fatalf("new db: %v", err)
+	}
+
+	for i := 0; i < 800; i++ {
+		r := &RegionRecord{Name: fmt.Sprintf("user_%d", i), Age: 20 + (i % 30), Score: int64(i)}
+		if _, err := db.Insert(r); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	start, cap, _, _, _ := readRegionHeaderPointers(t, path)
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("open db file for corruption: %v", err)
+	}
+
+	footerOffset := int64(start) + int64(cap)
+	if _, err := f.WriteAt([]byte("BADFOOT!"), footerOffset); err != nil {
+		f.Close()
+		t.Fatalf("corrupt footer: %v", err)
+	}
+	f.Close()
+
+	db2, err := New[RegionRecord](path, false, true)
+	if err != nil {
+		t.Fatalf("reopen db with corrupt footer: %v", err)
+	}
+
+	res, err := db2.Query("Name", "user_42")
+	if err != nil {
+		t.Fatalf("query after corrupt footer reopen: %v", err)
+	}
+	if len(res) == 0 {
+		t.Fatalf("expected query results after corrupt footer recovery")
+	}
+
+	if err := db2.Close(); err != nil {
+		t.Fatalf("close recovered db: %v", err)
+	}
+}
+
+func TestRegionCatalogRebuildsHeaderPointersFromFooter(t *testing.T) {
+	t.Setenv("EMBEDDB_EXPERIMENTAL_REGION_INDEX", "1")
+	t.Setenv("EMBEDDB_EXPERIMENTAL_REGION_INDEX_UNSAFE", "")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "region_header_repair.db")
+
+	db, err := New[RegionRecord](path, false, true)
+	if err != nil {
+		t.Fatalf("new db: %v", err)
+	}
+
+	for i := 0; i < 1200; i++ {
+		r := &RegionRecord{Name: fmt.Sprintf("repair_%d", i), Age: 30 + (i % 20), Score: int64(i)}
+		if _, err := db.Insert(r); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("open db for header corruption: %v", err)
+	}
+
+	h := make([]byte, headerSize)
+	if _, err := f.ReadAt(h, 0); err != nil {
+		f.Close()
+		t.Fatalf("read header: %v", err)
+	}
+
+	for i := 43; i < 59; i++ {
+		h[i] = 0
+	}
+	if _, err := f.WriteAt(h, 0); err != nil {
+		f.Close()
+		t.Fatalf("write corrupt header: %v", err)
+	}
+	f.Close()
+
+	db2, err := New[RegionRecord](path, false, true)
+	if err != nil {
+		t.Fatalf("reopen db with zeroed pointers: %v", err)
+	}
+
+	res, err := db2.Query("Age", 35)
+	if err != nil {
+		t.Fatalf("query after header-pointer recovery: %v", err)
+	}
+	if len(res) == 0 {
+		t.Fatalf("expected results after header-pointer recovery")
+	}
+
+	if err := db2.Close(); err != nil {
+		t.Fatalf("close recovered db: %v", err)
+	}
+
+	start, cap, used, flags, _ := readRegionHeaderPointers(t, path)
+	if start == 0 || cap == 0 || used == 0 || flags == 0 {
+		t.Fatalf("expected repaired non-zero header pointers, got start=%d cap=%d used=%d flags=%d", start, cap, used, flags)
+	}
+}

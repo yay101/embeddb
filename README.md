@@ -14,6 +14,27 @@ A lightweight, embedded database for Go that gives you SQLite-like functionality
 - **Memory-efficient** - Memory-mapped I/O keeps heap usage minimal
 - **Scanner** - Low-lock-contention sequential access for large scans
 
+## Recent Releases
+
+### v0.4.0
+
+- Secondary indexes now use embedded region-backed storage in the main DB file by default.
+- Legacy secondary index file paths (`*.idx`) were removed from runtime behavior.
+- Existing query features are preserved, including nested struct indexing and range queries.
+
+### v0.3.4
+
+- Added switchable region-backed secondary index storage path.
+- Added region pointer/capacity metadata handling and growth safety checks.
+- Added regression coverage for reopen persistence and region growth behavior.
+
+## Migration Notes
+
+- Upgrading to `v0.4.0` removes runtime `.idx` files. Secondary indexes persist in the DB file.
+- `v0.4.0` expects region-backed secondary indexes to be enabled in normal operation.
+
+- If an old deployment still has stale `.idx` files from pre-`v0.4.0`, they can be safely deleted after successful reopen and query verification.
+
 ## Installation
 
 ```bash
