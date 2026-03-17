@@ -683,13 +683,6 @@ func (im *IndexManager[T]) Close() error {
 		}
 	}
 
-	// Then merge them with the database file
-	for fieldName, index := range im.indexes {
-		if err := index.mergeWithDatabase(); err != nil {
-			return fmt.Errorf("failed to merge index '%s' with database: %w", fieldName, err)
-		}
-	}
-
 	// Finally close all index files
 	for _, index := range im.indexes {
 		if err := index.Close(); err != nil {
@@ -743,6 +736,44 @@ func (im *IndexManager[T]) RebuildAll() error {
 func (im *IndexManager[T]) CheckIndexes() error {
 	im.lock.Lock()
 	defer im.lock.Unlock()
+
+	if useExperimentalRegionIndex() {
+		loadedFromRegion := false
+
+		for _, offset := range im.layout.FieldOffsets {
+			fieldName := offset.Name
+
+			if _, exists := im.indexes[fieldName]; exists {
+				continue
+			}
+
+			existsInRegion, err := regionCatalogEntryExists(im.db.file, im.tableName, fieldName)
+			if err != nil {
+				return fmt.Errorf("failed to inspect region catalog for field '%s': %w", fieldName, err)
+			}
+			if !existsInRegion {
+				continue
+			}
+
+			indexFieldType := offset.Type
+			if offset.IsSlice && offset.SliceElem != nil {
+				indexFieldType = offset.SliceElem.Kind()
+			}
+
+			index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, offset.Offset, indexFieldType, offset.IsTime)
+			if err != nil {
+				im.pendingIndexes[fieldName] = struct{}{}
+				continue
+			}
+
+			im.indexes[fieldName] = index
+			loadedFromRegion = true
+		}
+
+		if loadedFromRegion {
+			return nil
+		}
+	}
 
 	// Get the base name of the database file
 	dbBaseName := filepath.Base(im.db.file.Name())

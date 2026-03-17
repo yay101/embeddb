@@ -468,6 +468,12 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 			return nil, fmt.Errorf("failed to decode header: %w", err)
 		}
 
+		if !useExperimentalRegionIndex() {
+			if err := restoreSecondaryIndexesFromDB(filename); err != nil {
+				fmt.Printf("Warning: failed to restore secondary indexes from db file: %v\n", err)
+			}
+		}
+
 		// Read the existing index
 		if err := db.ReadIndex(); err != nil {
 			fmt.Printf("Warning: failed to read index: %v. Attempting to rebuild all indexes...\n", err)
@@ -490,12 +496,6 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 		if err := db.indexManager.CheckIndexes(); err != nil {
 			// Just log the error, don't fail
 			fmt.Printf("Warning: failed to check indexes: %v\n", err)
-		}
-
-		// Try to extract indexes from the database file
-		if err := db.indexManager.ExtractIndexesFromDatabase(); err != nil {
-			// Just log the error, don't fail
-			fmt.Printf("Warning: failed to extract indexes: %v\n", err)
 		}
 
 		// Check if we need to migrate the database

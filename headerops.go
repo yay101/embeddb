@@ -8,11 +8,13 @@ import (
 
 // Version constant is now defined in main.go
 
-// Header format (expanded to 52 bytes):
+// Header format (expanded to 64 bytes):
 // [Version (3 bytes)] [tocStart (4 bytes)] [indexStart (4 bytes)] [entryStart (4 bytes)]
 // [nextOffset (4 bytes)] [nextRecordID (4 bytes)] [indexCapacity (4 bytes)] [lgIndexStart (4 bytes)]
-// [indexEnd (4 bytes)] [tableCatalogOffset (4 bytes)] [tableCount (4 bytes)] [reserved (3 bytes)]
-// Total: 52 bytes
+// [indexEnd (4 bytes)] [tableCatalogOffset (4 bytes)] [tableCount (4 bytes)]
+// [secondaryIndexRegionStart (4 bytes)] [secondaryIndexRegionCapacity (4 bytes)]
+// [secondaryIndexRegionUsed (4 bytes)] [secondaryIndexRegionFlags (4 bytes)] [reserved (5 bytes)]
+// Total: 64 bytes
 
 // encodeHeader writes the header to the database file.
 // This is the public API that acquires locks.
@@ -95,13 +97,23 @@ func (db *Database[T]) encodeHeaderLocked() error {
 	// Append the encoded tableCount (4 bytes) to the header buffer.
 	hb = append(hb, ub...)
 
-	// Add reserved bytes for future expansion (7 bytes)
-	for i := 0; i < 7; i++ {
+	// Encode embedded secondary index region metadata.
+	binary.BigEndian.PutUint32(ub, db.header.secondaryIndexRegionStart)
+	hb = append(hb, ub...)
+	binary.BigEndian.PutUint32(ub, db.header.secondaryIndexRegionCapacity)
+	hb = append(hb, ub...)
+	binary.BigEndian.PutUint32(ub, db.header.secondaryIndexRegionUsed)
+	hb = append(hb, ub...)
+	binary.BigEndian.PutUint32(ub, db.header.secondaryIndexRegionFlags)
+	hb = append(hb, ub...)
+
+	// Add reserved bytes for future expansion (5 bytes)
+	for i := 0; i < 5; i++ {
 		hb = append(hb, 0)
 	}
 
 	// Write the complete header buffer to the beginning of the file (offset 0).
-	// Total header size written is 48 bytes.
+	// Total header size written is 64 bytes.
 	_, err := db.file.WriteAt(hb, 0)
 
 	if err != nil {
@@ -161,6 +173,10 @@ func (db *Database[T]) decodeHeaderLocked() error {
 	db.header.indexEnd = binary.BigEndian.Uint32(hb[31:35])
 	db.header.tableCatalogOffset = binary.BigEndian.Uint32(hb[35:39])
 	db.header.tableCount = binary.BigEndian.Uint32(hb[39:43])
+	db.header.secondaryIndexRegionStart = binary.BigEndian.Uint32(hb[43:47])
+	db.header.secondaryIndexRegionCapacity = binary.BigEndian.Uint32(hb[47:51])
+	db.header.secondaryIndexRegionUsed = binary.BigEndian.Uint32(hb[51:55])
+	db.header.secondaryIndexRegionFlags = binary.BigEndian.Uint32(hb[55:59])
 
 	// Read nextRecordID and set it on the database
 	db.nextRecordID = binary.BigEndian.Uint32(hb[19:23])

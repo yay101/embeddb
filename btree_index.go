@@ -93,6 +93,7 @@ func boolToUint8(b bool) uint8 {
 type BTreeIndex struct {
 	file          *os.File       // Index file
 	mmap          *mmap.ReaderAt // Memory-mapped access to the file
+	pageStore     btreePageStore // Page IO abstraction
 	lock          sync.RWMutex   // Lock for concurrent access
 	rootPageNum   uint32         // Page number of the root node
 	freeListHead  uint32         // Head of the free page list
@@ -167,6 +168,29 @@ func NewBTreeIndex(dbFileName, tableName, fieldName string, fieldOffset uintptr,
 		dbFileName:    dbFileName,
 		pendingWrites: make([]pendingWrite, 0, 1000),
 	}
+
+	if shouldUseRegionStore(tableName, fieldName) {
+		regionStore, exists, err := newRegionBackedBTreePageStore(dbFileName, tableName, fieldName)
+		if err == nil {
+			idx.pageStore = regionStore
+			if !exists {
+				if err := idx.initializeFile(); err != nil {
+					idx.Close()
+					return nil, fmt.Errorf("failed to initialize region index: %w", err)
+				}
+			} else {
+				if err := idx.loadMetadata(); err != nil {
+					if err := idx.initializeFile(); err != nil {
+						idx.Close()
+						return nil, fmt.Errorf("failed to re-initialize region index: %w", err)
+					}
+				}
+			}
+			return idx, nil
+		}
+	}
+
+	idx.pageStore = &fileBackedBTreePageStore{idx: idx}
 
 	// Set key size based on field type
 	switch fieldType {
@@ -250,7 +274,7 @@ func (idx *BTreeIndex) initializeFile() error {
 		return fmt.Errorf("failed to encode header: %w", err)
 	}
 
-	if _, err := idx.file.WriteAt(headerBytes, 0); err != nil {
+	if err := idx.pageStore.writeRaw(0, headerBytes); err != nil {
 		return fmt.Errorf("failed to write header: %w", err)
 	}
 
@@ -268,7 +292,7 @@ func (idx *BTreeIndex) initializeFile() error {
 		return fmt.Errorf("failed to encode root node: %w", err)
 	}
 
-	if _, err := idx.file.WriteAt(rootBytes, BTreeHeaderLen); err != nil {
+	if err := idx.pageStore.writeRaw(BTreeHeaderLen, rootBytes); err != nil {
 		return fmt.Errorf("failed to write root node: %w", err)
 	}
 
@@ -319,7 +343,7 @@ func (idx *BTreeIndex) remapFile() error {
 func (idx *BTreeIndex) loadMetadata() error {
 	// Read header page
 	headerBytes := make([]byte, BTreeHeaderLen)
-	_, err := idx.mmap.ReadAt(headerBytes, 0)
+	err := idx.pageStore.readRaw(0, headerBytes)
 	if err != nil {
 		return err
 	}
@@ -404,14 +428,9 @@ func (idx *BTreeIndex) readNode(pageNum uint32) (*BTreeNode, error) {
 
 	// Read page data
 	// Pages start after the header, so page 0 is at offset BTreeHeaderLen
-	pageData := make([]byte, BTreePageSize)
-	offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
-	if idx.mmap == nil {
-		return nil, fmt.Errorf("mmap is nil")
-	}
-	_, err := idx.mmap.ReadAt(pageData, offset)
+	pageData, err := idx.pageStore.readPage(pageNum)
 	if err != nil {
-		return nil, fmt.Errorf("mmap ReadAt error at offset %d (file len %d): %w", offset, idx.mmap.Len(), err)
+		return nil, fmt.Errorf("page read error for page %d: %w", pageNum, err)
 	}
 
 	// Decode the node
@@ -438,9 +457,7 @@ func (idx *BTreeIndex) writeNode(pageNum uint32, node *BTreeNode) error {
 	}
 
 	// Write to file - pages start after the header
-	offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
-	_, err := idx.file.WriteAt(pageData, offset)
-	return err
+	return idx.pageStore.writePage(pageNum, pageData)
 }
 
 // allocatePage allocates a new page in the B-tree file
@@ -454,9 +471,7 @@ func (idx *BTreeIndex) allocatePage() (uint32, error) {
 		pageNum = idx.freeListHead
 
 		// Read the free page to get the next free page
-		freePage := make([]byte, BTreePageSize)
-		offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
-		_, err := idx.mmap.ReadAt(freePage, offset)
+		freePage, err := idx.pageStore.readPage(pageNum)
 		if err != nil {
 			return 0, err
 		}
@@ -468,24 +483,8 @@ func (idx *BTreeIndex) allocatePage() (uint32, error) {
 		pageNum = idx.pageCount
 		idx.pageCount++
 
-		// Pre-allocate multiple pages at once to reduce file operations
-		// Extend by 64 pages (256KB) at a time for efficiency
-		const preAllocPages = 64
-		targetPageCount := ((idx.pageCount + preAllocPages - 1) / preAllocPages) * preAllocPages
-		targetOffset := int64(BTreeHeaderLen + (targetPageCount * BTreePageSize))
-
-		// Only extend and remap if we need more space
-		currentSize, _ := idx.file.Seek(0, 2) // Get current file size
-		if currentSize < targetOffset {
-			err := idx.file.Truncate(targetOffset)
-			if err != nil {
-				return 0, err
-			}
-
-			// Update memory mapping to include the new pages
-			if err := idx.remapFile(); err != nil {
-				return 0, err
-			}
+		if err := idx.pageStore.ensurePageCapacity(idx.pageCount); err != nil {
+			return 0, err
 		}
 	}
 
@@ -509,9 +508,7 @@ func (idx *BTreeIndex) freePage(pageNum uint32) error {
 	freePage[4] = BTreePageTypeFree
 
 	// Write to file
-	offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
-	_, err := idx.file.WriteAt(freePage, offset)
-	if err != nil {
+	if err := idx.pageStore.writePage(pageNum, freePage); err != nil {
 		return err
 	}
 
@@ -544,8 +541,7 @@ func (idx *BTreeIndex) updateHeader() error {
 		return err
 	}
 
-	_, err := idx.file.WriteAt(headerBytes, 0)
-	return err
+	return idx.pageStore.writeRaw(0, headerBytes)
 }
 
 // encodeNode encodes a B-tree node into a byte slice
@@ -1212,16 +1208,8 @@ func (idx *BTreeIndex) readOverflowPage(pageNum uint32) (*OverflowPage, error) {
 	buf := make([]byte, BTreePageSize)
 	offset := int64(BTreeHeaderLen) + int64(pageNum)*int64(BTreePageSize)
 
-	if idx.mmap != nil {
-		_, err := idx.mmap.ReadAt(buf, offset)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		_, err := idx.file.ReadAt(buf, offset)
-		if err != nil {
-			return nil, err
-		}
+	if err := idx.pageStore.readRaw(offset, buf); err != nil {
+		return nil, err
 	}
 
 	overflow := &OverflowPage{
@@ -1253,8 +1241,7 @@ func (idx *BTreeIndex) writeOverflowPage(pageNum uint32, overflow *OverflowPage)
 	}
 
 	offset := int64(BTreeHeaderLen) + int64(pageNum)*int64(BTreePageSize)
-	_, err := idx.file.WriteAt(buf, offset)
-	return err
+	return idx.pageStore.writeRaw(offset, buf)
 }
 
 // allocateOverflowPages allocates overflow pages for a large value list
@@ -1597,7 +1584,7 @@ func (idx *BTreeIndex) Flush() error {
 	}
 
 	// Sync the file to disk
-	return idx.file.Sync()
+	return idx.pageStore.sync()
 }
 
 // Close closes the index and flushes any pending writes
@@ -1607,15 +1594,7 @@ func (idx *BTreeIndex) Close() error {
 		return err
 	}
 
-	// Close memory mapping
-	if idx.mmap != nil {
-		if err := idx.mmap.Close(); err != nil {
-			return err
-		}
-	}
-
-	// Close file
-	return idx.file.Close()
+	return idx.pageStore.close()
 }
 
 // applyWrites applies all pending writes to the B-tree

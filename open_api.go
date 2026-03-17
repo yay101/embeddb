@@ -232,6 +232,15 @@ func (db *DB) Vacuum() error {
 	return binding.vacuum()
 }
 
+// SecondaryIndexStoreStats reports embedded secondary-index blob usage.
+// It reads directly from the underlying DB file path.
+func (db *DB) SecondaryIndexStoreStats() (*SecondaryIndexStoreStats, error) {
+	if db == nil {
+		return nil, fmt.Errorf("db is nil")
+	}
+	return GetSecondaryIndexStoreStats(db.filename)
+}
+
 func resolveTableName[T any](name ...string) string {
 	if len(name) > 0 && name[0] != "" {
 		return name[0]

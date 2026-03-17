@@ -47,24 +47,28 @@ type Database[T any] struct {
 }
 
 type DBHeader struct {
-	Version            string
-	indexStart         uint32
-	indexEnd           uint32
-	nextRecordID       uint32
-	nextOffset         uint32
-	tocStart           uint32
-	entryStart         uint32
-	lgIndexStart       uint32 // Last good index start position
-	lock               sync.Mutex
-	indexCapacity      uint32 // Capacity allocated for the index
-	tableCatalogOffset uint32 // Offset to table catalog
-	tableCount         uint32 // Number of tables
+	Version                      string
+	indexStart                   uint32
+	indexEnd                     uint32
+	nextRecordID                 uint32
+	nextOffset                   uint32
+	tocStart                     uint32
+	entryStart                   uint32
+	lgIndexStart                 uint32 // Last good index start position
+	lock                         sync.Mutex
+	indexCapacity                uint32 // Capacity allocated for the index
+	tableCatalogOffset           uint32 // Offset to table catalog
+	tableCount                   uint32 // Number of tables
+	secondaryIndexRegionStart    uint32 // Embedded secondary index region start
+	secondaryIndexRegionCapacity uint32 // Embedded secondary index region capacity
+	secondaryIndexRegionUsed     uint32 // Embedded secondary index region used bytes
+	secondaryIndexRegionFlags    uint32 // Embedded secondary index region flags/version
 }
 
 // This type is no longer used and has been replaced by FieldOffset in field_offsets.go
 
 const (
-	headerSize                int          = 52
+	headerSize                int          = 64
 	chunkSize                 int          = 4096
 	escCode                   byte         = 0x1B
 	startMarker               byte         = 0x02
@@ -73,7 +77,7 @@ const (
 	valueEndMarker            byte         = 0x1F
 	embeddedStructType        reflect.Kind = reflect.Struct // Use reflect.Struct
 	defaultIndexPreallocation uint32       = 10240          // 10KB preallocated for index by default
-	Version                   string       = "0.3.3"
+	Version                   string       = "0.3.4"
 	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
 	autoVacuumInterval                     = 24 * time.Hour
 	autoVacuumMinChanges      uint64       = 50000
@@ -282,6 +286,32 @@ func (db *Database[T]) Close() error {
 		}
 	}
 
+	if useExperimentalRegionIndex() {
+		db.lock.Lock()
+		if err := syncRegionCatalogHeaderPointersFromFooter(db.file, &db.header); err != nil {
+			db.lock.Unlock()
+			return fmt.Errorf("failed final region header sync: %w", err)
+		}
+		if err := db.encodeHeaderLocked(); err != nil {
+			db.lock.Unlock()
+			return fmt.Errorf("failed final header write: %w", err)
+		}
+		if err := db.file.Sync(); err != nil {
+			db.lock.Unlock()
+			return fmt.Errorf("failed final file sync: %w", err)
+		}
+		db.lock.Unlock()
+	}
+
+	if !useExperimentalRegionIndex() {
+		if err := persistSecondaryIndexesToDB(db.file.Name()); err != nil {
+			return fmt.Errorf("failed to persist secondary indexes in db file: %w", err)
+		}
+		if err := cleanupSecondaryIndexFiles(db.file.Name()); err != nil {
+			return fmt.Errorf("failed to cleanup secondary index files: %w", err)
+		}
+	}
+
 	// Close memory mapping
 	db.mlock.Lock()
 	if db.mfile != nil {
@@ -310,6 +340,13 @@ func (db *Database[T]) Sync() error {
 	if err := db.writeTableCatalogLocked(); err != nil {
 		db.lock.Unlock()
 		return fmt.Errorf("failed to write table catalog: %w", err)
+	}
+
+	if useExperimentalRegionIndex() {
+		if err := syncRegionCatalogHeaderPointersFromFooter(db.file, &db.header); err != nil {
+			db.lock.Unlock()
+			return fmt.Errorf("failed to sync region catalog header pointers: %w", err)
+		}
 	}
 
 	// Write the header to disk
@@ -352,6 +389,14 @@ func (db *Database[T]) RebuildAllIndexes() error {
 	}
 
 	return nil
+}
+
+// SecondaryIndexStoreStats reports embedded secondary-index blob usage.
+func (db *Database[T]) SecondaryIndexStoreStats() (*SecondaryIndexStoreStats, error) {
+	if db == nil || db.file == nil {
+		return nil, fmt.Errorf("database is not open")
+	}
+	return GetSecondaryIndexStoreStats(db.file.Name())
 }
 
 // Query finds all records that match a field value using an index
