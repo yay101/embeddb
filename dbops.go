@@ -4,26 +4,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 )
-
-func cleanupStaleIndexFiles(dbFileName string) error {
-	pattern := filepath.Join(filepath.Dir(dbFileName), fmt.Sprintf("%s.*.idx", filepath.Base(dbFileName)))
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return err
-	}
-	for _, m := range matches {
-		if err := os.Remove(m); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
-}
 
 // TableCatalogEntry represents a single table in the database catalog.
 //
@@ -422,11 +407,6 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 	// For a new file, initialize the header and index
 	if fileInfo.Size() == 0 {
-		if err := cleanupStaleIndexFiles(file.Name()); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to clean stale index files: %w", err)
-		}
-
 		// Initialize the header for a new file
 		db.header = DBHeader{
 			Version:            Version,
@@ -466,12 +446,6 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 		if err := db.decodeHeader(); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("failed to decode header: %w", err)
-		}
-
-		if !useExperimentalRegionIndex() {
-			if err := restoreSecondaryIndexesFromDB(filename); err != nil {
-				fmt.Printf("Warning: failed to restore secondary indexes from db file: %v\n", err)
-			}
 		}
 
 		// Read the existing index

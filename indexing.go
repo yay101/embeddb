@@ -1,10 +1,7 @@
 package embeddb
 
 import (
-	"encoding/binary"
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -107,15 +104,6 @@ func (im *IndexManager[T]) DropIndex(fieldName string) error {
 	// Close the index
 	if err := index.Close(); err != nil {
 		return fmt.Errorf("failed to close index for field '%s': %w", fieldName, err)
-	}
-
-	// Remove the index file
-	indexFilePath := filepath.Join(
-		filepath.Dir(im.db.file.Name()),
-		fmt.Sprintf("%s.%s.idx", filepath.Base(im.db.file.Name()), fieldName),
-	)
-	if err := os.Remove(indexFilePath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove index file for field '%s': %w", fieldName, err)
 	}
 
 	// Remove from pending indexes if it's there
@@ -715,11 +703,6 @@ func (im *IndexManager[T]) RebuildAll() error {
 				im.lock.Unlock()
 				return fmt.Errorf("failed to re-initialize index for field '%s': %w", fieldName, err)
 			}
-			// Update memory mapping
-			if err := index.remapFile(); err != nil {
-				im.lock.Unlock()
-				return fmt.Errorf("failed to remap index for field '%s': %w", fieldName, err)
-			}
 		}
 		im.lock.Unlock()
 
@@ -738,8 +721,6 @@ func (im *IndexManager[T]) CheckIndexes() error {
 	defer im.lock.Unlock()
 
 	if useExperimentalRegionIndex() {
-		loadedFromRegion := false
-
 		for _, offset := range im.layout.FieldOffsets {
 			fieldName := offset.Name
 
@@ -767,152 +748,9 @@ func (im *IndexManager[T]) CheckIndexes() error {
 			}
 
 			im.indexes[fieldName] = index
-			loadedFromRegion = true
 		}
 
-		if loadedFromRegion {
-			return nil
-		}
-	}
-
-	// Get the base name of the database file
-	dbBaseName := filepath.Base(im.db.file.Name())
-	dirPath := filepath.Dir(im.db.file.Name())
-
-	// Try to find all index files
-	entries, err := os.ReadDir(dirPath)
-	if err != nil {
-		return fmt.Errorf("failed to read directory: %w", err)
-	}
-
-	suffix := ".idx"
-
-	// Determine prefixes to check
-	// New format: <dbname>.<tableName>.<fieldname>.idx (with table)
-	// Legacy format: <dbname>.<fieldname>.idx (without table - backwards compat)
-	var prefixes []string
-	if im.tableName != "" {
-		prefixes = []string{dbBaseName + "." + im.tableName + ".", dbBaseName + "."}
-	} else {
-		prefixes = []string{dbBaseName + "."}
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
-			continue
-		}
-
-		var fieldName string
-		var prefixMatched bool
-
-		// Try each prefix
-		for _, prefix := range prefixes {
-			if strings.HasPrefix(entry.Name(), prefix) {
-				fieldName = strings.TrimPrefix(entry.Name(), prefix)
-				fieldName = strings.TrimSuffix(fieldName, suffix)
-				prefixMatched = true
-				break
-			}
-		}
-
-		if !prefixMatched {
-			continue
-		}
-
-		// Check if we already have this index
-		if _, exists := im.indexes[fieldName]; exists {
-			continue
-		}
-
-		// Find the field in the layout
-		var fieldOffset FieldOffset
-		var fieldFound bool
-		for _, offset := range im.layout.FieldOffsets {
-			if strings.EqualFold(offset.Name, fieldName) {
-				fieldOffset = offset
-				fieldFound = true
-				break
-			}
-		}
-
-		if !fieldFound {
-			continue
-		}
-
-		indexFieldType := fieldOffset.Type
-		if fieldOffset.IsSlice && fieldOffset.SliceElem != nil {
-			indexFieldType = fieldOffset.SliceElem.Kind()
-		}
-
-		// Try to load the index
-		index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime)
-		if err != nil {
-			// If we fail to load, mark it for rebuild
-			im.pendingIndexes[fieldName] = struct{}{}
-		} else {
-			im.indexes[fieldName] = index
-		}
-	}
-
-	return nil
-}
-
-// ExtractIndexesFromDatabase extracts indexes embedded in the database file
-func (im *IndexManager[T]) ExtractIndexesFromDatabase() error {
-	// Get database file size
-	dbInfo, err := im.db.file.Stat()
-	if err != nil {
-		return err
-	}
-
-	if dbInfo.Size() < 8 {
-		return nil // File too small to have embedded indexes
-	}
-
-	// Read the last 8 bytes to check if there's an index marker
-	marker := make([]byte, 8)
-	if _, err := im.db.file.ReadAt(marker, dbInfo.Size()-8); err != nil {
-		return fmt.Errorf("failed to read index marker: %w", err)
-	}
-
-	// Check if marker looks valid
-	indexLoc := binary.LittleEndian.Uint64(marker)
-	if indexLoc >= uint64(dbInfo.Size())-8 {
-		return nil // Invalid marker
-	}
-
-	// Read index metadata to find all embedded indexes
-	// This would need to parse the index data at the specified location
-	// to identify all the indexes embedded in the file
-
-	// Simplified approach: try to extract any index that might be there
-	dirPath := filepath.Dir(im.db.file.Name())
-	dbBaseName := filepath.Base(im.db.file.Name())
-
-	// For each field in the layout, check if there's an index
-	for _, offset := range im.layout.FieldOffsets {
-		fieldName := offset.Name
-		indexFileName := filepath.Join(dirPath, fmt.Sprintf("%s.%s.idx", dbBaseName, fieldName))
-
-		// Try to extract the index
-		if err := ExtractIndexFromDatabase(im.db.file.Name(), indexFileName); err != nil {
-			// Just log and continue - this field might not have an index
-			continue
-		}
-
-		indexFieldType := offset.Type
-		if offset.IsSlice && offset.SliceElem != nil {
-			indexFieldType = offset.SliceElem.Kind()
-		}
-
-		// Try to load the extracted index
-		index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, offset.Offset, indexFieldType, offset.IsTime)
-		if err != nil {
-			// If we fail to load, mark it for rebuild
-			im.pendingIndexes[fieldName] = struct{}{}
-		} else {
-			im.indexes[fieldName] = index
-		}
+		return nil
 	}
 
 	return nil

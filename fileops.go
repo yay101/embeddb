@@ -11,9 +11,6 @@ import (
 // IMPORTANT: Caller must hold db.lock before calling this method.
 func (db *Database[T]) writeData(data []byte, offset int64) error {
 	end := offset + int64(len(data))
-	if err := ensureSecondaryIndexBlobAfter(db.file, end); err != nil {
-		return fmt.Errorf("failed to move embedded secondary index blob: %w", err)
-	}
 	if err := ensureRegionIndexBlobAfter(db.file, end); err != nil {
 		return fmt.Errorf("failed to move embedded region index blob: %w", err)
 	}

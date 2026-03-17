@@ -43,6 +43,16 @@ type regionCatalogEntry struct {
 	used     uint64
 }
 
+// SecondaryIndexStoreStats reports the embedded secondary index region state.
+type SecondaryIndexStoreStats struct {
+	Exists       bool
+	Start        uint64
+	Capacity     uint64
+	Used         uint64
+	EntryCount   uint32
+	PayloadMagic string
+}
+
 type regionBackedBTreePageStore struct {
 	file     *os.File
 	keyHash  uint64
@@ -206,6 +216,45 @@ func hashIndexKey(tableName, fieldName string) uint64 {
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(fieldName))
 	return h.Sum64()
+}
+
+// GetSecondaryIndexStoreStats returns embedded secondary index region stats.
+func GetSecondaryIndexStoreStats(dbFileName string) (*SecondaryIndexStoreStats, error) {
+	file, err := os.Open(dbFileName)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	footer, hasFooter, err := readRegionCatalogFooter(file)
+	if err != nil {
+		return nil, err
+	}
+	if !hasFooter {
+		return &SecondaryIndexStoreStats{Exists: false}, nil
+	}
+
+	stats := &SecondaryIndexStoreStats{
+		Exists:       true,
+		Start:        footer.start,
+		Capacity:     footer.capacity,
+		Used:         footer.used,
+		PayloadMagic: regionCatalogMagic,
+	}
+
+	data, err := readRegionCatalogData(file, footer)
+	if err == nil {
+		var count uint32
+		for i := 0; i < regionCatalogMaxEntries; i++ {
+			e := decodeRegionCatalogEntry(data, i)
+			if e.keyHash != 0 {
+				count++
+			}
+		}
+		stats.EntryCount = count
+	}
+
+	return stats, nil
 }
 
 func ensureRegionCatalogAndEntry(file *os.File, keyHash uint64) (bool, error) {

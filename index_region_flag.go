@@ -3,5 +3,9 @@ package embeddb
 import "os"
 
 func useExperimentalRegionIndex() bool {
-	return os.Getenv("EMBEDDB_EXPERIMENTAL_REGION_INDEX") == "1"
+	v := os.Getenv("EMBEDDB_EXPERIMENTAL_REGION_INDEX")
+	if v == "0" || v == "false" {
+		return false
+	}
+	return true
 }

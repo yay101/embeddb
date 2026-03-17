@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -151,15 +150,6 @@ type pendingWrite struct {
 //
 // Deprecated: internal use only. This function will be made private in a future release.
 func NewBTreeIndex(dbFileName, tableName, fieldName string, fieldOffset uintptr, fieldType reflect.Kind, isTimeField bool) (*BTreeIndex, error) {
-	// Create the index file in the same directory as the database file
-	dbDir := filepath.Dir(dbFileName)
-	var indexFileName string
-	if tableName != "" {
-		indexFileName = filepath.Join(dbDir, fmt.Sprintf("%s.%s.%s.idx", filepath.Base(dbFileName), tableName, fieldName))
-	} else {
-		indexFileName = filepath.Join(dbDir, fmt.Sprintf("%s.%s.idx", filepath.Base(dbFileName), fieldName))
-	}
-
 	idx := &BTreeIndex{
 		fieldName:     fieldName,
 		fieldOffset:   fieldOffset,
@@ -168,29 +158,15 @@ func NewBTreeIndex(dbFileName, tableName, fieldName string, fieldOffset uintptr,
 		dbFileName:    dbFileName,
 		pendingWrites: make([]pendingWrite, 0, 1000),
 	}
-
-	if shouldUseRegionStore(tableName, fieldName) {
-		regionStore, exists, err := newRegionBackedBTreePageStore(dbFileName, tableName, fieldName)
-		if err == nil {
-			idx.pageStore = regionStore
-			if !exists {
-				if err := idx.initializeFile(); err != nil {
-					idx.Close()
-					return nil, fmt.Errorf("failed to initialize region index: %w", err)
-				}
-			} else {
-				if err := idx.loadMetadata(); err != nil {
-					if err := idx.initializeFile(); err != nil {
-						idx.Close()
-						return nil, fmt.Errorf("failed to re-initialize region index: %w", err)
-					}
-				}
-			}
-			return idx, nil
-		}
+	if !shouldUseRegionStore(tableName, fieldName) {
+		return nil, fmt.Errorf("region-backed secondary indexes are disabled")
 	}
 
-	idx.pageStore = &fileBackedBTreePageStore{idx: idx}
+	regionStore, exists, err := newRegionBackedBTreePageStore(dbFileName, tableName, fieldName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize region index store: %w", err)
+	}
+	idx.pageStore = regionStore
 
 	// Set key size based on field type
 	switch fieldType {
@@ -212,38 +188,16 @@ func NewBTreeIndex(dbFileName, tableName, fieldName string, fieldOffset uintptr,
 		idx.keySize = -1
 	}
 
-	// Check if the index file already exists
-	_, err := os.Stat(indexFileName)
-	fileExists := err == nil
-
-	// Open or create the index file
-	file, err := os.OpenFile(indexFileName, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open index file: %w", err)
-	}
-	idx.file = file
-
-	// Initialize the file if it doesn't exist yet
-	if !fileExists {
+	if !exists {
 		if err := idx.initializeFile(); err != nil {
 			idx.Close()
-			return nil, fmt.Errorf("failed to initialize index file: %w", err)
+			return nil, fmt.Errorf("failed to initialize region index file: %w", err)
 		}
-	}
-
-	// Memory-map the file
-	if err := idx.mapFile(); err != nil {
-		idx.Close()
-		return nil, fmt.Errorf("failed to memory-map index file: %w", err)
-	}
-
-	// Load index metadata
-	if fileExists {
+	} else {
 		if err := idx.loadMetadata(); err != nil {
-			// If loading fails, try to rebuild
-			if err := idx.rebuildIndex(dbFileName, fieldName, fieldOffset); err != nil {
+			if err := idx.initializeFile(); err != nil {
 				idx.Close()
-				return nil, fmt.Errorf("failed to rebuild index: %w", err)
+				return nil, fmt.Errorf("failed to re-initialize region index: %w", err)
 			}
 		}
 	}
@@ -2177,100 +2131,5 @@ func (idx *BTreeIndex) rebuildIndex(dbFileName string, fieldName string, fieldOf
 	// you would need to understand the database file format and read records
 
 	// For now, we'll just create an empty index
-	return nil
-}
-
-// mergeWithDatabase copies the index into the database file for portability
-func (idx *BTreeIndex) mergeWithDatabase() error {
-	// Open the database file
-	dbFile, err := os.OpenFile(idx.dbFileName, os.O_RDWR, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open database file for index merge: %w", err)
-	}
-	defer dbFile.Close()
-
-	// Get database file size
-	dbInfo, err := dbFile.Stat()
-	if err != nil {
-		return err
-	}
-
-	// Get index file size
-	idxInfo, err := idx.file.Stat()
-	if err != nil {
-		return err
-	}
-
-	// Append index to database file
-	// First, ensure the database file is large enough
-	newSize := dbInfo.Size() + idxInfo.Size() + 8 // +8 for index location marker
-	if err := dbFile.Truncate(newSize); err != nil {
-		return fmt.Errorf("failed to resize database file: %w", err)
-	}
-
-	// Copy index file to the end of database file
-	idxData := make([]byte, idxInfo.Size())
-	if _, err := idx.file.ReadAt(idxData, 0); err != nil {
-		return fmt.Errorf("failed to read index file: %w", err)
-	}
-
-	if _, err := dbFile.WriteAt(idxData, dbInfo.Size()); err != nil {
-		return fmt.Errorf("failed to write index to database file: %w", err)
-	}
-
-	// Write index location marker at the end of the file
-	marker := make([]byte, 8)
-	binary.LittleEndian.PutUint64(marker, uint64(dbInfo.Size()))
-	if _, err := dbFile.WriteAt(marker, newSize-8); err != nil {
-		return fmt.Errorf("failed to write index location marker: %w", err)
-	}
-
-	return dbFile.Sync()
-}
-
-// extractFromDatabase extracts the index from a database file.
-//
-// Deprecated: internal use only. This function will be made private in a future release.
-func ExtractIndexFromDatabase(dbFileName string, indexFileName string) error {
-	// Open the database file
-	dbFile, err := os.Open(dbFileName)
-	if err != nil {
-		return fmt.Errorf("failed to open database file: %w", err)
-	}
-	defer dbFile.Close()
-
-	// Get database file size
-	dbInfo, err := dbFile.Stat()
-	if err != nil {
-		return err
-	}
-
-	// Read the index location marker (last 8 bytes)
-	marker := make([]byte, 8)
-	if _, err := dbFile.ReadAt(marker, dbInfo.Size()-8); err != nil {
-		return fmt.Errorf("failed to read index location marker: %w", err)
-	}
-
-	// Get index location
-	indexLoc := binary.LittleEndian.Uint64(marker)
-	indexSize := dbInfo.Size() - int64(indexLoc) - 8
-
-	// Read the index data
-	indexData := make([]byte, indexSize)
-	if _, err := dbFile.ReadAt(indexData, int64(indexLoc)); err != nil {
-		return fmt.Errorf("failed to read index data: %w", err)
-	}
-
-	// Write to the index file
-	indexFile, err := os.Create(indexFileName)
-	if err != nil {
-		return fmt.Errorf("failed to create index file: %w", err)
-	}
-	defer indexFile.Close()
-
-	if _, err := indexFile.Write(indexData); err != nil {
-		return fmt.Errorf("failed to write index file: %w", err)
-	}
-
 	return nil
 }

@@ -77,7 +77,7 @@ const (
 	valueEndMarker            byte         = 0x1F
 	embeddedStructType        reflect.Kind = reflect.Struct // Use reflect.Struct
 	defaultIndexPreallocation uint32       = 10240          // 10KB preallocated for index by default
-	Version                   string       = "0.3.4"
+	Version                   string       = "0.4.0"
 	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
 	autoVacuumInterval                     = 24 * time.Hour
 	autoVacuumMinChanges      uint64       = 50000
@@ -301,15 +301,6 @@ func (db *Database[T]) Close() error {
 			return fmt.Errorf("failed final file sync: %w", err)
 		}
 		db.lock.Unlock()
-	}
-
-	if !useExperimentalRegionIndex() {
-		if err := persistSecondaryIndexesToDB(db.file.Name()); err != nil {
-			return fmt.Errorf("failed to persist secondary indexes in db file: %w", err)
-		}
-		if err := cleanupSecondaryIndexFiles(db.file.Name()); err != nil {
-			return fmt.Errorf("failed to cleanup secondary index files: %w", err)
-		}
 	}
 
 	// Close memory mapping
