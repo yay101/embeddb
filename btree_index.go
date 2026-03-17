@@ -15,6 +15,46 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
+var btreePageBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, BTreePageSize)
+	},
+}
+
+var btreeNodePool = sync.Pool{
+	New: func() interface{} {
+		return &BTreeNode{}
+	},
+}
+
+func getBTreePageBuffer() []byte {
+	return btreePageBufferPool.Get().([]byte)
+}
+
+func putBTreePageBuffer(buf []byte) {
+	if cap(buf) < BTreePageSize {
+		return
+	}
+	btreePageBufferPool.Put(buf[:BTreePageSize])
+}
+
+func getBTreeNode() *BTreeNode {
+	return btreeNodePool.Get().(*BTreeNode)
+}
+
+func putBTreeNode(node *BTreeNode) {
+	if node == nil {
+		return
+	}
+	node.PageType = 0
+	node.KeyCount = 0
+	node.ParentPage = 0
+	for i := range node.BloomFilter {
+		node.BloomFilter[i] = 0
+	}
+	btreeNodePool.Put(node)
+}
+
 // normalizeString converts a string to lowercase and removes special characters
 // for case-insensitive, punctuation-insensitive searching.
 // This allows searching for "fox" to match "The Quick Brown Fox!"
@@ -380,21 +420,35 @@ func (idx *BTreeIndex) readNode(pageNum uint32) (*BTreeNode, error) {
 		return nil, fmt.Errorf("invalid page number: %d (pageCount=%d)", pageNum, idx.pageCount)
 	}
 
-	// Read page data
-	// Pages start after the header, so page 0 is at offset BTreeHeaderLen
-	pageData, err := idx.pageStore.readPage(pageNum)
-	if err != nil {
-		return nil, fmt.Errorf("page read error for page %d: %w", pageNum, err)
-	}
-
-	// Decode the node
 	node := &BTreeNode{}
-	err = idx.decodeNode(pageData, node)
-	if err != nil {
+	if err := idx.readNodeInto(pageNum, node); err != nil {
 		return nil, err
 	}
 
 	return node, nil
+}
+
+func (idx *BTreeIndex) readNodeInto(pageNum uint32, node *BTreeNode) error {
+	if pageNum >= idx.pageCount {
+		return fmt.Errorf("invalid page number: %d (pageCount=%d)", pageNum, idx.pageCount)
+	}
+
+	// Read page data
+	// Pages start after the header, so page 0 is at offset BTreeHeaderLen
+	pageData := getBTreePageBuffer()
+	defer putBTreePageBuffer(pageData)
+
+	if err := idx.pageStore.readPageInto(pageNum, pageData); err != nil {
+		return fmt.Errorf("page read error for page %d: %w", pageNum, err)
+	}
+
+	// Decode the node
+	err := idx.decodeNode(pageData, node)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // writeNode writes a B-tree node to the specified page
@@ -405,7 +459,8 @@ func (idx *BTreeIndex) writeNode(pageNum uint32, node *BTreeNode) error {
 	}
 
 	// Encode the node
-	pageData := make([]byte, BTreePageSize)
+	pageData := getBTreePageBuffer()
+	defer putBTreePageBuffer(pageData)
 	if err := idx.encodeNode(node, pageData); err != nil {
 		return err
 	}
@@ -425,7 +480,9 @@ func (idx *BTreeIndex) allocatePage() (uint32, error) {
 		pageNum = idx.freeListHead
 
 		// Read the free page to get the next free page
-		freePage, err := idx.pageStore.readPage(pageNum)
+		freePage := getBTreePageBuffer()
+		defer putBTreePageBuffer(freePage)
+		err := idx.pageStore.readPageInto(pageNum, freePage)
 		if err != nil {
 			return 0, err
 		}
@@ -455,7 +512,11 @@ func (idx *BTreeIndex) allocatePage() (uint32, error) {
 func (idx *BTreeIndex) freePage(pageNum uint32) error {
 
 	// Write the current free list head to the page
-	freePage := make([]byte, BTreePageSize)
+	freePage := getBTreePageBuffer()
+	defer putBTreePageBuffer(freePage)
+	for i := range freePage {
+		freePage[i] = 0
+	}
 	binary.LittleEndian.PutUint32(freePage[0:4], idx.freeListHead)
 
 	// Mark as free page
@@ -699,13 +760,46 @@ func (idx *BTreeIndex) decodeNode(buf []byte, node *BTreeNode) error {
 	// Read bloom filter
 	copy(node.BloomFilter[:], buf[7:7+BloomFilterSize])
 
-	// Initialize key and value/child slices
-	node.Keys = make([]interface{}, node.KeyCount)
-	if node.PageType == BTreePageTypeLeaf {
-		node.Values = make([][]uint32, node.KeyCount)
-		node.OverflowPages = make([]uint32, node.KeyCount)
+	// Initialize key and value/child slices with reuse.
+	keyCount := int(node.KeyCount)
+	if cap(node.Keys) < keyCount {
+		node.Keys = make([]interface{}, keyCount)
 	} else {
-		node.Children = make([]uint32, int(node.KeyCount)+1)
+		node.Keys = node.Keys[:keyCount]
+		for i := range node.Keys {
+			node.Keys[i] = nil
+		}
+	}
+	if node.PageType == BTreePageTypeLeaf {
+		if cap(node.Values) < keyCount {
+			node.Values = make([][]uint32, keyCount)
+		} else {
+			node.Values = node.Values[:keyCount]
+			for i := range node.Values {
+				node.Values[i] = nil
+			}
+		}
+		if cap(node.OverflowPages) < keyCount {
+			node.OverflowPages = make([]uint32, keyCount)
+		} else {
+			node.OverflowPages = node.OverflowPages[:keyCount]
+			for i := range node.OverflowPages {
+				node.OverflowPages[i] = 0
+			}
+		}
+		node.Children = node.Children[:0]
+	} else {
+		childCount := keyCount + 1
+		if cap(node.Children) < childCount {
+			node.Children = make([]uint32, childCount)
+		} else {
+			node.Children = node.Children[:childCount]
+			for i := range node.Children {
+				node.Children[i] = 0
+			}
+		}
+		node.Values = node.Values[:0]
+		node.OverflowPages = node.OverflowPages[:0]
 	}
 
 	// Current position in the buffer
@@ -927,6 +1021,28 @@ func (idx *BTreeIndex) Find(key interface{}, limit ...int) ([]uint32, error) {
 		}
 	}
 
+	if fastKey, ok := idx.fastKeyToUint32(searchKey); ok {
+		results, err := idx.searchInNodeFastU32(idx.rootPageNum, fastKey)
+		if err != nil {
+			return nil, err
+		}
+		if len(limit) > 0 && limit[0] > 0 && len(results) > limit[0] {
+			return results[:limit[0]], nil
+		}
+		return results, nil
+	}
+
+	if fastKey, ok := idx.fastKeyToUint64(searchKey); ok {
+		results, err := idx.searchInNodeFastU64(idx.rootPageNum, fastKey)
+		if err != nil {
+			return nil, err
+		}
+		if len(limit) > 0 && limit[0] > 0 && len(results) > limit[0] {
+			return results[:limit[0]], nil
+		}
+		return results, nil
+	}
+
 	// Start search at the root
 	results, err := idx.searchInNode(idx.rootPageNum, searchKey)
 	if err != nil {
@@ -1008,7 +1124,10 @@ func (idx *BTreeIndex) FindBetween(min, max interface{}, inclusiveMin, inclusive
 
 // searchRange searches for keys in a range [min, max]
 func (idx *BTreeIndex) searchRange(pageNum uint32, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
-	node, err := idx.readNode(pageNum)
+	node := getBTreeNode()
+	defer putBTreeNode(node)
+
+	err := idx.readNodeInto(pageNum, node)
 	if err != nil {
 		return nil, err
 	}
@@ -1016,44 +1135,72 @@ func (idx *BTreeIndex) searchRange(pageNum uint32, min, max interface{}, inclusi
 	var results []uint32
 
 	if node.PageType == BTreePageTypeLeaf {
-		// Iterate through all keys in this leaf node
+		// Keys are sorted; prune with early continue/break.
 		for i := 0; i < int(node.KeyCount); i++ {
 			key := node.Keys[i]
 
-			// Check if key is in range
-			inRange := true
-
 			if min != nil {
-				cmp := idx.compareKeys(key, min)
-				if cmp < 0 || (cmp == 0 && !inclusiveMin) {
-					inRange = false
+				cmpMin := idx.compareKeys(key, min)
+				if cmpMin < 0 || (cmpMin == 0 && !inclusiveMin) {
+					continue
 				}
 			}
 
-			if max != nil && inRange {
-				cmp := idx.compareKeys(key, max)
-				if cmp > 0 || (cmp == 0 && !inclusiveMax) {
-					inRange = false
+			if max != nil {
+				cmpMax := idx.compareKeys(key, max)
+				if cmpMax > 0 || (cmpMax == 0 && !inclusiveMax) {
+					break
 				}
 			}
 
-			if inRange {
-				// Collect values for this key
-				var values []uint32
-				if i < len(node.OverflowPages) && node.OverflowPages[i] != 0 {
-					values, err = idx.collectAllValues(node.Values[i], node.OverflowPages[i])
-					if err != nil {
-						return nil, err
-					}
-				} else {
-					values = node.Values[i]
+			// Collect values for this key
+			var values []uint32
+			if i < len(node.OverflowPages) && node.OverflowPages[i] != 0 {
+				values, err = idx.collectAllValues(node.Values[i], node.OverflowPages[i])
+				if err != nil {
+					return nil, err
 				}
-				results = append(results, values...)
+			} else {
+				values = node.Values[i]
 			}
+			results = append(results, values...)
 		}
 	} else {
-		// Internal node - traverse children
-		for i := 0; i <= int(node.KeyCount); i++ {
+		startChild := 0
+		endChild := int(node.KeyCount)
+
+		if min != nil {
+			insertPos, found := idx.searchNodeForKey(node, min)
+			startChild = insertPos
+			if found {
+				if inclusiveMin {
+					startChild = insertPos
+				} else {
+					startChild = insertPos + 1
+				}
+			}
+		}
+
+		if max != nil {
+			insertPos, found := idx.searchNodeForKey(node, max)
+			endChild = insertPos
+			if found {
+				if inclusiveMax {
+					endChild = insertPos + 1
+				} else {
+					endChild = insertPos
+				}
+			}
+		}
+
+		if startChild < 0 {
+			startChild = 0
+		}
+		if endChild > int(node.KeyCount) {
+			endChild = int(node.KeyCount)
+		}
+
+		for i := startChild; i <= endChild; i++ {
 			childResults, err := idx.searchRange(node.Children[i], min, max, inclusiveMin, inclusiveMax)
 			if err != nil {
 				return nil, err
@@ -1087,8 +1234,10 @@ func (idx *BTreeIndex) validateKeyType(key interface{}) error {
 
 // searchInNode recursively searches for a key in a node
 func (idx *BTreeIndex) searchInNode(pageNum uint32, key interface{}) ([]uint32, error) {
-	// Read the node
-	node, err := idx.readNode(pageNum)
+	node := getBTreeNode()
+	defer putBTreeNode(node)
+
+	err := idx.readNodeInto(pageNum, node)
 	if err != nil {
 		return nil, err
 	}
@@ -1108,7 +1257,9 @@ func (idx *BTreeIndex) searchInNode(pageNum uint32, key interface{}) ([]uint32, 
 			// Collect all values including overflow
 			return idx.collectAllValues(node.Values[i], node.OverflowPages[i])
 		}
-		return node.Values[i], nil
+		out := make([]uint32, len(node.Values[i]))
+		copy(out, node.Values[i])
+		return out, nil
 	}
 
 	// If we're at a leaf and didn't find it, it doesn't exist
@@ -1137,6 +1288,316 @@ func (idx *BTreeIndex) searchInNode(pageNum uint32, key interface{}) ([]uint32, 
 	return idx.searchInNode(node.Children[childIndex], key)
 }
 
+func (idx *BTreeIndex) fastKeyToUint32(key interface{}) (uint32, bool) {
+	if idx.isTimeField {
+		return 0, false
+	}
+
+	switch idx.fieldType {
+	case reflect.Int:
+		v, ok := key.(int)
+		if !ok {
+			return 0, false
+		}
+		return uint32(v), true
+	case reflect.Int32:
+		v, ok := key.(int32)
+		if !ok {
+			return 0, false
+		}
+		return uint32(v), true
+	case reflect.Uint:
+		v, ok := key.(uint)
+		if !ok {
+			return 0, false
+		}
+		return uint32(v), true
+	case reflect.Uint32:
+		v, ok := key.(uint32)
+		if !ok {
+			return 0, false
+		}
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+func (idx *BTreeIndex) fastKeyToUint64(key interface{}) (uint64, bool) {
+	if idx.isTimeField {
+		t, ok := key.(time.Time)
+		if !ok {
+			return 0, false
+		}
+		return uint64(t.UnixNano()), true
+	}
+
+	switch idx.fieldType {
+	case reflect.Int64:
+		v, ok := key.(int64)
+		if !ok {
+			return 0, false
+		}
+		return uint64(v), true
+	case reflect.Uint64:
+		v, ok := key.(uint64)
+		if !ok {
+			return 0, false
+		}
+		return v, true
+	default:
+		return 0, false
+	}
+}
+
+func (idx *BTreeIndex) searchInNodeFastU32(pageNum uint32, key uint32) ([]uint32, error) {
+	pageData := getBTreePageBuffer()
+	defer putBTreePageBuffer(pageData)
+
+	if err := idx.pageStore.readPageInto(pageNum, pageData); err != nil {
+		return nil, err
+	}
+
+	pageType := pageData[0]
+	keyCount := int(binary.LittleEndian.Uint16(pageData[1:3]))
+	pos := 7 + BloomFilterSize
+
+	if pageType == BTreePageTypeLeaf {
+		for i := 0; i < keyCount; i++ {
+			if pos+4 > BTreePageSize {
+				return nil, fmt.Errorf("invalid node format: int key beyond page size")
+			}
+			curKey := binary.LittleEndian.Uint32(pageData[pos : pos+4])
+			pos += 4
+
+			if pos+1 > BTreePageSize {
+				return nil, fmt.Errorf("invalid node format: overflow flag beyond page size")
+			}
+			hasOverflow := pageData[pos] != 0
+			pos++
+
+			if pos+2 > BTreePageSize {
+				return nil, fmt.Errorf("invalid node format: value count beyond page size")
+			}
+			valCount := int(binary.LittleEndian.Uint16(pageData[pos : pos+2]))
+			pos += 2
+
+			overflowPage := uint32(0)
+			if hasOverflow {
+				if pos+4 > BTreePageSize {
+					return nil, fmt.Errorf("invalid node format: overflow pointer beyond page size")
+				}
+				overflowPage = binary.LittleEndian.Uint32(pageData[pos : pos+4])
+				pos += 4
+			}
+
+			if pos+valCount*4 > BTreePageSize {
+				return nil, fmt.Errorf("invalid node format: value beyond page size")
+			}
+
+			if curKey == key {
+				inline := make([]uint32, valCount)
+				for j := 0; j < valCount; j++ {
+					inline[j] = binary.LittleEndian.Uint32(pageData[pos+j*4 : pos+(j+1)*4])
+				}
+				if overflowPage != 0 {
+					return idx.collectAllValues(inline, overflowPage)
+				}
+				return inline, nil
+			}
+
+			pos += valCount * 4
+		}
+
+		return nil, nil
+	}
+
+	var keysStack [256]uint32
+	var childrenStack [257]uint32
+	keys := keysStack[:]
+	children := childrenStack[:]
+	if keyCount > len(keysStack) {
+		keys = make([]uint32, keyCount)
+		children = make([]uint32, keyCount+1)
+	} else {
+		keys = keys[:keyCount]
+		children = children[:keyCount+1]
+	}
+
+	for i := 0; i < keyCount; i++ {
+		if pos+4 > BTreePageSize {
+			return nil, fmt.Errorf("invalid node format: int key beyond page size")
+		}
+		keys[i] = binary.LittleEndian.Uint32(pageData[pos : pos+4])
+		pos += 4
+
+		if pos+4 > BTreePageSize {
+			return nil, fmt.Errorf("invalid node format: child pointer beyond page size")
+		}
+		children[i] = binary.LittleEndian.Uint32(pageData[pos : pos+4])
+		pos += 4
+	}
+
+	if pos+4 > BTreePageSize {
+		return nil, fmt.Errorf("invalid node format: last child pointer beyond page size")
+	}
+	children[keyCount] = binary.LittleEndian.Uint32(pageData[pos : pos+4])
+
+	insertPos, found := binarySearchU32(keys, key)
+	childIndex := insertPos
+	if !found && insertPos < keyCount {
+		if key > keys[insertPos] {
+			childIndex = insertPos + 1
+		}
+	}
+
+	if childIndex < 0 || childIndex >= len(children) {
+		return nil, fmt.Errorf("invalid child index: %d (node has %d children)", childIndex, len(children))
+	}
+
+	return idx.searchInNodeFastU32(children[childIndex], key)
+}
+
+func (idx *BTreeIndex) searchInNodeFastU64(pageNum uint32, key uint64) ([]uint32, error) {
+	pageData := getBTreePageBuffer()
+	defer putBTreePageBuffer(pageData)
+
+	if err := idx.pageStore.readPageInto(pageNum, pageData); err != nil {
+		return nil, err
+	}
+
+	pageType := pageData[0]
+	keyCount := int(binary.LittleEndian.Uint16(pageData[1:3]))
+	pos := 7 + BloomFilterSize
+
+	if pageType == BTreePageTypeLeaf {
+		for i := 0; i < keyCount; i++ {
+			if pos+8 > BTreePageSize {
+				return nil, fmt.Errorf("invalid node format: int64 key beyond page size")
+			}
+			curKey := binary.LittleEndian.Uint64(pageData[pos : pos+8])
+			pos += 8
+
+			if pos+1 > BTreePageSize {
+				return nil, fmt.Errorf("invalid node format: overflow flag beyond page size")
+			}
+			hasOverflow := pageData[pos] != 0
+			pos++
+
+			if pos+2 > BTreePageSize {
+				return nil, fmt.Errorf("invalid node format: value count beyond page size")
+			}
+			valCount := int(binary.LittleEndian.Uint16(pageData[pos : pos+2]))
+			pos += 2
+
+			overflowPage := uint32(0)
+			if hasOverflow {
+				if pos+4 > BTreePageSize {
+					return nil, fmt.Errorf("invalid node format: overflow pointer beyond page size")
+				}
+				overflowPage = binary.LittleEndian.Uint32(pageData[pos : pos+4])
+				pos += 4
+			}
+
+			if pos+valCount*4 > BTreePageSize {
+				return nil, fmt.Errorf("invalid node format: value beyond page size")
+			}
+
+			if curKey == key {
+				inline := make([]uint32, valCount)
+				for j := 0; j < valCount; j++ {
+					inline[j] = binary.LittleEndian.Uint32(pageData[pos+j*4 : pos+(j+1)*4])
+				}
+				if overflowPage != 0 {
+					return idx.collectAllValues(inline, overflowPage)
+				}
+				return inline, nil
+			}
+
+			pos += valCount * 4
+		}
+
+		return nil, nil
+	}
+
+	var keysStack [256]uint64
+	var childrenStack [257]uint32
+	keys := keysStack[:]
+	children := childrenStack[:]
+	if keyCount > len(keysStack) {
+		keys = make([]uint64, keyCount)
+		children = make([]uint32, keyCount+1)
+	} else {
+		keys = keys[:keyCount]
+		children = children[:keyCount+1]
+	}
+
+	for i := 0; i < keyCount; i++ {
+		if pos+8 > BTreePageSize {
+			return nil, fmt.Errorf("invalid node format: int64 key beyond page size")
+		}
+		keys[i] = binary.LittleEndian.Uint64(pageData[pos : pos+8])
+		pos += 8
+
+		if pos+4 > BTreePageSize {
+			return nil, fmt.Errorf("invalid node format: child pointer beyond page size")
+		}
+		children[i] = binary.LittleEndian.Uint32(pageData[pos : pos+4])
+		pos += 4
+	}
+
+	if pos+4 > BTreePageSize {
+		return nil, fmt.Errorf("invalid node format: last child pointer beyond page size")
+	}
+	children[keyCount] = binary.LittleEndian.Uint32(pageData[pos : pos+4])
+
+	insertPos, found := binarySearchU64(keys, key)
+	childIndex := insertPos
+	if !found && insertPos < keyCount {
+		if key > keys[insertPos] {
+			childIndex = insertPos + 1
+		}
+	}
+
+	if childIndex < 0 || childIndex >= len(children) {
+		return nil, fmt.Errorf("invalid child index: %d (node has %d children)", childIndex, len(children))
+	}
+
+	return idx.searchInNodeFastU64(children[childIndex], key)
+}
+
+func binarySearchU32(keys []uint32, key uint32) (int, bool) {
+	left, right := 0, len(keys)-1
+	for left <= right {
+		mid := left + (right-left)/2
+		if keys[mid] == key {
+			return mid, true
+		}
+		if key < keys[mid] {
+			right = mid - 1
+		} else {
+			left = mid + 1
+		}
+	}
+	return left, false
+}
+
+func binarySearchU64(keys []uint64, key uint64) (int, bool) {
+	left, right := 0, len(keys)-1
+	for left <= right {
+		mid := left + (right-left)/2
+		if keys[mid] == key {
+			return mid, true
+		}
+		if key < keys[mid] {
+			right = mid - 1
+		} else {
+			left = mid + 1
+		}
+	}
+	return left, false
+}
+
 // collectAllValues collects values from inline storage and overflow pages
 func (idx *BTreeIndex) collectAllValues(inlineValues []uint32, overflowPageNum uint32) ([]uint32, error) {
 	// Start with inline values
@@ -1159,7 +1620,8 @@ func (idx *BTreeIndex) collectAllValues(inlineValues []uint32, overflowPageNum u
 
 // readOverflowPage reads an overflow page from disk
 func (idx *BTreeIndex) readOverflowPage(pageNum uint32) (*OverflowPage, error) {
-	buf := make([]byte, BTreePageSize)
+	buf := getBTreePageBuffer()
+	defer putBTreePageBuffer(buf)
 	offset := int64(BTreeHeaderLen) + int64(pageNum)*int64(BTreePageSize)
 
 	if err := idx.pageStore.readRaw(offset, buf); err != nil {
@@ -1183,7 +1645,11 @@ func (idx *BTreeIndex) readOverflowPage(pageNum uint32) (*OverflowPage, error) {
 
 // writeOverflowPage writes an overflow page to disk
 func (idx *BTreeIndex) writeOverflowPage(pageNum uint32, overflow *OverflowPage) error {
-	buf := make([]byte, BTreePageSize)
+	buf := getBTreePageBuffer()
+	defer putBTreePageBuffer(buf)
+	for i := range buf {
+		buf[i] = 0
+	}
 
 	binary.LittleEndian.PutUint32(buf[0:4], overflow.NextPage)
 	binary.LittleEndian.PutUint16(buf[4:6], overflow.ValueCount)

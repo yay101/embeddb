@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -29,6 +30,7 @@ const (
 )
 
 var regionCatalogMu sync.Mutex
+var regionCatalogGeneration atomic.Uint64
 
 type regionCatalogFooter struct {
 	start    uint64
@@ -59,6 +61,7 @@ type regionBackedBTreePageStore struct {
 	base     uint64
 	capacity uint64
 	fileName string
+	seenGen  uint64
 }
 
 func shouldUseRegionStore(tableName, fieldName string) bool {
@@ -108,41 +111,35 @@ func newRegionBackedBTreePageStore(dbFileName, tableName, fieldName string) (*re
 		file.Close()
 		return nil, false, err
 	}
+	atomic.StoreUint64(&store.seenGen, regionCatalogGeneration.Load())
 
 	return store, exists, nil
 }
 
 func (s *regionBackedBTreePageStore) readRaw(offset int64, buf []byte) error {
-	regionCatalogMu.Lock()
-	defer regionCatalogMu.Unlock()
-
-	if err := s.refreshLocationLocked(); err != nil {
+	if err := s.ensureFreshLocation(); err != nil {
 		return err
 	}
-
-	_, err := s.file.ReadAt(buf, int64(s.base)+offset)
+	base := atomic.LoadUint64(&s.base)
+	_, err := s.file.ReadAt(buf, int64(base)+offset)
 	return err
 }
 
 func (s *regionBackedBTreePageStore) writeRaw(offset int64, data []byte) error {
-	regionCatalogMu.Lock()
-	defer regionCatalogMu.Unlock()
-
-	if err := s.refreshLocationLocked(); err != nil {
+	if err := s.ensureFreshLocation(); err != nil {
 		return err
 	}
-
-	_, err := s.file.WriteAt(data, int64(s.base)+offset)
+	base := atomic.LoadUint64(&s.base)
+	_, err := s.file.WriteAt(data, int64(base)+offset)
 	return err
 }
 
-func (s *regionBackedBTreePageStore) readPage(pageNum uint32) ([]byte, error) {
-	buf := make([]byte, BTreePageSize)
-	offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
-	if err := s.readRaw(offset, buf); err != nil {
-		return nil, err
+func (s *regionBackedBTreePageStore) readPageInto(pageNum uint32, buf []byte) error {
+	if len(buf) < BTreePageSize {
+		return fmt.Errorf("page buffer too small: %d", len(buf))
 	}
-	return buf, nil
+	offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
+	return s.readRaw(offset, buf[:BTreePageSize])
 }
 
 func (s *regionBackedBTreePageStore) writePage(pageNum uint32, data []byte) error {
@@ -155,6 +152,9 @@ func (s *regionBackedBTreePageStore) writePage(pageNum uint32, data []byte) erro
 
 func (s *regionBackedBTreePageStore) ensurePageCapacity(pageCount uint32) error {
 	required := uint64(BTreeHeaderLen + (pageCount * BTreePageSize))
+	if atomic.LoadUint64(&s.base) != 0 && required <= atomic.LoadUint64(&s.capacity) {
+		return nil
+	}
 
 	regionCatalogMu.Lock()
 	defer regionCatalogMu.Unlock()
@@ -162,11 +162,18 @@ func (s *regionBackedBTreePageStore) ensurePageCapacity(pageCount uint32) error 
 	if err := s.refreshLocationLocked(); err != nil {
 		return err
 	}
-	if required <= s.capacity {
+	if required <= atomic.LoadUint64(&s.capacity) {
 		return nil
 	}
 
-	return growRegionCatalogEntry(s.file, s.keyHash, required)
+	if err := growRegionCatalogEntry(s.file, s.keyHash, required); err != nil {
+		return err
+	}
+	if err := s.refreshLocationLocked(); err != nil {
+		return err
+	}
+	atomic.StoreUint64(&s.seenGen, regionCatalogGeneration.Load())
+	return nil
 }
 
 func (s *regionBackedBTreePageStore) sync() error {
@@ -205,8 +212,24 @@ func (s *regionBackedBTreePageStore) refreshLocationLocked() error {
 	}
 
 	_ = entryIdx
-	s.base = footer.start + entry.offset
-	s.capacity = entry.capacity
+	atomic.StoreUint64(&s.base, footer.start+entry.offset)
+	atomic.StoreUint64(&s.capacity, entry.capacity)
+	return nil
+}
+
+func (s *regionBackedBTreePageStore) ensureFreshLocation() error {
+	gen := regionCatalogGeneration.Load()
+	if atomic.LoadUint64(&s.base) != 0 && atomic.LoadUint64(&s.seenGen) == gen {
+		return nil
+	}
+
+	regionCatalogMu.Lock()
+	defer regionCatalogMu.Unlock()
+
+	if err := s.refreshLocationLocked(); err != nil {
+		return err
+	}
+	atomic.StoreUint64(&s.seenGen, regionCatalogGeneration.Load())
 	return nil
 }
 
@@ -485,27 +508,35 @@ func growRegionCatalog(file *os.File, minCapacity uint64, minStart int64) error 
 	return writeRegionCatalogFooter(file, footer)
 }
 
-func ensureRegionIndexBlobAfter(file *os.File, minEnd int64) error {
+func ensureRegionIndexBlobAfter(file *os.File, minEnd int64) (int64, error) {
 	regionCatalogMu.Lock()
 	defer regionCatalogMu.Unlock()
 
 	footer, hasFooter, err := readRegionCatalogFooter(file)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !hasFooter {
-		return nil
+		return 0, nil
 	}
 
 	if int64(footer.start) >= minEnd {
-		return nil
+		return int64(footer.start), nil
 	}
 
 	if err := growRegionCatalog(file, footer.capacity, minEnd); err != nil {
-		return err
+		return 0, err
 	}
 
-	return nil
+	footer, hasFooter, err = readRegionCatalogFooter(file)
+	if err != nil {
+		return 0, err
+	}
+	if !hasFooter {
+		return 0, nil
+	}
+
+	return int64(footer.start), nil
 }
 
 func readRegionCatalogFooter(file *os.File) (regionCatalogFooter, bool, error) {
@@ -558,8 +589,11 @@ func writeRegionCatalogFooter(file *os.File, footer regionCatalogFooter) error {
 	binary.LittleEndian.PutUint64(buf[8:16], footer.start)
 	binary.LittleEndian.PutUint64(buf[16:24], footer.capacity)
 	binary.LittleEndian.PutUint64(buf[24:32], footer.used)
-	_, err := file.WriteAt(buf, int64(footer.start+footer.capacity))
-	return err
+	if _, err := file.WriteAt(buf, int64(footer.start+footer.capacity)); err != nil {
+		return err
+	}
+	regionCatalogGeneration.Add(1)
+	return nil
 }
 
 func decodeRegionCatalogFooter(buf []byte) (regionCatalogFooter, bool) {

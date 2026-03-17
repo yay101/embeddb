@@ -11,8 +11,50 @@ import (
 // IMPORTANT: Caller must hold db.lock before calling this method.
 func (db *Database[T]) writeData(data []byte, offset int64) error {
 	end := offset + int64(len(data))
-	if err := ensureRegionIndexBlobAfter(db.file, end); err != nil {
-		return fmt.Errorf("failed to move embedded region index blob: %w", err)
+	if db.regionStartHint == 0 && db.header.secondaryIndexRegionStart > 0 {
+		db.regionStartHint = int64(db.header.secondaryIndexRegionStart)
+		if db.regionStartHint > regionOverlapGuardBytes {
+			db.regionSafeUntil = db.regionStartHint - regionOverlapGuardBytes
+		}
+	}
+
+	if db.regionSafeUntil > 0 && end < db.regionSafeUntil {
+		_, err := db.file.WriteAt(data, offset)
+		return err
+	}
+
+	needsOverlapCheck := false
+	if db.regionStartHint == 0 {
+		needsOverlapCheck = true
+	} else if end+regionOverlapGuardBytes >= db.regionStartHint {
+		needsOverlapCheck = true
+	} else {
+		db.regionCheckCounter++
+		if db.regionCheckCounter%regionOverlapCheckEvery == 0 {
+			needsOverlapCheck = true
+		} else {
+			if db.regionStartHint > regionOverlapGuardBytes {
+				db.regionSafeUntil = db.regionStartHint - regionOverlapGuardBytes
+			} else {
+				db.regionSafeUntil = 0
+			}
+		}
+	}
+
+	if needsOverlapCheck {
+		regionStart, err := ensureRegionIndexBlobAfter(db.file, end)
+		if err != nil {
+			return fmt.Errorf("failed to move embedded region index blob: %w", err)
+		}
+		if regionStart > 0 {
+			db.regionStartHint = regionStart
+			if regionStart > regionOverlapGuardBytes {
+				db.regionSafeUntil = regionStart - regionOverlapGuardBytes
+			} else {
+				db.regionSafeUntil = 0
+			}
+		}
+		db.regionCheckCounter = 0
 	}
 	_, err := db.file.WriteAt(data, offset)
 	return err

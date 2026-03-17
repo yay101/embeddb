@@ -3,7 +3,7 @@ package embeddb
 import "fmt"
 
 type btreePageStore interface {
-	readPage(pageNum uint32) ([]byte, error)
+	readPageInto(pageNum uint32, buf []byte) error
 	writePage(pageNum uint32, data []byte) error
 	readRaw(offset int64, buf []byte) error
 	writeRaw(offset int64, data []byte) error
@@ -41,13 +41,12 @@ func (s *fileBackedBTreePageStore) writeRaw(offset int64, data []byte) error {
 	return err
 }
 
-func (s *fileBackedBTreePageStore) readPage(pageNum uint32) ([]byte, error) {
-	buf := make([]byte, BTreePageSize)
-	offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
-	if err := s.readRaw(offset, buf); err != nil {
-		return nil, err
+func (s *fileBackedBTreePageStore) readPageInto(pageNum uint32, buf []byte) error {
+	if len(buf) < BTreePageSize {
+		return fmt.Errorf("page buffer too small: %d", len(buf))
 	}
-	return buf, nil
+	offset := int64(BTreeHeaderLen + (pageNum * BTreePageSize))
+	return s.readRaw(offset, buf[:BTreePageSize])
 }
 
 func (s *fileBackedBTreePageStore) writePage(pageNum uint32, data []byte) error {

@@ -375,3 +375,42 @@ func BenchmarkQueryInt(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkQueryRangeInt benchmarks int range query performance.
+func BenchmarkQueryRangeInt(b *testing.B) {
+	rand.Seed(42)
+
+	dbPath := "bench_query_range_int.db"
+	os.Remove(dbPath)
+	defer func() {
+		os.Remove(dbPath)
+		files, _ := os.ReadDir(".")
+		for _, f := range files {
+			if len(f.Name()) > len(dbPath) && f.Name()[:len(dbPath)] == dbPath {
+				os.Remove(f.Name())
+			}
+		}
+	}()
+
+	db, err := New[BenchmarkRecord](dbPath, false, true)
+	if err != nil {
+		b.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 10000; i++ {
+		record := generateRecord(i)
+		_, err := db.Insert(record)
+		if err != nil {
+			b.Fatalf("Failed to insert: %v", err)
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryRangeBetween("Age", 25, 40, true, true)
+		if err != nil {
+			b.Fatalf("Failed to range query: %v", err)
+		}
+	}
+}

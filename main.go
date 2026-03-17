@@ -44,6 +44,9 @@ type Database[T any] struct {
 	tableDroppedSinceVacuum bool
 	lastVacuumTime          time.Time
 	vacuumStateLock         sync.Mutex
+	regionStartHint         int64
+	regionSafeUntil         int64
+	regionCheckCounter      uint64
 }
 
 type DBHeader struct {
@@ -81,6 +84,8 @@ const (
 	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
 	autoVacuumInterval                     = 24 * time.Hour
 	autoVacuumMinChanges      uint64       = 50000
+	regionOverlapCheckEvery   uint64       = 1024
+	regionOverlapGuardBytes   int64        = 64 * 1024
 )
 
 // Table returns a typed Table[T] for accessing records.
@@ -402,16 +407,53 @@ func (db *Database[T]) Query(fieldName string, value interface{}) ([]T, error) {
 		return nil, err
 	}
 
-	// Fetch the actual records
+	return db.collectRecordsByIDs(recordIDs), nil
+}
+
+func (db *Database[T]) resolveQueryTableIDLocked() uint8 {
+	tableID := uint8(0)
+	if db.tableCatalog != nil && db.defaultTable != "" {
+		if tid, ok := db.tableCatalog.GetTableID(db.defaultTable); ok {
+			tableID = tid
+		}
+	}
+	return tableID
+}
+
+func (db *Database[T]) collectRecordsByIDs(recordIDs []uint32) []T {
+	if len(recordIDs) == 0 {
+		return []T{}
+	}
+
 	results := make([]T, 0, len(recordIDs))
+	var scratch []byte
+
+	db.lock.RLock()
+	tableID := db.resolveQueryTableIDLocked()
 	for _, id := range recordIDs {
-		record, err := db.Get(id)
+		offset, exists := db.getRecordOffset(tableID, id)
+		if !exists {
+			continue
+		}
+
+		recordBytes, err := db.readRecordBytesAtInto(offset, tableID, scratch)
+		if err != nil {
+			continue
+		}
+		scratch = recordBytes[:0]
+
+		if !isActiveRecord(recordBytes) {
+			continue
+		}
+
+		record, err := db.decodeRecord(recordBytes)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
 	}
+	db.lock.RUnlock()
 
-	return results, nil
+	return results
 }
 
 // QueryRangeGreaterThan finds all records where field > value (or >= if inclusive)

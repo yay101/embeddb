@@ -179,6 +179,12 @@ func (db *Database[T]) readRecordBytes(offset uint32) ([]byte, error) {
 
 // readRecordBytesAt reads the raw bytes of a record at the given offset with optional tableID
 func (db *Database[T]) readRecordBytesAt(offset uint32, expectedTableID uint8) ([]byte, error) {
+	return db.readRecordBytesAtInto(offset, expectedTableID, nil)
+}
+
+// readRecordBytesAtInto reads the raw bytes of a record into a reusable buffer.
+// If buf has enough capacity, it is reused to reduce allocations.
+func (db *Database[T]) readRecordBytesAtInto(offset uint32, expectedTableID uint8, buf []byte) ([]byte, error) {
 	db.mlock.Lock()
 	if err := db.ensureMmapSizeLocked(); err != nil {
 		db.mlock.Unlock()
@@ -193,21 +199,26 @@ func (db *Database[T]) readRecordBytesAt(offset uint32, expectedTableID uint8) (
 	// Read the length bytes (4 bytes at offset+7 for new format)
 	// We check the format by looking at the first byte after markers
 	lengthOffset := int64(offset + 7) // new format: offset+2(tableID) + offset+3-6(id) = offset+7 for length
-	lengthBytes := make([]byte, 4)
-	_, err := db.mfile.ReadAt(lengthBytes, lengthOffset)
+	var lengthBytes [4]byte
+	_, err := db.mfile.ReadAt(lengthBytes[:], lengthOffset)
 	if err != nil {
 		return nil, err
 	}
 
 	// Parse the record length
-	recordLength := binary.BigEndian.Uint32(lengthBytes)
+	recordLength := binary.BigEndian.Uint32(lengthBytes[:])
 
 	// Read the entire record including the header and markers
 	// Header is 12 bytes: [escCode,startMarker](2) + tableID(1) + id(4) + length(4) + active(1)
 	// The footer is 2 bytes: [escCode,endMarker]
 	totalLength := 12 + recordLength + 2
 
-	recordBytes := make([]byte, totalLength)
+	if cap(buf) < int(totalLength) {
+		buf = make([]byte, totalLength)
+	} else {
+		buf = buf[:totalLength]
+	}
+	recordBytes := buf
 	_, err = db.mfile.ReadAt(recordBytes, int64(offset))
 	if err != nil {
 		return nil, err

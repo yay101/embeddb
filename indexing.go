@@ -591,14 +591,7 @@ func (im *IndexManager[T]) QueryRangeGreaterThan(fieldName string, value interfa
 		return nil, err
 	}
 
-	results := make([]T, 0, len(recordIDs))
-	for _, id := range recordIDs {
-		record, err := im.db.Get(id)
-		if err == nil && record != nil {
-			results = append(results, *record)
-		}
-	}
-	return results, nil
+	return im.collectRecordsByID(recordIDs), nil
 }
 
 // QueryRangeLessThan finds records where field < value (or <= if inclusive)
@@ -620,14 +613,7 @@ func (im *IndexManager[T]) QueryRangeLessThan(fieldName string, value interface{
 		return nil, err
 	}
 
-	results := make([]T, 0, len(recordIDs))
-	for _, id := range recordIDs {
-		record, err := im.db.Get(id)
-		if err == nil && record != nil {
-			results = append(results, *record)
-		}
-	}
-	return results, nil
+	return im.collectRecordsByID(recordIDs), nil
 }
 
 // QueryRangeBetween finds records where min <= field <= max
@@ -649,14 +635,7 @@ func (im *IndexManager[T]) QueryRangeBetween(fieldName string, min, max interfac
 		return nil, err
 	}
 
-	results := make([]T, 0, len(recordIDs))
-	for _, id := range recordIDs {
-		record, err := im.db.Get(id)
-		if err == nil && record != nil {
-			results = append(results, *record)
-		}
-	}
-	return results, nil
+	return im.collectRecordsByID(recordIDs), nil
 }
 
 // Close closes all indexes
@@ -814,13 +793,7 @@ func (im *IndexManager[T]) QueryPaged(fieldName string, value interface{}, offse
 
 	pagedIDs := allIDs[offset:end]
 
-	results := make([]T, 0, len(pagedIDs))
-	for _, id := range pagedIDs {
-		record, err := im.db.Get(id)
-		if err == nil && record != nil {
-			results = append(results, *record)
-		}
-	}
+	results := im.collectRecordsByID(pagedIDs)
 
 	return &PagedResult[T]{
 		Records:    results,
@@ -868,13 +841,7 @@ func (im *IndexManager[T]) QueryRangeGreaterThanPaged(fieldName string, value in
 
 	pagedIDs := allIDs[offset:end]
 
-	results := make([]T, 0, len(pagedIDs))
-	for _, id := range pagedIDs {
-		record, err := im.db.Get(id)
-		if err == nil && record != nil {
-			results = append(results, *record)
-		}
-	}
+	results := im.collectRecordsByID(pagedIDs)
 
 	return &PagedResult[T]{
 		Records:    results,
@@ -922,13 +889,7 @@ func (im *IndexManager[T]) QueryRangeLessThanPaged(fieldName string, value inter
 
 	pagedIDs := allIDs[offset:end]
 
-	results := make([]T, 0, len(pagedIDs))
-	for _, id := range pagedIDs {
-		record, err := im.db.Get(id)
-		if err == nil && record != nil {
-			results = append(results, *record)
-		}
-	}
+	results := im.collectRecordsByID(pagedIDs)
 
 	return &PagedResult[T]{
 		Records:    results,
@@ -976,13 +937,7 @@ func (im *IndexManager[T]) QueryRangeBetweenPaged(fieldName string, min, max int
 
 	pagedIDs := allIDs[offset:end]
 
-	results := make([]T, 0, len(pagedIDs))
-	for _, id := range pagedIDs {
-		record, err := im.db.Get(id)
-		if err == nil && record != nil {
-			results = append(results, *record)
-		}
-	}
+	results := im.collectRecordsByID(pagedIDs)
 
 	return &PagedResult[T]{
 		Records:    results,
@@ -991,4 +946,8 @@ func (im *IndexManager[T]) QueryRangeBetweenPaged(fieldName string, min, max int
 		Offset:     offset,
 		Limit:      limit,
 	}, nil
+}
+
+func (im *IndexManager[T]) collectRecordsByID(recordIDs []uint32) []T {
+	return im.db.collectRecordsByIDs(recordIDs)
 }
