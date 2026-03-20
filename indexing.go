@@ -1,7 +1,6 @@
 package embeddb
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,6 +28,7 @@ type IndexManager[T any] struct {
 	tableName      string                 // Table name for multi-table support
 	indexes        map[string]*BTreeIndex // Map of field name to index
 	layout         *StructLayout          // Struct layout for fast field access
+	fieldDir       string                 // Hidden directory for per-field index files
 	lock           sync.RWMutex           // Lock for concurrent access
 	pendingIndexes map[string]struct{}    // Set of indexes that need to be rebuilt
 }
@@ -38,22 +38,106 @@ type IndexManager[T any] struct {
 //
 // Deprecated: internal use only. This function will be made private in a future release.
 func NewIndexManager[T any](db *Database[T], layout *StructLayout, tableName string) *IndexManager[T] {
+	dbDir := filepath.Dir(db.file.Name())
+	dbBase := filepath.Base(db.file.Name())
+	fieldDir := filepath.Join(dbDir, ".embeddb-indexes", dbBase)
+	if tableName != "" {
+		fieldDir = filepath.Join(fieldDir, tableName)
+	}
+
 	return &IndexManager[T]{
 		db:             db,
 		tableName:      tableName,
 		indexes:        make(map[string]*BTreeIndex),
 		layout:         layout,
+		fieldDir:       fieldDir,
 		pendingIndexes: make(map[string]struct{}),
 	}
 }
 
-// CreateIndex creates a new index for a specific field
+// ensureFieldDir creates the hidden index directory if it doesn't exist.
+func (im *IndexManager[T]) ensureFieldDir() error {
+	if im.fieldDir == "" {
+		return fmt.Errorf("field index cache path not configured")
+	}
+	return os.MkdirAll(im.fieldDir, 0o755)
+}
+
+// fieldIndexFilePath returns the hidden-directory path for a per-field index file.
+func (im *IndexManager[T]) fieldIndexFilePath(fieldName string) string {
+	sanitized := strings.ReplaceAll(fieldName, string(os.PathSeparator), "_")
+	return filepath.Join(im.fieldDir, sanitized+".idx")
+}
+
+// tableID resolves the primary-index table ID this manager belongs to.
+func (im *IndexManager[T]) tableID() (uint8, bool) {
+	if im.tableName == "" {
+		if im.db.tableCatalog != nil && im.db.defaultTable != "" {
+			if tid, ok := im.db.tableCatalog.GetTableID(im.db.defaultTable); ok {
+				return tid, true
+			}
+		}
+		return 0, true // legacy single-table
+	}
+	if im.db.tableCatalog == nil {
+		return 0, false
+	}
+	tid, ok := im.db.tableCatalog.GetTableID(im.tableName)
+	return tid, ok
+}
+
+// getRecordIDs returns all record IDs for this manager's table.
+func (im *IndexManager[T]) getRecordIDs() []uint32 {
+	if tid, ok := im.tableID(); ok {
+		im.db.lock.RLock()
+		defer im.db.lock.RUnlock()
+		idx := im.db.indexes[tid]
+		if idx == nil {
+			return nil
+		}
+		ids := make([]uint32, 0, len(idx))
+		for id := range idx {
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	// fallback: first table
+	im.db.lock.RLock()
+	defer im.db.lock.RUnlock()
+	for _, idx := range im.db.indexes {
+		ids := make([]uint32, 0, len(idx))
+		for id := range idx {
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	return nil
+}
+
+// getRecord loads a single record for this manager's table.
+func (im *IndexManager[T]) getRecord(id uint32) (*T, error) {
+	if tid, ok := im.tableID(); ok {
+		im.db.lock.RLock()
+		defer im.db.lock.RUnlock()
+		return im.db.getLockedForTable(id, tid)
+	}
+	return im.db.Get(id)
+}
+
+// CreateIndex creates a new index for a specific field.
+// The index file is placed in a hidden directory alongside the database file.
+// After creation the index is immediately populated from existing records.
 func (im *IndexManager[T]) CreateIndex(fieldName string) error {
 	im.lock.Lock()
-	defer im.lock.Unlock()
+
+	if err := im.ensureFieldDir(); err != nil {
+		im.lock.Unlock()
+		return fmt.Errorf("failed to create index directory: %w", err)
+	}
 
 	// Check if the index already exists
 	if _, exists := im.indexes[fieldName]; exists {
+		im.lock.Unlock()
 		return nil // Index already exists
 	}
 
@@ -70,6 +154,7 @@ func (im *IndexManager[T]) CreateIndex(fieldName string) error {
 	}
 
 	if !fieldFound {
+		im.lock.Unlock()
 		return fmt.Errorf("field '%s' not found in struct", fieldName)
 	}
 
@@ -78,17 +163,27 @@ func (im *IndexManager[T]) CreateIndex(fieldName string) error {
 		indexFieldType = fieldOffset.SliceElem.Kind()
 	}
 
-	// Create the B-tree index
-	index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime)
+	// Create the B-tree index in the hidden directory
+	indexPath := im.fieldIndexFilePath(fieldName)
+	index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime, indexPath)
 	if err != nil {
+		im.lock.Unlock()
 		return fmt.Errorf("failed to create index for field '%s': %w", fieldName, err)
 	}
 
 	// Store the index
 	im.indexes[fieldName] = index
-
-	// Add to pending indexes to be built
 	im.pendingIndexes[fieldName] = struct{}{}
+	im.lock.Unlock()
+
+	// Build the index from existing records so it is usable immediately.
+	if err := im.BuildIndex(fieldName); err != nil {
+		return fmt.Errorf("failed to build index for field '%s': %w", fieldName, err)
+	}
+
+	im.lock.Lock()
+	delete(im.pendingIndexes, fieldName)
+	im.lock.Unlock()
 
 	return nil
 }
@@ -109,11 +204,8 @@ func (im *IndexManager[T]) DropIndex(fieldName string) error {
 		return fmt.Errorf("failed to close index for field '%s': %w", fieldName, err)
 	}
 
-	// Remove the index file
-	indexFilePath := filepath.Join(
-		filepath.Dir(im.db.file.Name()),
-		fmt.Sprintf("%s.%s.idx", filepath.Base(im.db.file.Name()), fieldName),
-	)
+	// Remove the index file from the hidden directory
+	indexFilePath := im.fieldIndexFilePath(fieldName)
 	if err := os.Remove(indexFilePath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove index file for field '%s': %w", fieldName, err)
 	}
@@ -127,7 +219,8 @@ func (im *IndexManager[T]) DropIndex(fieldName string) error {
 	return nil
 }
 
-// BuildPendingIndexes builds all pending indexes by scanning the database
+// BuildPendingIndexes creates and populates any indexes that were marked as
+// pending (e.g. because their files were missing or corrupt on load).
 func (im *IndexManager[T]) BuildPendingIndexes() error {
 	im.lock.Lock()
 	pendingList := make([]string, 0, len(im.pendingIndexes))
@@ -136,10 +229,24 @@ func (im *IndexManager[T]) BuildPendingIndexes() error {
 	}
 	im.lock.Unlock()
 
-	// Build each pending index
 	for _, fieldName := range pendingList {
-		if err := im.BuildIndex(fieldName); err != nil {
-			return err
+		// If the index is already loaded, just rebuild its data.
+		im.lock.RLock()
+		_, loaded := im.indexes[fieldName]
+		im.lock.RUnlock()
+
+		if loaded {
+			if err := im.BuildIndex(fieldName); err != nil {
+				return err
+			}
+			im.lock.Lock()
+			delete(im.pendingIndexes, fieldName)
+			im.lock.Unlock()
+		} else {
+			// CreateIndex creates, stores, builds, and clears the pending flag.
+			if err := im.CreateIndex(fieldName); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -172,16 +279,8 @@ func (im *IndexManager[T]) BuildIndex(fieldName string) error {
 	}
 	im.lock.Unlock()
 
-	// Get all record IDs from the database (first table with data)
-	im.db.lock.RLock()
-	var recordIDs []uint32
-	for _, idx := range im.db.indexes {
-		for id := range idx {
-			recordIDs = append(recordIDs, id)
-		}
-		break // Just get first table for now
-	}
-	im.db.lock.RUnlock()
+	// Get all record IDs for this manager's table.
+	recordIDs := im.getRecordIDs()
 
 	// Process records in batches
 	batchSize := 1000
@@ -194,7 +293,7 @@ func (im *IndexManager[T]) BuildIndex(fieldName string) error {
 		batch := recordIDs[i:end]
 		for _, id := range batch {
 			// Get the record
-			record, err := im.db.Get(id)
+			record, err := im.getRecord(id)
 			if err != nil || record == nil {
 				continue // Skip problematic records
 			}
@@ -605,7 +704,7 @@ func (im *IndexManager[T]) QueryRangeGreaterThan(fieldName string, value interfa
 
 	results := make([]T, 0, len(recordIDs))
 	for _, id := range recordIDs {
-		record, err := im.db.Get(id)
+		record, err := im.getRecord(id)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
@@ -634,7 +733,7 @@ func (im *IndexManager[T]) QueryRangeLessThan(fieldName string, value interface{
 
 	results := make([]T, 0, len(recordIDs))
 	for _, id := range recordIDs {
-		record, err := im.db.Get(id)
+		record, err := im.getRecord(id)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
@@ -663,7 +762,7 @@ func (im *IndexManager[T]) QueryRangeBetween(fieldName string, min, max interfac
 
 	results := make([]T, 0, len(recordIDs))
 	for _, id := range recordIDs {
-		record, err := im.db.Get(id)
+		record, err := im.getRecord(id)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
@@ -671,26 +770,20 @@ func (im *IndexManager[T]) QueryRangeBetween(fieldName string, min, max interfac
 	return results, nil
 }
 
-// Close closes all indexes
+// Close flushes and closes all indexes.  The per-field files remain in the
+// hidden directory so they can be reloaded on the next open.
 func (im *IndexManager[T]) Close() error {
 	im.lock.Lock()
 	defer im.lock.Unlock()
 
-	// First flush all indexes
+	// Flush all indexes so data is on disk.
 	for _, index := range im.indexes {
 		if err := index.Flush(); err != nil {
 			return fmt.Errorf("failed to flush index: %w", err)
 		}
 	}
 
-	// Then merge them with the database file
-	for fieldName, index := range im.indexes {
-		if err := index.mergeWithDatabase(); err != nil {
-			return fmt.Errorf("failed to merge index '%s' with database: %w", fieldName, err)
-		}
-	}
-
-	// Finally close all index files
+	// Close the underlying index files (they stay in the hidden directory).
 	for _, index := range im.indexes {
 		if err := index.Close(); err != nil {
 			return fmt.Errorf("failed to close index: %w", err)
@@ -739,56 +832,33 @@ func (im *IndexManager[T]) RebuildAll() error {
 	return nil
 }
 
-// CheckIndexes checks if all indexes exist and creates any missing ones
+// CheckIndexes discovers per-field index files in the hidden directory and
+// loads them.  Any file that fails to load is marked for rebuild so the
+// index will be regenerated from DB records.
 func (im *IndexManager[T]) CheckIndexes() error {
 	im.lock.Lock()
 	defer im.lock.Unlock()
 
-	// Get the base name of the database file
-	dbBaseName := filepath.Base(im.db.file.Name())
-	dirPath := filepath.Dir(im.db.file.Name())
+	// Ensure the hidden directory exists (it may not on a fresh DB).
+	if err := im.ensureFieldDir(); err != nil {
+		return fmt.Errorf("failed to prepare index directory: %w", err)
+	}
 
-	// Try to find all index files
-	entries, err := os.ReadDir(dirPath)
+	entries, err := os.ReadDir(im.fieldDir)
 	if err != nil {
-		return fmt.Errorf("failed to read directory: %w", err)
+		return fmt.Errorf("failed to read index directory: %w", err)
 	}
 
 	suffix := ".idx"
-
-	// Determine prefixes to check
-	// New format: <dbname>.<tableName>.<fieldname>.idx (with table)
-	// Legacy format: <dbname>.<fieldname>.idx (without table - backwards compat)
-	var prefixes []string
-	if im.tableName != "" {
-		prefixes = []string{dbBaseName + "." + im.tableName + ".", dbBaseName + "."}
-	} else {
-		prefixes = []string{dbBaseName + "."}
-	}
 
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
 			continue
 		}
 
-		var fieldName string
-		var prefixMatched bool
+		fieldName := strings.TrimSuffix(entry.Name(), suffix)
 
-		// Try each prefix
-		for _, prefix := range prefixes {
-			if strings.HasPrefix(entry.Name(), prefix) {
-				fieldName = strings.TrimPrefix(entry.Name(), prefix)
-				fieldName = strings.TrimSuffix(fieldName, suffix)
-				prefixMatched = true
-				break
-			}
-		}
-
-		if !prefixMatched {
-			continue
-		}
-
-		// Check if we already have this index
+		// Already loaded?
 		if _, exists := im.indexes[fieldName]; exists {
 			continue
 		}
@@ -805,7 +875,7 @@ func (im *IndexManager[T]) CheckIndexes() error {
 		}
 
 		if !fieldFound {
-			continue
+			continue // stale file for a field that no longer exists
 		}
 
 		indexFieldType := fieldOffset.Type
@@ -813,77 +883,24 @@ func (im *IndexManager[T]) CheckIndexes() error {
 			indexFieldType = fieldOffset.SliceElem.Kind()
 		}
 
-		// Try to load the index
-		index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime)
+		indexPath := im.fieldIndexFilePath(fieldName)
+		index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, fieldOffset.Offset, indexFieldType, fieldOffset.IsTime, indexPath)
 		if err != nil {
-			// If we fail to load, mark it for rebuild
+			// Mark for rebuild from DB records
 			im.pendingIndexes[fieldName] = struct{}{}
-		} else {
-			im.indexes[fieldName] = index
+			continue
 		}
+		im.indexes[fieldName] = index
 	}
 
 	return nil
 }
 
-// ExtractIndexesFromDatabase extracts indexes embedded in the database file
+// ExtractIndexesFromDatabase is a no-op kept for API compatibility.
+// Index data is no longer embedded in the database file.
+//
+// Deprecated: this method does nothing and will be removed.
 func (im *IndexManager[T]) ExtractIndexesFromDatabase() error {
-	// Get database file size
-	dbInfo, err := im.db.file.Stat()
-	if err != nil {
-		return err
-	}
-
-	if dbInfo.Size() < 8 {
-		return nil // File too small to have embedded indexes
-	}
-
-	// Read the last 8 bytes to check if there's an index marker
-	marker := make([]byte, 8)
-	if _, err := im.db.file.ReadAt(marker, dbInfo.Size()-8); err != nil {
-		return fmt.Errorf("failed to read index marker: %w", err)
-	}
-
-	// Check if marker looks valid
-	indexLoc := binary.LittleEndian.Uint64(marker)
-	if indexLoc >= uint64(dbInfo.Size())-8 {
-		return nil // Invalid marker
-	}
-
-	// Read index metadata to find all embedded indexes
-	// This would need to parse the index data at the specified location
-	// to identify all the indexes embedded in the file
-
-	// Simplified approach: try to extract any index that might be there
-	dirPath := filepath.Dir(im.db.file.Name())
-	dbBaseName := filepath.Base(im.db.file.Name())
-
-	// For each field in the layout, check if there's an index
-	for _, offset := range im.layout.FieldOffsets {
-		fieldName := offset.Name
-		indexFileName := filepath.Join(dirPath, fmt.Sprintf("%s.%s.idx", dbBaseName, fieldName))
-
-		// Try to extract the index
-		if err := ExtractIndexFromDatabase(im.db.file.Name(), indexFileName); err != nil {
-			// Just log and continue - this field might not have an index
-			continue
-		}
-
-		indexFieldType := offset.Type
-		if offset.IsSlice && offset.SliceElem != nil {
-			indexFieldType = offset.SliceElem.Kind()
-		}
-
-		// Try to load the extracted index
-		index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, fieldName, offset.Offset, indexFieldType, offset.IsTime)
-		if err != nil {
-			// If we fail to load, mark it for rebuild
-			im.pendingIndexes[fieldName] = struct{}{}
-		} else {
-			im.indexes[fieldName] = index
-		}
-	}
-
 	return nil
 }
 
@@ -947,7 +964,7 @@ func (im *IndexManager[T]) QueryPaged(fieldName string, value interface{}, offse
 
 	results := make([]T, 0, len(pagedIDs))
 	for _, id := range pagedIDs {
-		record, err := im.db.Get(id)
+		record, err := im.getRecord(id)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
@@ -1001,7 +1018,7 @@ func (im *IndexManager[T]) QueryRangeGreaterThanPaged(fieldName string, value in
 
 	results := make([]T, 0, len(pagedIDs))
 	for _, id := range pagedIDs {
-		record, err := im.db.Get(id)
+		record, err := im.getRecord(id)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
@@ -1055,7 +1072,7 @@ func (im *IndexManager[T]) QueryRangeLessThanPaged(fieldName string, value inter
 
 	results := make([]T, 0, len(pagedIDs))
 	for _, id := range pagedIDs {
-		record, err := im.db.Get(id)
+		record, err := im.getRecord(id)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
@@ -1109,7 +1126,7 @@ func (im *IndexManager[T]) QueryRangeBetweenPaged(fieldName string, min, max int
 
 	results := make([]T, 0, len(pagedIDs))
 	for _, id := range pagedIDs {
-		record, err := im.db.Get(id)
+		record, err := im.getRecord(id)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}

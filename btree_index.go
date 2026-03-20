@@ -149,14 +149,20 @@ type pendingWrite struct {
 // NewBTreeIndex creates a new B-tree index for the specified field.
 //
 // Deprecated: internal use only. This function will be made private in a future release.
-func NewBTreeIndex(dbFileName, tableName, fieldName string, fieldOffset uintptr, fieldType reflect.Kind, isTimeField bool) (*BTreeIndex, error) {
-	// Create the index file in the same directory as the database file
-	dbDir := filepath.Dir(dbFileName)
+func NewBTreeIndex(dbFileName, tableName, fieldName string, fieldOffset uintptr, fieldType reflect.Kind, isTimeField bool, indexFilePath string) (*BTreeIndex, error) {
+	// Determine index file location.  When an explicit path is supplied (hidden
+	// directory strategy) use it directly; otherwise fall back to the legacy
+	// naming convention next to the DB file.
 	var indexFileName string
-	if tableName != "" {
-		indexFileName = filepath.Join(dbDir, fmt.Sprintf("%s.%s.%s.idx", filepath.Base(dbFileName), tableName, fieldName))
+	if indexFilePath != "" {
+		indexFileName = indexFilePath
 	} else {
-		indexFileName = filepath.Join(dbDir, fmt.Sprintf("%s.%s.idx", filepath.Base(dbFileName), fieldName))
+		dbDir := filepath.Dir(dbFileName)
+		if tableName != "" {
+			indexFileName = filepath.Join(dbDir, fmt.Sprintf("%s.%s.%s.idx", filepath.Base(dbFileName), tableName, fieldName))
+		} else {
+			indexFileName = filepath.Join(dbDir, fmt.Sprintf("%s.%s.idx", filepath.Base(dbFileName), fieldName))
+		}
 	}
 
 	idx := &BTreeIndex{
@@ -2201,97 +2207,18 @@ func (idx *BTreeIndex) rebuildIndex(dbFileName string, fieldName string, fieldOf
 	return nil
 }
 
-// mergeWithDatabase copies the index into the database file for portability
+// mergeWithDatabase is a no-op kept for API compatibility.
+// Index data is no longer embedded in the database file.
+//
+// Deprecated: this method does nothing and will be removed.
 func (idx *BTreeIndex) mergeWithDatabase() error {
-	// Open the database file
-	dbFile, err := os.OpenFile(idx.dbFileName, os.O_RDWR, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open database file for index merge: %w", err)
-	}
-	defer dbFile.Close()
-
-	// Get database file size
-	dbInfo, err := dbFile.Stat()
-	if err != nil {
-		return err
-	}
-
-	// Get index file size
-	idxInfo, err := idx.file.Stat()
-	if err != nil {
-		return err
-	}
-
-	// Append index to database file
-	// First, ensure the database file is large enough
-	newSize := dbInfo.Size() + idxInfo.Size() + 8 // +8 for index location marker
-	if err := dbFile.Truncate(newSize); err != nil {
-		return fmt.Errorf("failed to resize database file: %w", err)
-	}
-
-	// Copy index file to the end of database file
-	idxData := make([]byte, idxInfo.Size())
-	if _, err := idx.file.ReadAt(idxData, 0); err != nil {
-		return fmt.Errorf("failed to read index file: %w", err)
-	}
-
-	if _, err := dbFile.WriteAt(idxData, dbInfo.Size()); err != nil {
-		return fmt.Errorf("failed to write index to database file: %w", err)
-	}
-
-	// Write index location marker at the end of the file
-	marker := make([]byte, 8)
-	binary.LittleEndian.PutUint64(marker, uint64(dbInfo.Size()))
-	if _, err := dbFile.WriteAt(marker, newSize-8); err != nil {
-		return fmt.Errorf("failed to write index location marker: %w", err)
-	}
-
-	return dbFile.Sync()
+	return nil
 }
 
-// extractFromDatabase extracts the index from a database file.
+// ExtractIndexFromDatabase is a no-op kept for API compatibility.
+// Index data is no longer embedded in the database file.
 //
-// Deprecated: internal use only. This function will be made private in a future release.
+// Deprecated: this function does nothing and will be removed.
 func ExtractIndexFromDatabase(dbFileName string, indexFileName string) error {
-	// Open the database file
-	dbFile, err := os.Open(dbFileName)
-	if err != nil {
-		return fmt.Errorf("failed to open database file: %w", err)
-	}
-	defer dbFile.Close()
-
-	// Get database file size
-	dbInfo, err := dbFile.Stat()
-	if err != nil {
-		return err
-	}
-
-	// Read the index location marker (last 8 bytes)
-	marker := make([]byte, 8)
-	if _, err := dbFile.ReadAt(marker, dbInfo.Size()-8); err != nil {
-		return fmt.Errorf("failed to read index location marker: %w", err)
-	}
-
-	// Get index location
-	indexLoc := binary.LittleEndian.Uint64(marker)
-	indexSize := dbInfo.Size() - int64(indexLoc) - 8
-
-	// Read the index data
-	indexData := make([]byte, indexSize)
-	if _, err := dbFile.ReadAt(indexData, int64(indexLoc)); err != nil {
-		return fmt.Errorf("failed to read index data: %w", err)
-	}
-
-	// Write to the index file
-	indexFile, err := os.Create(indexFileName)
-	if err != nil {
-		return fmt.Errorf("failed to create index file: %w", err)
-	}
-	defer indexFile.Close()
-
-	if _, err := indexFile.Write(indexData); err != nil {
-		return fmt.Errorf("failed to write index file: %w", err)
-	}
-
 	return nil
 }

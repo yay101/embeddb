@@ -210,9 +210,9 @@ func TestMockMultiTableVacuumReopenNested100K(t *testing.T) {
 
 	logMockMem(t, "after drop+vacuum")
 
-	// Remove one index file to exercise reopen path with missing index artifacts.
-	idxToRemove := filepath.Join(filepath.Dir(dbPath), fmt.Sprintf("%s.%s.idx", filepath.Base(dbPath), "Loc.City"))
-	_ = os.Remove(idxToRemove)
+	// Remove hidden index cache to exercise reopen path with missing index artifacts.
+	cacheDir := filepath.Join(filepath.Dir(dbPath), ".embeddb-indexes")
+	_ = os.RemoveAll(cacheDir)
 
 	// Reopen and re-query remaining tables on nested fields.
 	db2, err := New[mockMultiRow](dbPath, false, false)

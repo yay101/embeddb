@@ -6,7 +6,8 @@ A lightweight, embedded database for Go that gives you SQLite-like functionality
 
 - **Zero dependencies** - Just Go standard library + mmapped files
 - **Type-safe** - Full Go generics support, no code generation
-- **Single file** - Database and indexes in your project directory
+- **Single file** - Database stored in a single `.db` file
+- **Hidden index files** - B-tree indexes stored in a `.embeddb-indexes/` directory, auto-regenerated if missing
 - **B-tree indexes** - Fast queries on any indexed field
 - **Range queries** - Query by greater than, less than, or between ranges
 - **Nested structs** - Query fields like `Address.City` with dot notation
@@ -414,10 +415,26 @@ err := users.CreateIndex("Address.City")
 
 // Drop index
 err := users.DropIndex("Age")
-
-// Indexes persist with the database file
-// They load automatically when you reopen the database
 ```
+
+### Index Storage
+
+Indexes are stored as hidden files in a `.embeddb-indexes/` directory next to your database file:
+
+```
+myapp/
+  data.db
+  .embeddb-indexes/
+    data.db/
+      users/
+        Age.idx
+        Name.idx
+```
+
+- On `Close()`, index files are flushed and left in place for fast reload.
+- On `Open()`, existing index files are loaded automatically.
+- If index files are missing or corrupt, they are **regenerated from database records** automatically -- no data loss.
+- When a new database is created, any stale legacy index files are cleaned up.
 
 ## Schema Migration
 
@@ -480,3 +497,8 @@ The database uses memory-mapped I/O, so most of the "Sys" memory is just the map
 - Complex relational queries with joins (use SQLite)
 - High-concurrency write workloads (use PostgreSQL/MySQL)
 - Distributed systems (use proper databases)
+
+## Branches
+
+- **`main`** - Stable releases (currently v0.5.0).
+- **`experimental`** - Experimental work including region-backed index storage (v0.4.0). Not recommended for production use.

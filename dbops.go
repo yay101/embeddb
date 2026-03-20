@@ -12,15 +12,30 @@ import (
 )
 
 func cleanupStaleIndexFiles(dbFileName string) error {
-	pattern := filepath.Join(filepath.Dir(dbFileName), fmt.Sprintf("%s.*.idx", filepath.Base(dbFileName)))
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return err
+	dbDir := filepath.Dir(dbFileName)
+	dbBase := filepath.Base(dbFileName)
+
+	// Remove legacy per-field .idx files next to the DB file.
+	patterns := []string{
+		filepath.Join(dbDir, fmt.Sprintf("%s.*.idx", dbBase)),
+		filepath.Join(dbDir, fmt.Sprintf("%s.idx", dbBase)),
 	}
-	for _, m := range matches {
-		if err := os.Remove(m); err != nil && !os.IsNotExist(err) {
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
 			return err
 		}
+		for _, m := range matches {
+			if err := os.Remove(m); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+
+	// Remove the hidden index cache directory.
+	cacheDir := filepath.Join(dbDir, ".embeddb-indexes", dbBase)
+	if err := os.RemoveAll(cacheDir); err != nil {
+		return err
 	}
 	return nil
 }
@@ -486,16 +501,10 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 		// No legacy schema initialization needed
 
-		// Try to load any existing indexes
+		// Load any existing indexes from the hidden directory.
 		if err := db.indexManager.CheckIndexes(); err != nil {
 			// Just log the error, don't fail
 			fmt.Printf("Warning: failed to check indexes: %v\n", err)
-		}
-
-		// Try to extract indexes from the database file
-		if err := db.indexManager.ExtractIndexesFromDatabase(); err != nil {
-			// Just log the error, don't fail
-			fmt.Printf("Warning: failed to extract indexes: %v\n", err)
 		}
 
 		// Check if we need to migrate the database
