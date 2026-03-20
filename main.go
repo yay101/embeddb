@@ -428,7 +428,15 @@ func (db *Database[T]) collectRecordsByIDs(recordIDs []uint32) []T {
 	results := make([]T, 0, len(recordIDs))
 	var scratch []byte
 
+	db.mlock.Lock()
+	if err := db.ensureMmapSizeLocked(); err != nil {
+		db.mlock.Unlock()
+		return results
+	}
+	db.mlock.Unlock()
+
 	db.lock.RLock()
+	db.mlock.RLock()
 	tableID := db.resolveQueryTableIDLocked()
 	for _, id := range recordIDs {
 		offset, exists := db.getRecordOffset(tableID, id)
@@ -436,7 +444,7 @@ func (db *Database[T]) collectRecordsByIDs(recordIDs []uint32) []T {
 			continue
 		}
 
-		recordBytes, err := db.readRecordBytesAtInto(offset, tableID, scratch)
+		recordBytes, err := db.readRecordBytesAtIntoNoLock(offset, tableID, scratch)
 		if err != nil {
 			continue
 		}
@@ -451,6 +459,7 @@ func (db *Database[T]) collectRecordsByIDs(recordIDs []uint32) []T {
 			results = append(results, *record)
 		}
 	}
+	db.mlock.RUnlock()
 	db.lock.RUnlock()
 
 	return results

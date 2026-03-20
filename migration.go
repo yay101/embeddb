@@ -195,6 +195,13 @@ func (db *Database[T]) readRecordBytesAtInto(offset uint32, expectedTableID uint
 	db.mlock.RLock()
 	defer db.mlock.RUnlock()
 
+	return db.readRecordBytesAtIntoNoLock(offset, expectedTableID, buf)
+}
+
+// readRecordBytesAtIntoNoLock reads record bytes into a reusable buffer.
+// Caller must hold db.mlock.RLock and ensure mmap size is valid.
+func (db *Database[T]) readRecordBytesAtIntoNoLock(offset uint32, expectedTableID uint8, buf []byte) ([]byte, error) {
+
 	// First, determine the length of the record
 	// Read the length bytes (4 bytes at offset+7 for new format)
 	// We check the format by looking at the first byte after markers
