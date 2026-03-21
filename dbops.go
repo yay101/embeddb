@@ -466,7 +466,7 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 
 		// No legacy schema initialization needed
 
-		// Try to load any existing indexes
+		// Load any existing indexes from the hidden directory.
 		if err := db.indexManager.CheckIndexes(); err != nil {
 			// Just log the error, don't fail
 			fmt.Printf("Warning: failed to check indexes: %v\n", err)

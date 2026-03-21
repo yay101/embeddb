@@ -133,6 +133,11 @@ func (db *Database[T]) Table(name ...string) (*Table[T], error) {
 		fmt.Printf("Warning: failed to check indexes for table '%s': %v\n", tableName, err)
 	}
 
+	// Rebuild any indexes that failed to load (e.g. missing/corrupt files).
+	if err := indexManager.BuildPendingIndexes(); err != nil {
+		fmt.Printf("Warning: failed to rebuild pending indexes for table '%s': %v\n", tableName, err)
+	}
+
 	// Track the table's index manager for cleanup when database closes
 	db.tableIndexManagers = append(db.tableIndexManagers, indexManager)
 
