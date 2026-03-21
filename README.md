@@ -1,3 +1,7 @@
+# Warning
+
+This project is in testing and used in production in a non life threatening situation. It has many hundreds of hours of human development and many hours of AI breaking things but is new to being shared with others. Do not use if you really can't lose your data. The API will remain the same until go gets generic methods soon tm at which point it will move to v2.0.0.
+
 # EmbedDB
 
 A lightweight, embedded database for Go that gives you SQLite-like functionality with a more Go-native experience. Perfect for desktop apps, CLI tools, local caching, and anywhere you'd reach for SQLite but want something simpler.
