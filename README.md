@@ -21,24 +21,20 @@ A lightweight, embedded database for Go that gives you SQLite-like functionality
 
 ## Recent Releases
 
+### v0.6.1
+
+- Minor bug fixes and documentation updates
+
 ### v0.6.0
 
-- Region-backed secondary indexes are now the only supported storage path
+- Region-backed secondary indexes (only supported storage path)
 - Performance optimizations:
-  - Per-instance mutexes to reduce lock contention under concurrent workloads
+  - Per-instance mutexes to reduce lock contention
   - Pre-allocated buffers for record encoding/decoding
   - Field offset cache for O(1) lookup vs O(n) linear search
   - Optimized string hashing using `strconv` instead of `fmt.Sprintf`
-  - Result slice preallocation in search operations
-  - `clear()` builtin for buffer clearing
 - ~25k records/sec insert rate with multiple indexes
 - ~1-4ms per indexed query on 200k+ record datasets
-
-### v0.4.0
-
-- Secondary indexes now use embedded region-backed storage in the main DB file by default.
-- Legacy secondary index file paths (`*.idx`) were removed from runtime behavior.
-- Existing query features are preserved, including nested struct indexing and range queries.
 
 ## Installation
 
@@ -794,8 +790,7 @@ err := users.CreateIndex("Address.City")
 // Drop index
 err := users.DropIndex("Age")
 
-// Indexes persist with the database file
-// They load automatically when you reopen the database
+// Indexes are automatically loaded when you reopen the database
 ```
 
 ## Schema Migration
