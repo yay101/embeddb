@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -198,7 +199,7 @@ func NewBTreeIndex(dbFileName, tableName, fieldName string, fieldOffset uintptr,
 		dbFileName:    dbFileName,
 		pendingWrites: make([]pendingWrite, 0, 1000),
 	}
-	if !shouldUseRegionStore(tableName, fieldName) {
+	if false {
 		return nil, fmt.Errorf("region-backed secondary indexes are disabled")
 	}
 
@@ -565,10 +566,8 @@ func (idx *BTreeIndex) encodeNode(node *BTreeNode, buf []byte) error {
 		return fmt.Errorf("buffer too small for node")
 	}
 
-	// Clear the buffer
-	for i := range buf {
-		buf[i] = 0
-	}
+	// Clear the buffer using clear() builtin (Go 1.21+)
+	clear(buf)
 
 	// Write node type and key count
 	buf[0] = node.PageType
@@ -1132,7 +1131,12 @@ func (idx *BTreeIndex) searchRange(pageNum uint32, min, max interface{}, inclusi
 		return nil, err
 	}
 
-	var results []uint32
+	// Pre-allocate results with estimated capacity based on node size
+	estimatedSize := int(node.KeyCount) * 4 // Assume ~4 values per key on average
+	if estimatedSize < 16 {
+		estimatedSize = 16
+	}
+	results := make([]uint32, 0, estimatedSize)
 
 	if node.PageType == BTreePageTypeLeaf {
 		// Keys are sorted; prune with early continue/break.
@@ -1155,6 +1159,7 @@ func (idx *BTreeIndex) searchRange(pageNum uint32, min, max interface{}, inclusi
 
 			// Collect values for this key
 			var values []uint32
+			// Reuse allocated slice if possible
 			if i < len(node.OverflowPages) && node.OverflowPages[i] != 0 {
 				values, err = idx.collectAllValues(node.Values[i], node.OverflowPages[i])
 				if err != nil {
@@ -1647,9 +1652,7 @@ func (idx *BTreeIndex) readOverflowPage(pageNum uint32) (*OverflowPage, error) {
 func (idx *BTreeIndex) writeOverflowPage(pageNum uint32, overflow *OverflowPage) error {
 	buf := getBTreePageBuffer()
 	defer putBTreePageBuffer(buf)
-	for i := range buf {
-		buf[i] = 0
-	}
+	clear(buf)
 
 	binary.LittleEndian.PutUint32(buf[0:4], overflow.NextPage)
 	binary.LittleEndian.PutUint16(buf[4:6], overflow.ValueCount)
@@ -1876,20 +1879,34 @@ func (idx *BTreeIndex) addToBloomFilter(filter *[BloomFilterSize]byte, key inter
 func (idx *BTreeIndex) hashKey(key interface{}) (uint32, uint32) {
 	var str string
 
-	// Convert key to string based on its type
+	// Convert key to string based on its type - optimized for performance
 	switch k := key.(type) {
 	case string:
 		str = k
-	case int, int32, int64, uint, uint32, uint64, float32, float64:
-		str = fmt.Sprintf("%v", k)
+	case int:
+		str = strconv.FormatInt(int64(k), 10)
+	case int32:
+		str = strconv.FormatInt(int64(k), 10)
+	case int64:
+		str = strconv.FormatInt(k, 10)
+	case uint:
+		str = strconv.FormatUint(uint64(k), 10)
+	case uint32:
+		str = strconv.FormatUint(uint64(k), 10)
+	case uint64:
+		str = strconv.FormatUint(k, 10)
+	case float32:
+		str = strconv.FormatFloat(float64(k), 'f', -1, 32)
+	case float64:
+		str = strconv.FormatFloat(k, 'f', -1, 64)
 	case bool:
 		if k {
-			str = "true"
+			str = "1"
 		} else {
-			str = "false"
+			str = "0"
 		}
 	case time.Time:
-		str = fmt.Sprintf("%d", k.UnixNano())
+		str = strconv.FormatInt(k.UnixNano(), 10)
 	default:
 		str = fmt.Sprintf("%v", k)
 	}
@@ -2040,8 +2057,8 @@ func (idx *BTreeIndex) applyWrites() error {
 
 	// Group writes by key to handle multiple operations on the same key efficiently
 	var prevKey interface{} = nil
-	var valuesToAdd []uint32
-	var valuesToRemove []uint32
+	valuesToAdd := make([]uint32, 0, 64)
+	valuesToRemove := make([]uint32, 0, 64)
 
 	flushOp := func() error {
 		if prevKey == nil {

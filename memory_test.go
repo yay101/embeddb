@@ -566,3 +566,86 @@ func TestUnindexedScanBenchmarks(t *testing.T) {
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
+
+func TestPeakMemoryDuringOperations(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping in short mode")
+	}
+
+	rand.Seed(42)
+	dbPath := "test_peak_mem.db"
+	os.Remove(dbPath)
+	defer func() {
+		os.Remove(dbPath)
+		files, _ := os.ReadDir(".")
+		for _, f := range files {
+			if len(f.Name()) > len(dbPath) && f.Name()[:len(dbPath)] == dbPath {
+				os.Remove(f.Name())
+			}
+		}
+	}()
+
+	db, err := New[BenchmarkRecord](dbPath, false, true)
+	if err != nil {
+		t.Fatalf("Failed to create db: %v", err)
+	}
+	defer db.Close()
+
+	var peakHeap, peakSys uint64
+	var m runtime.MemStats
+
+	// Measure peak memory during insert
+	for i := 0; i < 10000; i++ {
+		record := generateRecord(i)
+		_, err := db.Insert(record)
+		if err != nil {
+			t.Fatalf("Insert failed: %v", err)
+		}
+		if i%100 == 0 {
+			runtime.ReadMemStats(&m)
+			if m.HeapAlloc > peakHeap {
+				peakHeap = m.HeapAlloc
+			}
+			if m.Sys > peakSys {
+				peakSys = m.Sys
+			}
+		}
+	}
+	runtime.ReadMemStats(&m)
+	if m.HeapAlloc > peakHeap {
+		peakHeap = m.HeapAlloc
+	}
+	if m.Sys > peakSys {
+		peakSys = m.Sys
+	}
+
+	fmt.Printf("\n=== Peak Memory During 10k Inserts ===\n")
+	fmt.Printf("Peak Heap: %s\n", formatBytes(peakHeap))
+	fmt.Printf("Peak Sys:  %s\n", formatBytes(peakSys))
+
+	// Measure peak memory during queries
+	peakHeap, peakSys = 0, 0
+	for i := 0; i < 5000; i++ {
+		_, _ = db.Query("Age", 50)
+		if i%100 == 0 {
+			runtime.ReadMemStats(&m)
+			if m.HeapAlloc > peakHeap {
+				peakHeap = m.HeapAlloc
+			}
+			if m.Sys > peakSys {
+				peakSys = m.Sys
+			}
+		}
+	}
+	runtime.ReadMemStats(&m)
+	if m.HeapAlloc > peakHeap {
+		peakHeap = m.HeapAlloc
+	}
+	if m.Sys > peakSys {
+		peakSys = m.Sys
+	}
+
+	fmt.Printf("\n=== Peak Memory During 5k Queries ===\n")
+	fmt.Printf("Peak Heap: %s\n", formatBytes(peakHeap))
+	fmt.Printf("Peak Sys:  %s\n", formatBytes(peakSys))
+}

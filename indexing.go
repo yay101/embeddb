@@ -3,7 +3,6 @@ package embeddb
 import (
 	"fmt"
 	"reflect"
-	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -22,12 +21,13 @@ type PagedResult[T any] struct {
 //
 // Deprecated: internal use only. This type will be made private in a future release.
 type IndexManager[T any] struct {
-	db             *Database[T]           // Reference to the parent database
-	tableName      string                 // Table name for multi-table support
-	indexes        map[string]*BTreeIndex // Map of field name to index
-	layout         *StructLayout          // Struct layout for fast field access
-	lock           sync.RWMutex           // Lock for concurrent access
-	pendingIndexes map[string]struct{}    // Set of indexes that need to be rebuilt
+	db               *Database[T]           // Reference to the parent database
+	tableName        string                 // Table name for multi-table support
+	indexes          map[string]*BTreeIndex // Map of field name to index
+	layout           *StructLayout          // Struct layout for fast field access
+	fieldOffsetCache map[string]FieldOffset // Cached field offsets for O(1) lookup
+	lock             sync.RWMutex           // Lock for concurrent access
+	pendingIndexes   map[string]struct{}    // Set of indexes that need to be rebuilt
 }
 
 // NewIndexManager creates a new index manager for a database.
@@ -35,12 +35,19 @@ type IndexManager[T any] struct {
 //
 // Deprecated: internal use only. This function will be made private in a future release.
 func NewIndexManager[T any](db *Database[T], layout *StructLayout, tableName string) *IndexManager[T] {
+	// Build field offset cache for O(1) lookup
+	fieldOffsetCache := make(map[string]FieldOffset, len(layout.FieldOffsets))
+	for _, fo := range layout.FieldOffsets {
+		fieldOffsetCache[fo.Name] = fo
+	}
+
 	return &IndexManager[T]{
-		db:             db,
-		tableName:      tableName,
-		indexes:        make(map[string]*BTreeIndex),
-		layout:         layout,
-		pendingIndexes: make(map[string]struct{}),
+		db:               db,
+		tableName:        tableName,
+		indexes:          make(map[string]*BTreeIndex),
+		layout:           layout,
+		fieldOffsetCache: fieldOffsetCache,
+		pendingIndexes:   make(map[string]struct{}),
 	}
 }
 
@@ -54,18 +61,8 @@ func (im *IndexManager[T]) CreateIndex(fieldName string) error {
 		return nil // Index already exists
 	}
 
-	// Find the field in the layout
-	var fieldOffset FieldOffset
-	var fieldFound bool
-
-	for _, offset := range im.layout.FieldOffsets {
-		if strings.EqualFold(offset.Name, fieldName) {
-			fieldOffset = offset
-			fieldFound = true
-			break
-		}
-	}
-
+	// Find the field in the layout using cached map - O(1) lookup
+	fieldOffset, fieldFound := im.fieldOffsetCache[fieldName]
 	if !fieldFound {
 		return fmt.Errorf("field '%s' not found in struct", fieldName)
 	}
@@ -143,17 +140,8 @@ func (im *IndexManager[T]) BuildIndex(fieldName string) error {
 		return fmt.Errorf("index for field '%s' does not exist", fieldName)
 	}
 
-	// Find the field offset
-	var fieldOffset FieldOffset
-	var fieldFound bool
-	for _, offset := range im.layout.FieldOffsets {
-		if strings.EqualFold(offset.Name, fieldName) {
-			fieldOffset = offset
-			fieldFound = true
-			break
-		}
-	}
-
+	// Find the field offset using cached map - O(1) lookup
+	fieldOffset, fieldFound := im.fieldOffsetCache[fieldName]
 	if !fieldFound {
 		im.lock.Unlock()
 		return fmt.Errorf("field '%s' not found in struct", fieldName)
@@ -318,17 +306,8 @@ func (im *IndexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 	defer im.lock.RUnlock()
 
 	for fieldName, index := range im.indexes {
-		// Find the field offset
-		var fieldOffset FieldOffset
-		var fieldFound bool
-		for _, offset := range im.layout.FieldOffsets {
-			if strings.EqualFold(offset.Name, fieldName) {
-				fieldOffset = offset
-				fieldFound = true
-				break
-			}
-		}
-
+		// Find the field offset using cached map - O(1) lookup
+		fieldOffset, fieldFound := im.fieldOffsetCache[fieldName]
 		if !fieldFound {
 			continue // Skip this index
 		}
@@ -453,17 +432,8 @@ func (im *IndexManager[T]) RemoveFromIndexes(record *T, recordID uint32) error {
 	defer im.lock.RUnlock()
 
 	for fieldName, index := range im.indexes {
-		// Find the field offset
-		var fieldOffset FieldOffset
-		var fieldFound bool
-		for _, offset := range im.layout.FieldOffsets {
-			if strings.EqualFold(offset.Name, fieldName) {
-				fieldOffset = offset
-				fieldFound = true
-				break
-			}
-		}
-
+		// Find the field offset using cached map - O(1) lookup
+		fieldOffset, fieldFound := im.fieldOffsetCache[fieldName]
 		if !fieldFound {
 			continue // Skip this index
 		}

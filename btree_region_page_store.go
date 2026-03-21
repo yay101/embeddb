@@ -21,7 +21,7 @@ const (
 
 	regionCatalogMetaSize      = regionCatalogHeaderSize + (regionCatalogEntrySize * regionCatalogMaxEntries)
 	regionCatalogInitialGrowth = 512 * 1024
-	regionIndexGrowPages       = 64
+	regionIndexGrowPages       = 256
 
 	regionHeaderStartOff    = 43
 	regionHeaderCapacityOff = 47
@@ -29,7 +29,7 @@ const (
 	regionHeaderFlagsOff    = 55
 )
 
-var regionCatalogMu sync.Mutex
+var regionCatalogMu sync.RWMutex
 var regionCatalogGeneration atomic.Uint64
 
 type regionCatalogFooter struct {
@@ -62,25 +62,10 @@ type regionBackedBTreePageStore struct {
 	capacity uint64
 	fileName string
 	seenGen  uint64
+	mu       sync.RWMutex // Per-instance lock for read/write operations
 }
 
-func shouldUseRegionStore(tableName, fieldName string) bool {
-	if !useExperimentalRegionIndex() {
-		return false
-	}
-
-	target := os.Getenv("EMBEDDB_EXPERIMENTAL_REGION_INDEX_KEY")
-	current := fieldName
-	if tableName != "" {
-		current = tableName + "." + fieldName
-	}
-
-	if target == "" {
-		return true
-	}
-
-	return target == current
-}
+func shouldUseRegionStore(tableName, fieldName string) bool { return true }
 
 func regionIndexUnsafeMode() bool {
 	return os.Getenv("EMBEDDB_EXPERIMENTAL_REGION_INDEX_UNSAFE") == "1"
@@ -107,7 +92,7 @@ func newRegionBackedBTreePageStore(dbFileName, tableName, fieldName string) (*re
 		return nil, false, err
 	}
 
-	if err := store.refreshLocationLocked(); err != nil {
+	if err := store.refreshLocationLocked(false); err != nil {
 		file.Close()
 		return nil, false, err
 	}
@@ -156,20 +141,31 @@ func (s *regionBackedBTreePageStore) ensurePageCapacity(pageCount uint32) error 
 		return nil
 	}
 
-	regionCatalogMu.Lock()
-	defer regionCatalogMu.Unlock()
+	// Use instance lock for thread safety
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if err := s.refreshLocationLocked(); err != nil {
+	// Recheck after acquiring lock
+	if required <= atomic.LoadUint64(&s.capacity) {
+		return nil
+	}
+
+	// First refresh - may need global lock if entry doesn't exist
+	if err := s.refreshLocationLocked(false); err != nil {
 		return err
 	}
 	if required <= atomic.LoadUint64(&s.capacity) {
 		return nil
 	}
 
+	// Need global lock for growth
+	regionCatalogMu.Lock()
+	defer regionCatalogMu.Unlock()
+
 	if err := growRegionCatalogEntry(s.file, s.keyHash, required); err != nil {
 		return err
 	}
-	if err := s.refreshLocationLocked(); err != nil {
+	if err := s.refreshLocationLocked(false); err != nil {
 		return err
 	}
 	atomic.StoreUint64(&s.seenGen, regionCatalogGeneration.Load())
@@ -189,7 +185,10 @@ func (s *regionBackedBTreePageStore) close() error {
 	return err
 }
 
-func (s *regionBackedBTreePageStore) refreshLocationLocked() error {
+// refreshLocationLocked refreshes the store's location from the catalog.
+// If callerHoldsGlobalLock is true, the caller already holds regionCatalogMu and we should not lock.
+// If false, we will acquire the lock if needed for catalog modification.
+func (s *regionBackedBTreePageStore) refreshLocationLocked(callerHoldsGlobalLock bool) error {
 	footer, data, err := loadRegionCatalog(s.file)
 	if err != nil {
 		return err
@@ -197,17 +196,35 @@ func (s *regionBackedBTreePageStore) refreshLocationLocked() error {
 
 	entryIdx, entry, ok := findRegionCatalogEntry(data, s.keyHash)
 	if !ok {
+		needsUnlock := false
+		if !callerHoldsGlobalLock {
+			regionCatalogMu.Lock()
+			needsUnlock = true
+		}
+		// Note: If callerHoldsGlobalLock is true, we trust them to hold the lock
 		_, err := ensureRegionCatalogAndEntry(s.file, s.keyHash)
 		if err != nil {
+			if needsUnlock {
+				regionCatalogMu.Unlock()
+			}
 			return err
 		}
 		footer, data, err = loadRegionCatalog(s.file)
 		if err != nil {
+			if needsUnlock {
+				regionCatalogMu.Unlock()
+			}
 			return err
 		}
 		entryIdx, entry, ok = findRegionCatalogEntry(data, s.keyHash)
 		if !ok {
+			if needsUnlock {
+				regionCatalogMu.Unlock()
+			}
 			return fmt.Errorf("region catalog entry not found after create")
+		}
+		if needsUnlock {
+			regionCatalogMu.Unlock()
 		}
 	}
 
@@ -223,10 +240,15 @@ func (s *regionBackedBTreePageStore) ensureFreshLocation() error {
 		return nil
 	}
 
-	regionCatalogMu.Lock()
-	defer regionCatalogMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if err := s.refreshLocationLocked(); err != nil {
+	// Double-check after acquiring lock
+	if atomic.LoadUint64(&s.seenGen) == regionCatalogGeneration.Load() {
+		return nil
+	}
+
+	if err := s.refreshLocationLocked(false); err != nil {
 		return err
 	}
 	atomic.StoreUint64(&s.seenGen, regionCatalogGeneration.Load())

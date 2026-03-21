@@ -613,30 +613,18 @@ func (db *Database[T]) InsertToTable(record *T, tableName string) (uint32, error
 	db.lock.Lock()
 
 	// 2. Write the record header (escCode, startMarker, tableID, ID, length, active)
-	// New format: 12 bytes header instead of 11
-	headerBytes := make([]byte, 12)
-	headerBytes[0] = escCode
-	headerBytes[1] = startMarker
-	headerBytes[2] = tableID
-
-	// Write the ID
-	binary.BigEndian.PutUint32(headerBytes[3:7], newRecordId)
-
-	// Write the length
+	// Pre-allocate exact size to avoid reallocation
 	recordLength := uint32(len(encoded))
-	binary.BigEndian.PutUint32(headerBytes[7:11], recordLength)
-
-	// Set active flag
-	headerBytes[11] = 1 // 1 = active
-
-	// Add end marker
-	footerBytes := []byte{escCode, endMarker}
-
-	// Combine header, encoded data, and footer
-	completeRecord := make([]byte, 0, len(headerBytes)+len(encoded)+len(footerBytes))
-	completeRecord = append(completeRecord, headerBytes...)
-	completeRecord = append(completeRecord, encoded...)
-	completeRecord = append(completeRecord, footerBytes...)
+	completeRecord := make([]byte, 12+recordLength+2)
+	completeRecord[0] = escCode
+	completeRecord[1] = startMarker
+	completeRecord[2] = tableID
+	binary.BigEndian.PutUint32(completeRecord[3:7], newRecordId)
+	binary.BigEndian.PutUint32(completeRecord[7:11], recordLength)
+	completeRecord[11] = 1 // active flag
+	copy(completeRecord[12:], encoded)
+	completeRecord[12+recordLength] = escCode
+	completeRecord[13+recordLength] = endMarker
 
 	// 3. Write the data to the file at the next available offset
 	nextOffset := db.header.nextOffset

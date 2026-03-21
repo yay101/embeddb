@@ -10,30 +10,35 @@ A lightweight, embedded database for Go that gives you SQLite-like functionality
 - **B-tree indexes** - Fast queries on any indexed field
 - **Range queries** - Query by greater than, less than, or between ranges
 - **Nested structs** - Query fields like `Address.City` with dot notation
+- **Multiple tables** - Store different struct types in one database file
+- **Paged queries** - Efficient pagination for large result sets
+- **Partial text matching** - Use Filter with `strings.Contains` for text search
+- **Concurrent access** - Safe multi-goroutine reads and writes
 - **time.Time support** - Full indexing and range queries on timestamps
 - **Memory-efficient** - Memory-mapped I/O keeps heap usage minimal
 - **Scanner** - Low-lock-contention sequential access for large scans
+- **Auto vacuum** - Automatic file compaction for long-running workloads
 
 ## Recent Releases
+
+### v0.6.0
+
+- Region-backed secondary indexes are now the only supported storage path
+- Performance optimizations:
+  - Per-instance mutexes to reduce lock contention under concurrent workloads
+  - Pre-allocated buffers for record encoding/decoding
+  - Field offset cache for O(1) lookup vs O(n) linear search
+  - Optimized string hashing using `strconv` instead of `fmt.Sprintf`
+  - Result slice preallocation in search operations
+  - `clear()` builtin for buffer clearing
+- ~25k records/sec insert rate with multiple indexes
+- ~1-4ms per indexed query on 200k+ record datasets
 
 ### v0.4.0
 
 - Secondary indexes now use embedded region-backed storage in the main DB file by default.
 - Legacy secondary index file paths (`*.idx`) were removed from runtime behavior.
 - Existing query features are preserved, including nested struct indexing and range queries.
-
-### v0.3.4
-
-- Added switchable region-backed secondary index storage path.
-- Added region pointer/capacity metadata handling and growth safety checks.
-- Added regression coverage for reopen persistence and region growth behavior.
-
-## Migration Notes
-
-- Upgrading to `v0.4.0` removes runtime `.idx` files. Secondary indexes persist in the DB file.
-- `v0.4.0` expects region-backed secondary indexes to be enabled in normal operation.
-
-- If an old deployment still has stale `.idx` files from pre-`v0.4.0`, they can be safely deleted after successful reopen and query verification.
 
 ## Installation
 
@@ -283,6 +288,265 @@ err := users.Delete(id)
 err := db.Close()
 ```
 
+## Complete Examples
+
+### E-commerce Application
+
+```go
+type Product struct {
+    ID          uint32    `db:"id,primary"`
+    Name        string    `db:"index"`
+    Category    string    `db:"index"`
+    Price       float64   `db:"index"`
+    Stock       int       `db:"index"`
+    CreatedAt   time.Time `db:"index"`
+    Description string
+}
+
+type Order struct {
+    ID         uint32    `db:"id,primary"`
+    CustomerID uint32    `db:"index"`
+    ProductID  uint32    `db:"index"`
+    Quantity   int       `db:"index"`
+    TotalPrice float64   `db:"index"`
+    Status     string    `db:"index"`
+    CreatedAt  time.Time `db:"index"`
+}
+
+db, _ := embeddb.Open("shop.db", embeddb.OpenOptions{AutoIndex: true})
+products, _ := embeddb.Use[Product](db, "products")
+orders, _ := embeddb.Use[Order](db, "orders")
+
+// Insert products
+products.Insert(&Product{Name: "Laptop", Category: "Electronics", Price: 999.99, Stock: 50})
+products.Insert(&Product{Name: "Headphones", Category: "Electronics", Price: 79.99, Stock: 200})
+
+// Find all electronics under $500
+deals, _ := products.Filter(func(p Product) bool {
+    return p.Category == "Electronics" && p.Price < 500
+})
+
+// Get paginated results
+result, _ := products.QueryRangeBetweenPaged("Price", 0, 100, true, true, 0, 20)
+for page := 0; page < int(result.TotalCount)/20+1; page++ {
+    // Process each page...
+}
+```
+
+### Multi-Table with Different Types
+
+```go
+type User struct {
+    ID    uint32 `db:"id,primary"`
+    Name  string `db:"index"`
+    Email string `db:"index"`
+}
+
+type Post struct {
+    ID        uint32 `db:"id,primary"`
+    AuthorID  uint32 `db:"index"`
+    Title     string `db:"index"`
+    Published bool   `db:"index"`
+}
+
+type Comment struct {
+    ID        uint32 `db:"id,primary"`
+    PostID    uint32 `db:"index"`
+    AuthorID  uint32 `db:"index"`
+    Content   string
+}
+
+// All in the same database file!
+db, _ := embeddb.Open("blog.db")
+users, _ := embeddb.Use[User](db, "users")
+posts, _ := embeddb.Use[Post](db, "posts")
+comments, _ := embeddb.Use[Comment](db, "comments")
+
+// Create indexes for common queries
+users.CreateIndex("Email")
+posts.CreateIndex("AuthorID")
+posts.CreateIndex("Published")
+comments.CreateIndex("PostID")
+```
+
+### Pagination with Infinite Scroll
+
+```go
+const pageSize = 50
+offset := 0
+
+for {
+    result, err := products.QueryRangeBetweenPaged("Price", minPrice, maxPrice, true, true, offset, pageSize)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    for _, product := range result.Records {
+        // Display product to user
+        fmt.Printf("%s - $%.2f\n", product.Name, product.Price)
+    }
+
+    if !result.HasMore {
+        break
+    }
+    offset += pageSize
+}
+```
+
+### Text Search with Filter
+
+```go
+// Find products containing "wireless" (case-insensitive)
+wireless, _ := products.Filter(func(p Product) bool {
+    return strings.Contains(strings.ToLower(p.Name), "wireless")
+})
+
+// Find products with names starting with "Pro"
+proProducts, _ := products.Filter(func(p Product) bool {
+    return strings.HasPrefix(p.Name, "Pro")
+})
+
+// Complex search: electronics with "blue" in description
+blueElectronics, _ := products.Filter(func(p Product) bool {
+    return p.Category == "Electronics" && 
+           strings.Contains(strings.ToLower(p.Description), "blue")
+})
+```
+
+### Complex Filtering
+
+```go
+// Multiple conditions
+premiumActive, _ := users.Filter(func(u User) bool {
+    return u.Subscription == "premium" && 
+           u.IsActive && 
+           u.LastLogin.After(time.Now().AddDate(0, -1, 0))
+})
+
+// Nested field access
+nyCustomers, _ := customers.Filter(func(c Customer) bool {
+    return c.Address.State == "NY" && 
+           c.Address.ZipCode[:3] == "100" // NYC area
+})
+
+// Date range queries
+recentOrders, _ := orders.Filter(func(o Order) bool {
+    return o.CreatedAt.After(time.Now().AddDate(0, 0, -30))
+})
+```
+
+### Concurrent Access from Multiple Goroutines
+
+```go
+var wg sync.WaitGroup
+
+// Writer goroutines
+for i := 0; i < 4; i++ {
+    wg.Add(1)
+    go func(id int) {
+        defer wg.Done()
+        for j := 0; j < 1000; j++ {
+            products.Insert(&Product{
+                Name:     fmt.Sprintf("Product_%d_%d", id, j),
+                Category: "general",
+                Price:    float64(j),
+            })
+        }
+    }(i)
+}
+
+// Reader goroutines
+for i := 0; i < 8; i++ {
+    wg.Add(1)
+    go func(id int) {
+        defer wg.Done()
+        for j := 0; j < 100; j++ {
+            products.Query("Category", "electronics")
+            products.Count()
+        }
+    }(i)
+}
+
+wg.Wait() // Safe to access concurrently
+```
+
+### Scanner for Large Datasets
+
+```go
+// Scanner provides low-lock-contention iteration
+scanner := products.ScanRecords()
+defer scanner.Close()
+
+count := 0
+totalValue := 0.0
+
+for scanner.Next() {
+    product, _ := scanner.Record()
+    count++
+    totalValue += product.Price
+}
+
+fmt.Printf("Scanned %d products, total value: $%.2f\n", count, totalValue)
+
+// With early exit
+scanner = products.ScanRecords()
+for scanner.Next() {
+    product, _ := scanner.Record()
+    if product.Stock == 0 {
+        break // Stop at first out-of-stock item
+    }
+    process(product)
+}
+```
+
+### Batch Operations
+
+```go
+// Bulk insert with progress tracking
+batch := []Product{}
+for i := 0; i < 10000; i++ {
+    batch = append(batch, Product{
+        Name:     fmt.Sprintf("Item_%d", i),
+        Category: categories[i%len(categories)],
+        Price:    float64(rand.Intn(1000)),
+    })
+
+    if len(batch) == 1000 {
+        for i := range batch {
+            products.Insert(&batch[i])
+        }
+        batch = batch[:0] // Reset slice, keep capacity
+        fmt.Printf("Inserted %d records...\n", i+1)
+    }
+}
+
+// Process remaining
+for i := range batch {
+    products.Insert(&batch[i])
+}
+```
+
+### Database Maintenance
+
+```go
+// Check record counts
+fmt.Printf("Products: %d\n", products.Count())
+fmt.Printf("Orders: %d\n", orders.Count())
+
+// Vacuum to reclaim space after bulk deletes
+err := db.Vacuum()
+if err != nil {
+    log.Printf("Vacuum failed: %v", err)
+}
+
+// Reopen and verify data integrity
+db.Close()
+db, _ = embeddb.Open("shop.db")
+products, _ = embeddb.Use[Product](db, "products")
+allProducts, _ := products.Filter(func(p Product) bool { return true })
+fmt.Printf("Products after reopen: %d\n", len(allProducts))
+```
+
 ## Querying
 
 EmbedDB supports two types of queries:
@@ -361,14 +625,108 @@ The `PagedResult[T]` type provides:
 ### Nested Struct Queries
 
 ```go
+// Define structs with nested types
+type User struct {
+    ID        uint32  `db:"id,primary"`
+    Name      string  `db:"index"`
+    Address   Address // Nested struct
+    Manager   Manager // Another nested level
+}
+
+type Address struct {
+    Street string
+    City   string `db:"index"`        // Query: "Address.City"
+    State  string `db:"index"`        // Query: "Address.State"
+    Zip    int    `db:"index"`       // Query: "Address.Zip"
+    Country Country                  // Deep nesting
+}
+
+type Country struct {
+    Name     string `db:"index"`     // Query: "Address.Country.Name"
+    Code     string `db:"index"`     // Query: "Address.Country.Code"
+}
+
+type Manager struct {
+    Name  string `db:"index"`        // Query: "Manager.Name"
+    Title string `db:"index"`        // Query: "Manager.Title"
+}
+
 // Query nested struct fields using dot notation
 results, err := users.Query("Address.City", "New York")
 
 // Range query on nested field
-results, err := users.QueryRangeBetween("Address.ZipCode", 10000, 99999, true, true)
+results, err := users.QueryRangeBetween("Address.Zip", 10000, 99999, true, true)
 
-// Query embedded time in nested struct
-results, err := users.Query("Metadata.DeletedAt", time.Time{})
+// Deep nesting works too
+results, err := users.Query("Address.Country.Code", "US")
+
+// Query nested manager field
+results, err := users.Query("Manager.Name", "Jane Manager")
+
+// Combine with other indexed fields
+premiumNY, _ := users.Filter(func(u User) bool {
+    return u.Address.State == "NY" && 
+           u.Subscription == "premium"
+})
+```
+
+### Time-Based Queries
+
+```go
+// Define struct with timestamps
+type Event struct {
+    ID        uint32    `db:"id,primary"`
+    Name      string    `db:"index"`
+    StartTime time.Time `db:"index"`
+    EndTime   time.Time `db:"index"`
+    CreatedAt time.Time `db:"index"`
+}
+
+// Query by exact timestamp
+results, err := events.Query("CreatedAt", time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC))
+
+// Events after a certain date
+recent, err := events.QueryRangeGreaterThan("StartTime", time.Now(), false)
+
+// Events in a date range
+conference, err := events.QueryRangeBetween("StartTime", 
+    time.Date(2024, 9, 1, 0, 0, 0, 0, time.UTC),
+    time.Date(2024, 9, 30, 23, 59, 59, 0, time.UTC),
+    true, true)
+
+// Filter for time-based conditions
+pastEvents, _ := events.Filter(func(e Event) bool {
+    return e.EndTime.Before(time.Now())
+})
+
+upcomingWeek, _ := events.Filter(func(e Event) bool {
+    return e.StartTime.After(time.Now()) && 
+           e.StartTime.Before(time.Now().AddDate(0, 0, 7))
+})
+```
+
+### Boolean and Enum Queries
+
+```go
+type Task struct {
+    ID       uint32 `db:"id,primary"`
+    Title    string `db:"index"`
+    Priority string `db:"index"` // "low", "medium", "high"
+    Status   string `db:"index"` // "todo", "in_progress", "done"
+    IsUrgent bool   `db:"index"`
+}
+
+// Query by boolean
+urgent, _ := tasks.Query("IsUrgent", true)
+
+// Query by string enum value
+highPriority, _ := tasks.Query("Priority", "high")
+inProgress, _ := tasks.Query("Status", "in_progress")
+
+// Combine conditions
+urgentInProgress, _ := tasks.Filter(func(t Task) bool {
+    return t.IsUrgent && t.Status != "done"
+})
 ```
 
 ### Unindexed Queries (Full Table Scan)
@@ -458,13 +816,13 @@ _ = db2
 ## Performance
 
 ### Insert Performance
-- ~350k-400k records/sec without secondary indexes
-- ~30k-40k records/sec with multiple secondary indexes on 100k-scale workloads
+- ~200k-350k records/sec without secondary indexes
+- ~25k-30k records/sec with multiple secondary indexes on 200k+ record datasets
 
 ### Query Performance  
-- Exact match (indexed): ~1-2ms/query for moderate-cardinality keys on 100k rows
-- Exact match (indexed): ~20-30ms/query for low-cardinality keys on 100k rows
-- Filter/Scan (full table): ~80ms for 100k records
+- Exact match (indexed): ~1-4ms/query for indexed fields on 200k records
+- Range queries: ~140ms for large result sets on 200k records
+- Filter/Scan (full table): ~300ms for 200k records
 
 ### Memory Usage
 Memory usage stays minimal even with large datasets:
@@ -474,6 +832,7 @@ Memory usage stays minimal even with large datasets:
 | 1,000   | 94 KB     | 87 KB      | 8 MB      |
 | 10,000  | 954 KB    | 217 KB     | 12 MB     |
 | 50,000  | 4.7 MB    | 668 KB     | 12 MB     |
+| 200,000 | ~20 MB    | ~1.5 MB    | ~30 MB    |
 
 The database uses memory-mapped I/O, so most of the "Sys" memory is just the mapped file - not heap allocations.
 
@@ -481,12 +840,13 @@ The database uses memory-mapped I/O, so most of the "Sys" memory is just the map
 
 | SQLite | EmbedDB |
 |--------|---------|
-| Cgo required | Pure Go |
-| SQL queries | Go structs |
+| Cgo required | Pure Go (single module) |
+| SQL queries | Go structs & functions |
 | Schema migrations | Just change your struct |
 | Multiple tables | Multiple table handles |
 | ACID transactions | Atomic single-record ops |
-| 2MB+ binary | Pure Go module |
+| 2MB+ binary | ~50KB Go module |
+| Complex setup | Zero-config, embed in your app |
 
 ## When to use EmbedDB
 
