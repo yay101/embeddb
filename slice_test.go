@@ -1,6 +1,7 @@
 package embeddb
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -148,5 +149,85 @@ func TestSliceInsertAndRetrieve(t *testing.T) {
 
 	if retrieved.Scores[0] != 100 || retrieved.Scores[1] != 200 || retrieved.Scores[2] != 300 {
 		t.Errorf("Scores mismatch: got %v", retrieved.Scores)
+	}
+}
+
+func TestSliceContainsFilter(t *testing.T) {
+	dbPath := "test_slice_contains_db"
+	defer cleanupTestFiles(dbPath)
+
+	db, err := New[SliceRecord](dbPath, false, true)
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	records := []SliceRecord{
+		{ID: 1, Name: "Alice", Tags: []string{"admin", "developer"}, Scores: []int{10, 20, 30}},
+		{ID: 2, Name: "Bob", Tags: []string{"user", "developer"}, Scores: []int{15, 25}},
+		{ID: 3, Name: "Charlie", Tags: []string{"admin", "manager"}, Scores: []int{10, 35}},
+		{ID: 4, Name: "Diana", Tags: []string{"user"}, Scores: []int{20, 40}},
+	}
+
+	for _, record := range records {
+		_, err := db.Insert(&record)
+		if err != nil {
+			t.Fatalf("Failed to insert: %v", err)
+		}
+	}
+
+	// Filter for admin users using slices.Contains
+	adminResults, err := db.Filter(func(r SliceRecord) bool {
+		return slices.Contains(r.Tags, "admin")
+	})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
+	if len(adminResults) != 2 {
+		t.Errorf("Expected 2 admin users, got %d", len(adminResults))
+	}
+
+	// Filter for developers
+	devResults, err := db.Filter(func(r SliceRecord) bool {
+		return slices.Contains(r.Tags, "developer")
+	})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
+	if len(devResults) != 2 {
+		t.Errorf("Expected 2 developers, got %d", len(devResults))
+	}
+
+	// Filter for users with score 10
+	score10Results, err := db.Filter(func(r SliceRecord) bool {
+		return slices.Contains(r.Scores, 10)
+	})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
+	if len(score10Results) != 2 {
+		t.Errorf("Expected 2 users with score 10, got %d", len(score10Results))
+	}
+
+	// Filter for users with score 25
+	score25Results, err := db.Filter(func(r SliceRecord) bool {
+		return slices.Contains(r.Scores, 25)
+	})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
+	if len(score25Results) != 1 {
+		t.Errorf("Expected 1 user with score 25, got %d", len(score25Results))
+	}
+
+	// Filter for users with non-existent tag
+	nonexistentResults, err := db.Filter(func(r SliceRecord) bool {
+		return slices.Contains(r.Tags, "nonexistent")
+	})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
+	if len(nonexistentResults) != 0 {
+		t.Errorf("Expected 0 users with non-existent tag, got %d", len(nonexistentResults))
 	}
 }
