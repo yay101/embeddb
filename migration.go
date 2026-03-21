@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	embedcore "github.com/yay101/embeddbcore"
 )
 
 // MigrationOptions contains options for schema migration
@@ -32,12 +34,12 @@ func DefaultMigrationOptions() MigrationOptions {
 // Migrate performs a schema migration when the struct layout has changed
 // It reads all records using the old layout and writes them back using the new layout
 // This operation is atomic - either all records are migrated or none
-func (db *Database[T]) Migrate(oldLayout *StructLayout) error {
+func (db *Database[T]) Migrate(oldLayout *embedcore.StructLayout) error {
 	return db.MigrateWithOptions(oldLayout, DefaultMigrationOptions())
 }
 
 // MigrateWithOptions performs a schema migration with custom options
-func (db *Database[T]) MigrateWithOptions(oldLayout *StructLayout, opts MigrationOptions) error {
+func (db *Database[T]) MigrateWithOptions(oldLayout *embedcore.StructLayout, opts MigrationOptions) error {
 	if db.layout.Hash == oldLayout.Hash {
 		// No migration needed if the layouts are identical
 		return nil
@@ -275,7 +277,7 @@ func isActiveRecord(recordBytes []byte) bool {
 }
 
 // decodeRecordWithLayout decodes a record using the specified struct layout
-func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout) (*T, error) {
+func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *embedcore.StructLayout) (*T, error) {
 	// Create a new instance of T
 	record := new(T)
 
@@ -288,7 +290,7 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 		if pkField, exists := layout.FieldOffsets[layout.PrimaryKey]; exists {
 			// Set the primary key field value
 			// Pass as uint32 directly since that's what we read from the header
-			if err := SetFieldValue(record, pkField, uint32(recordID)); err != nil {
+			if err := embedcore.SetFieldValue(record, pkField, uint32(recordID)); err != nil {
 				return nil, fmt.Errorf("failed to set primary key field: %w", err)
 			}
 		}
@@ -503,7 +505,7 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 		// Set the field value using the unsafe pointer
 		// For time.Time fields (which are structs with IsTime=true), we need to set the value too
 		if fieldOffset.Type != reflect.Struct || fieldOffset.IsTime {
-			err = SetFieldValue(record, fieldOffset, value)
+			err = embedcore.SetFieldValue(record, fieldOffset, value)
 			if err != nil {
 				return nil, fmt.Errorf("failed to set field %s: %w", fieldOffset.Name, err)
 			}
@@ -523,7 +525,7 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *StructLayout)
 // encodeRecordWithLayout encodes a record using the specified struct layout
 // This only encodes the field data, NOT the record wrapper (header/footer).
 // The caller (Insert/Update) is responsible for adding the record header and footer.
-func (db *Database[T]) encodeRecordWithLayout(record *T, layout *StructLayout) ([]byte, error) {
+func (db *Database[T]) encodeRecordWithLayout(record *T, layout *embedcore.StructLayout) ([]byte, error) {
 	var buffer []byte
 
 	// Get sorted keys for deterministic field order
@@ -552,7 +554,7 @@ func (db *Database[T]) encodeRecordWithLayout(record *T, layout *StructLayout) (
 		buffer = append(buffer, key, valueStartMarker)
 
 		// Get the field value using the unsafe pointer
-		value, err := GetFieldValue(record, fieldOffset)
+		value, err := embedcore.GetFieldValue(record, fieldOffset)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get field %s: %w", fieldOffset.Name, err)
 		}

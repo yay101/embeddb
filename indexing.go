@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	embedcore "github.com/yay101/embeddbcore"
 )
 
 // PagedResult represents a paginated query result
@@ -21,22 +23,22 @@ type PagedResult[T any] struct {
 //
 // Deprecated: internal use only. This type will be made private in a future release.
 type IndexManager[T any] struct {
-	db               *Database[T]           // Reference to the parent database
-	tableName        string                 // Table name for multi-table support
-	indexes          map[string]*BTreeIndex // Map of field name to index
-	layout           *StructLayout          // Struct layout for fast field access
-	fieldOffsetCache map[string]FieldOffset // Cached field offsets for O(1) lookup
-	lock             sync.RWMutex           // Lock for concurrent access
-	pendingIndexes   map[string]struct{}    // Set of indexes that need to be rebuilt
+	db               *Database[T]                     // Reference to the parent database
+	tableName        string                           // Table name for multi-table support
+	indexes          map[string]*BTreeIndex           // Map of field name to index
+	layout           *embedcore.StructLayout          // Struct layout for fast field access
+	fieldOffsetCache map[string]embedcore.FieldOffset // Cached field offsets for O(1) lookup
+	lock             sync.RWMutex                     // Lock for concurrent access
+	pendingIndexes   map[string]struct{}              // Set of indexes that need to be rebuilt
 }
 
 // NewIndexManager creates a new index manager for a database.
 // The tableName parameter is used for multi-table support to namespace index files.
 //
 // Deprecated: internal use only. This function will be made private in a future release.
-func NewIndexManager[T any](db *Database[T], layout *StructLayout, tableName string) *IndexManager[T] {
+func NewIndexManager[T any](db *Database[T], layout *embedcore.StructLayout, tableName string) *IndexManager[T] {
 	// Build field offset cache for O(1) lookup
-	fieldOffsetCache := make(map[string]FieldOffset, len(layout.FieldOffsets))
+	fieldOffsetCache := make(map[string]embedcore.FieldOffset, len(layout.FieldOffsets))
 	for _, fo := range layout.FieldOffsets {
 		fieldOffsetCache[fo.Name] = fo
 	}

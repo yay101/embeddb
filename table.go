@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"slices"
+
+	embedcore "github.com/yay101/embeddbcore"
 )
 
 // Table provides typed table access for a specific struct type
@@ -11,7 +13,7 @@ type Table[T any] struct {
 	db           *Database[T]
 	name         string
 	tableID      uint8
-	layout       *StructLayout
+	layout       *embedcore.StructLayout
 	indexManager *IndexManager[T]
 }
 
@@ -374,7 +376,7 @@ func (t *Table[T]) Filter(fn func(T) bool) ([]T, error) {
 type Scanner[T any] struct {
 	db        *Database[T]
 	tableID   uint8
-	layout    *StructLayout
+	layout    *embedcore.StructLayout
 	indexSnap []uint32 // Snapshot of record IDs
 	pos       int
 	buf       []byte

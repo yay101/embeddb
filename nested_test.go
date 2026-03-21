@@ -5,6 +5,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	embedcore "github.com/yay101/embeddbcore"
 )
 
 type Address struct {
@@ -40,7 +42,7 @@ func TestNestedStructQuery(t *testing.T) {
 	defer db.Close()
 
 	// First, let's see what fields are detected
-	layout, _ := ComputeStructLayout(Employee{})
+	layout, _ := embedcore.ComputeStructLayout(Employee{})
 	fmt.Println("Detected fields:")
 	for key, fo := range layout.FieldOffsets {
 		fmt.Printf("  Key %d: Name=%s, Type=%v, IsStruct=%v, IsTime=%v\n", key, fo.Name, fo.Type, fo.IsStruct, fo.IsTime)

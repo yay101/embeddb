@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	embedcore "github.com/yay101/embeddbcore"
 	"golang.org/x/exp/mmap"
 )
 
@@ -30,7 +31,7 @@ type Database[T any] struct {
 	mfile              *mmap.ReaderAt
 	mlock              sync.RWMutex
 	indexes            map[uint8]map[uint32]uint32 // tableID -> recordID -> file offset
-	layout             *StructLayout               // Struct layout information using unsafe
+	layout             *embedcore.StructLayout     // Struct layout information using unsafe
 	nextRecordID       uint32
 	nlock              sync.Mutex
 	transaction        *Transaction       // Transaction manager for atomicity
@@ -93,7 +94,7 @@ const (
 // Example: db.Table() or db.Table("users")
 func (db *Database[T]) Table(name ...string) (*Table[T], error) {
 	var instance T
-	layout, err := ComputeStructLayout(instance)
+	layout, err := embedcore.ComputeStructLayout(instance)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute struct layout: %w", err)
 	}

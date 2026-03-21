@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	embedcore "github.com/yay101/embeddbcore"
 )
 
 // TableCatalogEntry represents a single table in the database catalog.
@@ -376,7 +378,7 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 	var instance T
 
 	// Compute struct layout using unsafe pointers for field offsets
-	layout, err := ComputeStructLayout(instance)
+	layout, err := embedcore.ComputeStructLayout(instance)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute struct layout: %w", err)
 	}
@@ -487,7 +489,7 @@ func New[T any](filename string, migrate bool, autoIndex bool) (*Database[T], er
 					}
 					existingRecord, err := db.decodeRecord(recordBytes)
 					if err == nil && existingRecord != nil {
-						oldLayout, err := ComputeStructLayout(*existingRecord)
+						oldLayout, err := embedcore.ComputeStructLayout(*existingRecord)
 						if err != nil {
 							db.Close()
 							return nil, fmt.Errorf("failed to compute layout of existing record: %w", err)
