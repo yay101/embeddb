@@ -3,6 +3,7 @@ package embeddb
 import (
 	"encoding/binary"
 	"fmt"
+	"reflect"
 	"slices"
 
 	embedcore "github.com/yay101/embeddbcore"
@@ -100,14 +101,51 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 }
 
 // Get retrieves a record by ID
-func (t *Table[T]) Get(id uint32) (*T, error) {
+// Supports uint32, int, or string primary keys based on the struct definition
+func (t *Table[T]) Get(id any) (*T, error) {
 	t.db.lock.RLock()
 	defer t.db.lock.RUnlock()
 
-	// Look up the record offset
-	offset, exists := t.db.getRecordOffset(t.tableID, id)
-	if !exists {
-		return nil, fmt.Errorf("record with id %d not found", id)
+	var recordID uint32
+	var offset uint32
+	var exists bool
+
+	// If no PK or PK is uint32, use internal index
+	if t.layout.PrimaryKey >= 255 || t.layout.PKType == reflect.Uint32 {
+		switch v := id.(type) {
+		case uint32:
+			recordID = v
+		case int:
+			recordID = uint32(v)
+		case int64:
+			recordID = uint32(v)
+		default:
+			return nil, fmt.Errorf("expected integer ID, got %T", id)
+		}
+		offset, exists = t.db.getRecordOffset(t.tableID, recordID)
+		if !exists {
+			return nil, fmt.Errorf("record with id %d not found", recordID)
+		}
+	} else {
+		// Use the PK field's index
+		pkField := t.layout.FieldOffsets[t.layout.PrimaryKey]
+		if t.indexManager == nil {
+			return nil, fmt.Errorf("no index manager for table")
+		}
+
+		recordIDs, err := t.indexManager.Query(pkField.Name, id)
+		if err != nil {
+			return nil, fmt.Errorf("query failed: %w", err)
+		}
+		if len(recordIDs) == 0 {
+			return nil, fmt.Errorf("record not found")
+		}
+		// Use the first match (PKs should be unique)
+		recordID = recordIDs[0]
+		offset, exists = t.db.getRecordOffset(t.tableID, recordID)
+		if !exists {
+			return nil, fmt.Errorf("record not found")
+		}
 	}
 
 	// Read the record bytes
@@ -118,7 +156,7 @@ func (t *Table[T]) Get(id uint32) (*T, error) {
 
 	// Check if active
 	if !isActiveRecord(recordBytes) {
-		return nil, fmt.Errorf("record with id %d is not active", id)
+		return nil, fmt.Errorf("record is not active")
 	}
 
 	// Decode the record
@@ -126,7 +164,7 @@ func (t *Table[T]) Get(id uint32) (*T, error) {
 }
 
 // Update updates an existing record
-func (t *Table[T]) Update(id uint32, record *T) error {
+func (t *Table[T]) Update(id any, record *T) error {
 	// Ensure table is registered
 	if err := t.ensureTableRegistered(); err != nil {
 		return err
@@ -134,54 +172,86 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 
 	// Serialize write operations
 	t.db.writeLock.Lock()
-	defer t.db.writeLock.Unlock()
 
 	strictSync := t.db.needsCrossHandleSync()
 	if strictSync {
 		if err := t.db.syncStateFromDiskForWrite(); err != nil {
+			t.db.writeLock.Unlock()
 			return fmt.Errorf("failed to sync database state before update: %w", err)
 		}
 	}
 
 	t.db.lock.Lock()
+	defer t.db.lock.Unlock()
+	defer t.db.writeLock.Unlock()
 
-	// Check if record exists
-	oldOffset, exists := t.db.indexes[t.tableID][id]
-	if !exists {
-		t.db.lock.Unlock()
-		return fmt.Errorf("record with id %d not found", id)
+	// Resolve ID to internal uint32
+	var recordID uint32
+	var oldOffset uint32
+	var exists bool
+
+	if t.layout.PrimaryKey >= 255 || t.layout.PKType == reflect.Uint32 {
+		// Use internal index
+		switch v := id.(type) {
+		case uint32:
+			recordID = v
+		case int:
+			recordID = uint32(v)
+		case int64:
+			recordID = uint32(v)
+		default:
+			return fmt.Errorf("expected integer ID, got %T", id)
+		}
+		oldOffset, exists = t.db.getRecordOffset(t.tableID, recordID)
+		if !exists {
+			return fmt.Errorf("record with id %d not found", recordID)
+		}
+	} else {
+		// Use PK index
+		pkField := t.layout.FieldOffsets[t.layout.PrimaryKey]
+		if t.indexManager == nil {
+			return fmt.Errorf("no index manager for table")
+		}
+
+		recordIDs, err := t.indexManager.Query(pkField.Name, id)
+		if err != nil {
+			return fmt.Errorf("query failed: %w", err)
+		}
+		if len(recordIDs) == 0 {
+			return fmt.Errorf("record not found")
+		}
+		recordID = recordIDs[0]
+		oldOffset, exists = t.db.getRecordOffset(t.tableID, recordID)
+		if !exists {
+			return fmt.Errorf("record not found")
+		}
 	}
 
 	// Read old record
 	oldBytes, err := t.db.readRecordBytesAt(oldOffset, t.tableID)
 	if err != nil {
-		t.db.lock.Unlock()
 		return fmt.Errorf("failed to read old record: %w", err)
 	}
 
 	if !isActiveRecord(oldBytes) {
-		t.db.lock.Unlock()
-		return fmt.Errorf("cannot update inactive record with id %d", id)
+		return fmt.Errorf("cannot update inactive record")
 	}
 
 	// Get old record for index update
 	oldRecord, err := t.db.decodeRecordWithLayout(oldBytes, t.layout)
 	if err != nil {
-		t.db.lock.Unlock()
 		return fmt.Errorf("failed to decode old record: %w", err)
 	}
 
 	// Mark old record as inactive
 	_, err = t.db.file.WriteAt([]byte{0}, int64(oldOffset+11))
 	if err != nil {
-		t.db.lock.Unlock()
 		return fmt.Errorf("failed to mark old record as inactive: %w", err)
 	}
 
 	// Encode updated record
 	encoded, err := t.db.encodeRecordWithLayout(record, t.layout)
 	if err != nil {
-		t.db.lock.Unlock()
 		return fmt.Errorf("failed to encode record: %w", err)
 	}
 
@@ -191,7 +261,7 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 	headerBytes[1] = startMarker
 	headerBytes[2] = t.tableID
 
-	binary.BigEndian.PutUint32(headerBytes[3:7], id)
+	binary.BigEndian.PutUint32(headerBytes[3:7], recordID)
 
 	recordLength := uint32(len(encoded))
 	binary.BigEndian.PutUint32(headerBytes[7:11], recordLength)
@@ -208,36 +278,31 @@ func (t *Table[T]) Update(id uint32, record *T) error {
 	// Write updated record
 	nextOffset := t.db.header.nextOffset
 	if err := t.db.writeData(completeRecord, int64(nextOffset)); err != nil {
-		t.db.lock.Unlock()
 		return fmt.Errorf("failed to write updated record: %w", err)
 	}
 
 	// Update index
-	t.db.indexes[t.tableID][id] = nextOffset
+	t.db.setRecordOffset(t.tableID, recordID, nextOffset)
 	t.db.header.nextOffset += uint32(len(completeRecord))
 
 	// Update indexes
 	if t.indexManager != nil && oldRecord != nil {
-		if err := t.indexManager.UpdateInIndexes(oldRecord, record, id); err != nil {
-			t.db.lock.Unlock()
+		if err := t.indexManager.UpdateInIndexes(oldRecord, record, recordID); err != nil {
 			return fmt.Errorf("failed to update indexes: %w", err)
 		}
 	}
 
 	if strictSync {
 		if err := t.db.writeIndexLocked(); err != nil {
-			t.db.lock.Unlock()
 			return fmt.Errorf("failed to persist index after update: %w", err)
 		}
 	}
-
-	t.db.lock.Unlock()
 
 	return nil
 }
 
 // Delete soft-deletes a record
-func (t *Table[T]) Delete(id uint32) error {
+func (t *Table[T]) Delete(id any) error {
 	// Serialize write operations
 	t.db.writeLock.Lock()
 	defer t.db.writeLock.Unlock()
@@ -249,55 +314,83 @@ func (t *Table[T]) Delete(id uint32) error {
 	}
 
 	t.db.lock.Lock()
+	defer t.db.lock.Unlock()
 
-	// Check if record exists
-	offset, exists := t.db.indexes[t.tableID][id]
-	if !exists {
-		t.db.lock.Unlock()
-		return fmt.Errorf("record with id %d not found", id)
+	// Resolve ID to internal uint32
+	var recordID uint32
+	var offset uint32
+	var exists bool
+
+	if t.layout.PrimaryKey >= 255 || t.layout.PKType == reflect.Uint32 {
+		// Use internal index
+		switch v := id.(type) {
+		case uint32:
+			recordID = v
+		case int:
+			recordID = uint32(v)
+		case int64:
+			recordID = uint32(v)
+		default:
+			return fmt.Errorf("expected integer ID, got %T", id)
+		}
+		offset, exists = t.db.getRecordOffset(t.tableID, recordID)
+		if !exists {
+			return fmt.Errorf("record with id %d not found", recordID)
+		}
+	} else {
+		// Use PK index
+		pkField := t.layout.FieldOffsets[t.layout.PrimaryKey]
+		if t.indexManager == nil {
+			return fmt.Errorf("no index manager for table")
+		}
+
+		recordIDs, err := t.indexManager.Query(pkField.Name, id)
+		if err != nil {
+			return fmt.Errorf("query failed: %w", err)
+		}
+		if len(recordIDs) == 0 {
+			return fmt.Errorf("record not found")
+		}
+		recordID = recordIDs[0]
+		offset, exists = t.db.getRecordOffset(t.tableID, recordID)
+		if !exists {
+			return fmt.Errorf("record not found")
+		}
 	}
 
 	// Check if already inactive
 	recordBytes, err := t.db.readRecordBytesAt(offset, t.tableID)
 	if err != nil {
-		t.db.lock.Unlock()
 		return fmt.Errorf("failed to read record: %w", err)
 	}
 
 	if !isActiveRecord(recordBytes) {
-		t.db.lock.Unlock()
 		return nil
 	}
 
 	// Get record for index update
 	record, err := t.db.decodeRecordWithLayout(recordBytes, t.layout)
 	if err != nil {
-		t.db.lock.Unlock()
 		return fmt.Errorf("failed to get record for index updates: %w", err)
 	}
 
 	// Mark as inactive
 	_, err = t.db.file.WriteAt([]byte{0}, int64(offset+11))
 	if err != nil {
-		t.db.lock.Unlock()
 		return fmt.Errorf("failed to mark record as deleted: %w", err)
 	}
 
 	// Write index
 	if err := t.db.writeIndexLocked(); err != nil {
-		t.db.lock.Unlock()
 		return fmt.Errorf("failed to update index: %w", err)
 	}
 
 	// Update indexes
 	if t.indexManager != nil && record != nil {
-		if err := t.indexManager.RemoveFromIndexes(record, id); err != nil {
-			t.db.lock.Unlock()
+		if err := t.indexManager.RemoveFromIndexes(record, recordID); err != nil {
 			return fmt.Errorf("failed to update indexes: %w", err)
 		}
 	}
-
-	t.db.lock.Unlock()
 
 	return nil
 }

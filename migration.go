@@ -285,11 +285,10 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *embedcore.Str
 	// Header: [escCode,startMarker](2) + tableID(1) + id(4) + length(4) + active(1)
 	recordID := binary.BigEndian.Uint32(data[3:7])
 
-	// If there's a primary key field, set the ID
-	if layout.PrimaryKey < 255 {
+	// If there's a uint32 primary key field, set the ID from the header
+	// For non-uint32 PKs, we decode them from the data normally
+	if layout.PrimaryKey < 255 && layout.PKType == reflect.Uint32 {
 		if pkField, exists := layout.FieldOffsets[layout.PrimaryKey]; exists {
-			// Set the primary key field value
-			// Pass as uint32 directly since that's what we read from the header
 			if err := embedcore.SetFieldValue(record, pkField, uint32(recordID)); err != nil {
 				return nil, fmt.Errorf("failed to set primary key field: %w", err)
 			}
@@ -330,8 +329,9 @@ func (db *Database[T]) decodeRecordWithLayout(data []byte, layout *embedcore.Str
 			continue
 		}
 
-		// Skip primary key field - it's already set from the record header
-		if fieldOffset.Primary {
+		// Skip uint32 PK field - it's already set from the record header
+		// For non-uint32 PKs, we decode them normally
+		if fieldOffset.Primary && layout.PKType == reflect.Uint32 {
 			// Find the value end marker and skip
 			endIdx := bytes.IndexByte(data, valueEndMarker)
 			if endIdx == -1 {
@@ -545,8 +545,9 @@ func (db *Database[T]) encodeRecordWithLayout(record *T, layout *embedcore.Struc
 			continue
 		}
 
-		// Skip primary key field - it's stored in the record header, not the data
-		if fieldOffset.Primary {
+		// Skip uint32 PK field - it's stored in the record header, not the data
+		// For non-uint32 PKs, we encode them normally so they can be indexed
+		if fieldOffset.Primary && layout.PKType == reflect.Uint32 {
 			continue
 		}
 

@@ -128,6 +128,9 @@ type Record struct {
     
     // Embedded time.Time in nested struct
     Metadata  Metadata
+    
+    // Skip fields (not stored in database)
+    TempData []byte `db:"-"`
 }
 
 type Address struct {
@@ -138,6 +141,89 @@ type Address struct {
 type Metadata struct {
     Version   int       `db:"index"`
     DeletedAt time.Time `db:"index"`  // Query: "Metadata.DeletedAt"
+}
+```
+
+## Primary Keys
+
+Any field can be marked as the primary key with `db:"id,primary"`. EmbedDB auto-generates an internal `uint32` ID for every record, but you can use any field as your lookup key.
+
+### String Primary Key (e.g., UUID, email)
+
+```go
+type User struct {
+    UUID   string `db:"id,primary"`  // Used for Get/Update/Delete
+    Name   string
+    Email  string `db:"index"`
+}
+
+db, _ := embeddb.Open("users.db", embeddb.OpenOptions{AutoIndex: true})
+users, _ := embeddb.Use[User](db, "users")
+
+// Insert - UUID is stored and indexed automatically
+users.Insert(&User{UUID: "user-123", Name: "Alice", Email: "alice@example.com"})
+
+// Get by UUID (string)
+user, _ := users.Get("user-123")
+
+// Update by UUID
+users.Update("user-123", &User{UUID: "user-123", Name: "Alice Updated"})
+
+// Delete by UUID
+users.Delete("user-123")
+```
+
+### Integer Primary Key (e.g., SKU, product code)
+
+```go
+type Product struct {
+    SKU    int     `db:"id,primary"`  // Used for Get/Update/Delete
+    Name   string  `db:"index"`
+    Price  float64 `db:"index"`
+}
+
+products, _ := embeddb.Use[Product](db, "products")
+
+products.Insert(&Product{SKU: 12345, Name: "Widget", Price: 9.99})
+product, _ := products.Get(12345)  // Get by SKU (int)
+products.Update(12345, &Product{SKU: 12345, Name: "Updated Widget"})
+```
+
+### Traditional uint32 Primary Key
+
+The original behavior - uses the auto-generated internal ID:
+
+```go
+type Order struct {
+    ID         uint32 `db:"id,primary"`  // uint32 PK (stored in header)
+    CustomerID uint32 `db:"index"`
+    Total      float64 `db:"index"`
+    Status     string `db:"index"`
+}
+
+orders, _ := embeddb.Use[Order](db, "orders")
+
+id, _ := orders.Insert(&Order{CustomerID: 1, Total: 99.99, Status: "pending"})
+order, _ := orders.Get(id)  // Get by internal uint32 ID
+```
+
+### How It Works
+
+- **Internal ID**: Every record gets an auto-generated `uint32` ID stored in the record header
+- **User-facing PK**: The field marked with `db:"id,primary"` is used for `Get`/`Update`/`Delete`
+- **Auto-indexing**: Non-uint32 PK fields are automatically indexed for fast lookups
+- **uint32 PKs**: Stored only in the header (no data duplication), use direct offset lookup
+
+### Skipping Fields
+
+Use `db:"-"` to exclude fields from storage. Useful for temporary data or runtime-only fields:
+
+```go
+type Config struct {
+    ID       uint32 `db:"id,primary"`
+    Name     string
+    Settings map[string]string `db:"-"`  // Not stored
+    Cache   []byte            `db:"-"`  // Not stored
 }
 ```
 
@@ -294,7 +380,7 @@ err := db.Close()
 
 ```go
 type Product struct {
-    ID          uint32    `db:"id,primary"`
+    ID          string    `db:"id,primary"`  // String SKU (e.g., "SKU-12345")
     Name        string    `db:"index"`
     Category    string    `db:"index"`
     Price       float64   `db:"index"`
@@ -304,9 +390,9 @@ type Product struct {
 }
 
 type Order struct {
-    ID         uint32    `db:"id,primary"`
-    CustomerID uint32    `db:"index"`
-    ProductID  uint32    `db:"index"`
+    ID         string    `db:"id,primary"`  // Order number (e.g., "ORD-20240115-001")
+    CustomerID string    `db:"index"`       // Customer UUID
+    ProductID  string    `db:"index"`       // Product SKU
     Quantity   int       `db:"index"`
     TotalPrice float64   `db:"index"`
     Status     string    `db:"index"`
@@ -317,13 +403,26 @@ db, _ := embeddb.Open("shop.db", embeddb.OpenOptions{AutoIndex: true})
 products, _ := embeddb.Use[Product](db, "products")
 orders, _ := embeddb.Use[Order](db, "orders")
 
-// Insert products
-products.Insert(&Product{Name: "Laptop", Category: "Electronics", Price: 999.99, Stock: 50})
-products.Insert(&Product{Name: "Headphones", Category: "Electronics", Price: 79.99, Stock: 200})
+// Insert products with string IDs
+products.Insert(&Product{
+    ID: "LAPTOP-001", Name: "Laptop", Category: "Electronics", Price: 999.99, Stock: 50,
+})
+products.Insert(&Product{
+    ID: "HEADPHONES-001", Name: "Headphones", Category: "Electronics", Price: 79.99, Stock: 200,
+})
+
+// Get by product ID
+laptop, _ := products.Get("LAPTOP-001")
 
 // Find all electronics under $500
 deals, _ := products.Filter(func(p Product) bool {
     return p.Category == "Electronics" && p.Price < 500
+})
+
+// Create order with string ID
+orders.Insert(&Order{
+    ID: "ORD-20240115-001", CustomerID: "cust-123", ProductID: "LAPTOP-001",
+    Quantity: 1, TotalPrice: 999.99, Status: "pending",
 })
 
 // Get paginated results
@@ -337,22 +436,22 @@ for page := 0; page < int(result.TotalCount)/20+1; page++ {
 
 ```go
 type User struct {
-    ID    uint32 `db:"id,primary"`
+    ID    string `db:"id,primary"`  // UUID
     Name  string `db:"index"`
     Email string `db:"index"`
 }
 
 type Post struct {
-    ID        uint32 `db:"id,primary"`
-    AuthorID  uint32 `db:"index"`
+    ID        string `db:"id,primary"`  // Slug (URL-friendly)
+    AuthorID  string `db:"index"`       // User UUID
     Title     string `db:"index"`
     Published bool   `db:"index"`
 }
 
 type Comment struct {
-    ID        uint32 `db:"id,primary"`
-    PostID    uint32 `db:"index"`
-    AuthorID  uint32 `db:"index"`
+    ID        int    `db:"id,primary"`  // Auto-incrementing int
+    PostID    string `db:"index"`       // Post slug
+    AuthorID  string `db:"index"`       // User UUID
     Content   string
 }
 
@@ -361,6 +460,15 @@ db, _ := embeddb.Open("blog.db")
 users, _ := embeddb.Use[User](db, "users")
 posts, _ := embeddb.Use[Post](db, "posts")
 comments, _ := embeddb.Use[Comment](db, "comments")
+
+// Get user by UUID
+user, _ := users.Get("user-abc-123")
+
+// Get post by slug
+post, _ := posts.Get("my-first-post")
+
+// Get comment by ID (int)
+comment, _ := comments.Get(42)
 
 // Create indexes for common queries
 users.CreateIndex("Email")
@@ -627,7 +735,7 @@ The `PagedResult[T]` type provides:
 ```go
 // Define structs with nested types
 type User struct {
-    ID        uint32  `db:"id,primary"`
+    ID        string  `db:"id,primary"`  // Can be any type
     Name      string  `db:"index"`
     Address   Address // Nested struct
     Manager   Manager // Another nested level
@@ -675,7 +783,7 @@ premiumNY, _ := users.Filter(func(u User) bool {
 ```go
 // Define struct with timestamps
 type Event struct {
-    ID        uint32    `db:"id,primary"`
+    ID        string    `db:"id,primary"`  // Event code (e.g., "CONF-2024-001")
     Name      string    `db:"index"`
     StartTime time.Time `db:"index"`
     EndTime   time.Time `db:"index"`
@@ -709,7 +817,7 @@ upcomingWeek, _ := events.Filter(func(e Event) bool {
 
 ```go
 type Task struct {
-    ID       uint32 `db:"id,primary"`
+    ID       string `db:"id,primary"`  // Task ID (e.g., "TASK-123")
     Title    string `db:"index"`
     Priority string `db:"index"` // "low", "medium", "high"
     Status   string `db:"index"` // "todo", "in_progress", "done"
