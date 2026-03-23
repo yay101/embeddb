@@ -43,7 +43,7 @@ func NewIndexManager[T any](db *Database[T], layout *embedcore.StructLayout, tab
 		fieldOffsetCache[fo.Name] = fo
 	}
 
-	return &IndexManager[T]{
+	im := &IndexManager[T]{
 		db:               db,
 		tableName:        tableName,
 		indexes:          make(map[string]*BTreeIndex),
@@ -51,6 +51,45 @@ func NewIndexManager[T any](db *Database[T], layout *embedcore.StructLayout, tab
 		fieldOffsetCache: fieldOffsetCache,
 		pendingIndexes:   make(map[string]struct{}),
 	}
+
+	// Auto-create index for non-uint32 primary key fields
+	im.createPKIndexIfNeeded()
+
+	return im
+}
+
+// createPKIndexIfNeeded creates an index for the primary key field if it's not uint32
+func (im *IndexManager[T]) createPKIndexIfNeeded() {
+	if im.layout.PrimaryKey >= 255 || im.layout.PKType == reflect.Uint32 {
+		return // No PK or uint32 PK (stored in header, no index needed)
+	}
+
+	pkField, exists := im.layout.FieldOffsets[im.layout.PrimaryKey]
+	if !exists {
+		return
+	}
+
+	// Create index for the PK field
+	im.lock.Lock()
+	defer im.lock.Unlock()
+
+	// Check if index already exists
+	if _, exists := im.indexes[pkField.Name]; exists {
+		return
+	}
+
+	indexFieldType := pkField.Type
+	if pkField.IsSlice && pkField.SliceElem != nil {
+		indexFieldType = pkField.SliceElem.Kind()
+	}
+
+	index, err := NewBTreeIndex(im.db.file.Name(), im.tableName, pkField.Name, pkField.Offset, indexFieldType, pkField.IsTime)
+	if err != nil {
+		return // Silently fail - PK index is optional
+	}
+
+	im.indexes[pkField.Name] = index
+	im.pendingIndexes[pkField.Name] = struct{}{}
 }
 
 // CreateIndex creates a new index for a specific field
