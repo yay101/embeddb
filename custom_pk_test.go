@@ -402,3 +402,141 @@ func TestMultipleStringPK(t *testing.T) {
 		t.Errorf("expected 1 result, got %d", len(results))
 	}
 }
+
+func TestUpsertStringPK(t *testing.T) {
+	dbPath := "test_upsert.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[UserWithStringPK](dbPath, false, true)
+	if err != nil {
+		t.Fatalf("failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	// Insert new record via Upsert
+	id, inserted, err := db.Upsert("alice@example.com", &UserWithStringPK{Email: "alice@example.com", Name: "Alice", Age: 30})
+	if err != nil {
+		t.Fatalf("failed to upsert: %v", err)
+	}
+	if !inserted {
+		t.Error("expected inserted to be true")
+	}
+	t.Logf("Inserted with internal ID: %d", id)
+
+	// Verify inserted
+	found, err := db.Get("alice@example.com")
+	if err != nil {
+		t.Fatalf("failed to get: %v", err)
+	}
+	if found.Name != "Alice" {
+		t.Errorf("expected Alice, got %s", found.Name)
+	}
+
+	// Upsert existing record
+	id2, inserted2, err := db.Upsert("alice@example.com", &UserWithStringPK{Email: "alice@example.com", Name: "Alice Updated", Age: 31})
+	if err != nil {
+		t.Fatalf("failed to upsert update: %v", err)
+	}
+	if inserted2 {
+		t.Error("expected inserted to be false for update")
+	}
+	if id != id2 {
+		t.Errorf("expected same internal ID: %d vs %d", id, id2)
+	}
+
+	// Verify updated
+	found, err = db.Get("alice@example.com")
+	if err != nil {
+		t.Fatalf("failed to get after update: %v", err)
+	}
+	if found.Name != "Alice Updated" {
+		t.Errorf("expected Alice Updated, got %s", found.Name)
+	}
+	if found.Age != 31 {
+		t.Errorf("expected age 31, got %d", found.Age)
+	}
+}
+
+func TestUpsertIntPK(t *testing.T) {
+	dbPath := "test_upsert_int.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[UserWithIntPK](dbPath, false, true)
+	if err != nil {
+		t.Fatalf("failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	// Insert via Upsert
+	_, inserted, err := db.Upsert(12345, &UserWithIntPK{SKU: 12345, Name: "Product A"})
+	if err != nil {
+		t.Fatalf("failed to upsert: %v", err)
+	}
+	if !inserted {
+		t.Error("expected inserted to be true")
+	}
+
+	// Update via Upsert
+	_, inserted2, err := db.Upsert(12345, &UserWithIntPK{SKU: 12345, Name: "Product A Updated"})
+	if err != nil {
+		t.Fatalf("failed to upsert update: %v", err)
+	}
+	if inserted2 {
+		t.Error("expected inserted to be false for update")
+	}
+
+	// Verify
+	found, err := db.Get(12345)
+	if err != nil {
+		t.Fatalf("failed to get: %v", err)
+	}
+	if found.Name != "Product A Updated" {
+		t.Errorf("expected Product A Updated, got %s", found.Name)
+	}
+}
+
+func TestUpsertTable(t *testing.T) {
+	dbPath := "test_upsert_table.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[UserWithStringPK](dbPath, false, true)
+	if err != nil {
+		t.Fatalf("failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	table, err := db.Table()
+	if err != nil {
+		t.Fatalf("failed to get table: %v", err)
+	}
+
+	// Insert via Upsert
+	_, inserted, err := table.Upsert("alice@example.com", &UserWithStringPK{Email: "alice@example.com", Name: "Alice", Age: 30})
+	if err != nil {
+		t.Fatalf("failed to upsert: %v", err)
+	}
+	if !inserted {
+		t.Error("expected inserted to be true")
+	}
+
+	// Update via Upsert
+	_, inserted2, err := table.Upsert("alice@example.com", &UserWithStringPK{Email: "alice@example.com", Name: "Alice Updated"})
+	if err != nil {
+		t.Fatalf("failed to upsert update: %v", err)
+	}
+	if inserted2 {
+		t.Error("expected inserted to be false")
+	}
+
+	// Verify
+	found, err := table.Get("alice@example.com")
+	if err != nil {
+		t.Fatalf("failed to get: %v", err)
+	}
+	if found.Name != "Alice Updated" {
+		t.Errorf("expected Alice Updated, got %s", found.Name)
+	}
+}

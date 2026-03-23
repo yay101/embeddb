@@ -277,6 +277,10 @@ user, err := users.Get(id)
 // Update
 err := users.Update(id, &User{Name: "Alice", Age: 31})
 
+// Upsert - insert or update based on whether the ID exists
+id, inserted, err := users.Upsert("alice@example.com", &User{Email: "alice@example.com", Name: "Alice"})
+// inserted=true if new record, inserted=false if updated
+
 // Delete (soft delete)
 err := users.Delete(id)
 

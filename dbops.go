@@ -1033,6 +1033,61 @@ func (db *Database[T]) UpdateInTable(id any, record *T, tableID uint8) error {
 	return nil
 }
 
+// Upsert inserts a new record or updates an existing one
+// If the record with the given ID exists, it updates it
+// If it doesn't exist, it inserts the new record
+// Returns the ID and a boolean indicating whether it was an insert (true) or update (false)
+func (db *Database[T]) Upsert(id any, record *T) (uint32, bool, error) {
+	// Try to get the record first
+	existing, err := db.Get(id)
+	if err == nil && existing != nil {
+		// Record exists, update it
+		if updateErr := db.Update(id, record); updateErr != nil {
+			return 0, false, updateErr
+		}
+		// Get the internal ID for return
+		internalID, _ := db.getInternalID(id)
+		return internalID, false, nil
+	}
+
+	// Record doesn't exist, insert it
+	insertID, err := db.Insert(record)
+	if err != nil {
+		return 0, true, err
+	}
+	return insertID, true, nil
+}
+
+// getInternalID returns the internal uint32 ID for a given PK value
+func (db *Database[T]) getInternalID(id any) (uint32, error) {
+	if db.layout.PrimaryKey >= 255 || db.layout.PKType == reflect.Uint32 {
+		switch v := id.(type) {
+		case uint32:
+			return v, nil
+		case int:
+			return uint32(v), nil
+		case int64:
+			return uint32(v), nil
+		default:
+			return 0, fmt.Errorf("expected integer ID")
+		}
+	}
+
+	// For non-uint32 PKs, query the index
+	pkField := db.layout.FieldOffsets[db.layout.PrimaryKey]
+	if db.indexManager == nil {
+		return 0, fmt.Errorf("no index manager")
+	}
+	recordIDs, err := db.indexManager.Query(pkField.Name, id)
+	if err != nil {
+		return 0, err
+	}
+	if len(recordIDs) == 0 {
+		return 0, fmt.Errorf("record not found")
+	}
+	return recordIDs[0], nil
+}
+
 // Compact removes deleted records and reorganizes the database file
 // This is a more thorough version of Vacuum that rebuilds the entire file
 func (db *Database[T]) Compact() error {
