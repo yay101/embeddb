@@ -395,6 +395,61 @@ func (t *Table[T]) Delete(id any) error {
 	return nil
 }
 
+// Upsert inserts a new record or updates an existing one
+// If the record with the given ID exists, it updates it
+// If it doesn't exist, it inserts the new record
+// Returns the ID and a boolean indicating whether it was an insert (true) or update (false)
+func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
+	// Try to get the record first
+	existing, err := t.Get(id)
+	if err == nil && existing != nil {
+		// Record exists, update it
+		if updateErr := t.Update(id, record); updateErr != nil {
+			return 0, false, updateErr
+		}
+		// Get the internal ID for return
+		internalID, _ := t.getInternalID(id)
+		return internalID, false, nil
+	}
+
+	// Record doesn't exist, insert it
+	insertID, err := t.Insert(record)
+	if err != nil {
+		return 0, true, err
+	}
+	return insertID, true, nil
+}
+
+// getInternalID returns the internal uint32 ID for a given PK value
+func (t *Table[T]) getInternalID(id any) (uint32, error) {
+	if t.layout.PrimaryKey >= 255 || t.layout.PKType == reflect.Uint32 {
+		switch v := id.(type) {
+		case uint32:
+			return v, nil
+		case int:
+			return uint32(v), nil
+		case int64:
+			return uint32(v), nil
+		default:
+			return 0, fmt.Errorf("expected integer ID")
+		}
+	}
+
+	// For non-uint32 PKs, query the index
+	pkField := t.layout.FieldOffsets[t.layout.PrimaryKey]
+	if t.indexManager == nil {
+		return 0, fmt.Errorf("no index manager")
+	}
+	recordIDs, err := t.indexManager.Query(pkField.Name, id)
+	if err != nil {
+		return 0, err
+	}
+	if len(recordIDs) == 0 {
+		return 0, fmt.Errorf("record not found")
+	}
+	return recordIDs[0], nil
+}
+
 // Query finds records by indexed field value
 func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 	if t.indexManager == nil || !t.indexManager.HasIndex(fieldName) {
@@ -442,6 +497,24 @@ func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inc
 		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
 	}
 	return t.indexManager.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
+}
+
+// All returns all records in the table
+func (t *Table[T]) All() ([]T, error) {
+	scanner := t.ScanRecords()
+	defer scanner.Close()
+
+	results := make([]T, 0)
+
+	for scanner.Next() {
+		record, err := scanner.Record()
+		if err != nil {
+			continue
+		}
+		results = append(results, *record)
+	}
+
+	return results, scanner.Err()
 }
 
 // Filter scans all records and returns those matching the filter
@@ -732,14 +805,38 @@ func paginateTableResults[T any](all []T, offset, limit int) *PagedResult[T] {
 // FilterPaged scans all records and returns those matching the filter with pagination
 func (t *Table[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedResult[T], error) {
 	t.db.lock.RLock()
-	defer t.db.lock.RUnlock()
+	idx := t.db.indexes[t.tableID]
+	if idx == nil {
+		t.db.lock.RUnlock()
+		return &PagedResult[T]{Records: []T{}}, nil
+	}
+
+	ids := make([]uint32, 0, len(idx))
+	for id := range idx {
+		ids = append(ids, id)
+	}
+	t.db.lock.RUnlock()
 
 	var results []T
 	totalCount := 0
 	skipped := 0
 
-	for id := range t.db.indexes[t.tableID] {
-		record, err := t.Get(id)
+	for _, id := range ids {
+		offsetVal, exists := idx[id]
+		if !exists {
+			continue
+		}
+
+		recordBytes, err := t.db.readRecordBytesAt(offsetVal, t.tableID)
+		if err != nil {
+			continue
+		}
+
+		if !isActiveRecord(recordBytes) {
+			continue
+		}
+
+		record, err := t.db.decodeRecordWithLayout(recordBytes, t.layout)
 		if err != nil {
 			continue
 		}
@@ -766,6 +863,71 @@ func (t *Table[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedResult
 		Records:    results,
 		TotalCount: totalCount,
 		HasMore:    hasMore,
+		Offset:     offset,
+		Limit:      limit,
+	}, nil
+}
+
+// AllPaged returns all records with pagination
+func (t *Table[T]) AllPaged(offset, limit int) (*PagedResult[T], error) {
+	t.db.lock.RLock()
+	idx := t.db.indexes[t.tableID]
+	if idx == nil {
+		t.db.lock.RUnlock()
+		return &PagedResult[T]{Records: []T{}}, nil
+	}
+
+	ids := make([]uint32, 0, len(idx))
+	for id := range idx {
+		ids = append(ids, id)
+	}
+	t.db.lock.RUnlock()
+
+	totalCount := len(ids)
+	if offset >= totalCount || limit <= 0 {
+		return &PagedResult[T]{
+			Records:    []T{},
+			TotalCount: totalCount,
+			HasMore:    false,
+			Offset:     offset,
+			Limit:      limit,
+		}, nil
+	}
+
+	end := offset + limit
+	if end > totalCount {
+		end = totalCount
+	}
+
+	results := make([]T, 0, end-offset)
+	for i := offset; i < end; i++ {
+		id := ids[i]
+		offsetVal, exists := idx[id]
+		if !exists {
+			continue
+		}
+
+		recordBytes, err := t.db.readRecordBytesAt(offsetVal, t.tableID)
+		if err != nil {
+			continue
+		}
+
+		if !isActiveRecord(recordBytes) {
+			continue
+		}
+
+		record, err := t.db.decodeRecordWithLayout(recordBytes, t.layout)
+		if err != nil {
+			continue
+		}
+
+		results = append(results, *record)
+	}
+
+	return &PagedResult[T]{
+		Records:    results,
+		TotalCount: totalCount,
+		HasMore:    end < totalCount,
 		Offset:     offset,
 		Limit:      limit,
 	}, nil

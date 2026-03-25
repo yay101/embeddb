@@ -306,17 +306,19 @@ func BenchmarkFilterAll(b *testing.B) {
 	}
 	defer db.Close()
 
+	table, _ := db.Table("records")
+
 	// Pre-populate
 	for i := 0; i < 10000; i++ {
 		record := generateRecord(i)
-		db.Insert(record)
+		table.Insert(record)
 	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := db.Filter(func(r BenchmarkRecord) bool {
+		_, err := table.Filter(func(r BenchmarkRecord) bool {
 			return r.Age > 0
 		})
 		if err != nil {
@@ -346,17 +348,19 @@ func BenchmarkFilterMatch(b *testing.B) {
 	}
 	defer db.Close()
 
+	table, _ := db.Table("records")
+
 	// Pre-populate
 	for i := 0; i < 10000; i++ {
 		record := generateRecord(i)
-		db.Insert(record)
+		table.Insert(record)
 	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := db.Filter(func(r BenchmarkRecord) bool {
+		_, err := table.Filter(func(r BenchmarkRecord) bool {
 			return r.Age > 50 // Matches ~30% of records
 		})
 		if err != nil {
@@ -481,9 +485,11 @@ func BenchmarkFilterNested(b *testing.B) {
 	}
 	defer db.Close()
 
+	table, _ := db.Table("records")
+
 	// Pre-populate
 	for i := 0; i < 10000; i++ {
-		db.Insert(&TestRecordNested{
+		table.Insert(&TestRecordNested{
 			ID:   uint32(i),
 			Name: fmt.Sprintf("User%d", i),
 			Age:  rand.Intn(80) + 18,
@@ -495,7 +501,7 @@ func BenchmarkFilterNested(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := db.Filter(func(r TestRecordNested) bool {
+		_, err := table.Filter(func(r TestRecordNested) bool {
 			return r.Age > 50
 		})
 		if err != nil {
@@ -521,9 +527,14 @@ func TestUnindexedScanBenchmarks(t *testing.T) {
 	}
 	defer db.Close()
 
+	table, err := db.Table("records")
+	if err != nil {
+		t.Fatalf("Failed to get table: %v", err)
+	}
+
 	// Pre-populate with 10000 records
 	for i := 0; i < 10000; i++ {
-		db.Insert(generateRecord(i))
+		table.Insert(generateRecord(i))
 	}
 
 	fmt.Println("\n=== Unindexed Scan Benchmarks (10,000 records) ===")
@@ -533,20 +544,20 @@ func TestUnindexedScanBenchmarks(t *testing.T) {
 	// Benchmark Filter - match all
 	start := time.Now()
 	count := 0
-	db.Scan(func(r BenchmarkRecord) bool { count++; return true })
+	table.Scan(func(r BenchmarkRecord) bool { count++; return true })
 	elapsed := time.Since(start)
 	fmt.Printf("Full scan (iterating all):    %8.2f ms (%d records)\n", float64(elapsed.Microseconds())/1000, count)
 
 	// Benchmark Filter - match some
 	start = time.Now()
-	results, _ := db.Filter(func(r BenchmarkRecord) bool { return r.Age > 50 })
+	results, _ := table.Filter(func(r BenchmarkRecord) bool { return r.Age > 50 })
 	elapsed = time.Since(start)
 	fmt.Printf("Filter (age > 50):             %8.2f ms (%d results)\n", float64(elapsed.Microseconds())/1000, len(results))
 
 	// Benchmark Scan with early exit
 	start = time.Now()
 	earlyCount := 0
-	db.Scan(func(r BenchmarkRecord) bool {
+	table.Scan(func(r BenchmarkRecord) bool {
 		earlyCount++
 		return earlyCount < 100 // Stop after 100
 	})

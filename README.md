@@ -1,3 +1,7 @@
+# Warning
+
+This project is in testing and used in production in a non life threatening situation. It has many hundreds of hours of human development and many hours of AI breaking things but is new to being shared with others. Do not use if you really can't lose your data.
+
 # EmbedDB
 
 A lightweight, embedded database for Go that gives you SQLite-like functionality with a more Go-native experience. Perfect for desktop apps, CLI tools, local caching, and anywhere you'd reach for SQLite but want something simpler.
@@ -20,6 +24,18 @@ A lightweight, embedded database for Go that gives you SQLite-like functionality
 - **Auto vacuum** - Automatic file compaction for long-running workloads
 
 ## Recent Releases
+
+### v1.0.0
+
+**Breaking Changes:**
+- Removed `Database.Filter()` and `Database.FilterPaged()` - use `Table.Filter()` and `Table.FilterPaged()` instead
+
+**New Features:**
+- `Table.All()` - Returns all records in the table
+- `Table.AllPaged(offset, limit)` - Returns paginated records with total count
+
+**Performance:**
+- `Table.FilterPaged()` now uses efficient direct reads instead of calling `Get()` per record
 
 ### v0.6.1
 
@@ -272,6 +288,10 @@ user, err := users.Get(id)
 
 // Update
 err := users.Update(id, &User{Name: "Alice", Age: 31})
+
+// Upsert - insert or update based on whether the ID exists
+id, inserted, err := users.Upsert("alice@example.com", &User{Email: "alice@example.com", Name: "Alice"})
+// inserted=true if new record, inserted=false if updated
 
 // Delete (soft delete)
 err := users.Delete(id)
