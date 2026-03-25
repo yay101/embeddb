@@ -25,6 +25,10 @@ A lightweight, embedded database for Go that gives you SQLite-like functionality
 
 ## Recent Releases
 
+### v1.0.1
+
+- `Table.QueryBy(conditions)` - Query using a map with operators: `"{> 18}"`, `"{BETWEEN a AND b}"`, `"{LIKE %pattern%}"`
+
 ### v1.0.0
 
 **Breaking Changes:**
@@ -852,6 +856,47 @@ urgentInProgress, _ := tasks.Filter(func(t Task) bool {
     return t.IsUrgent && t.Status != "done"
 })
 ```
+
+### QueryBy (Dynamic Queries from Maps)
+
+Use `QueryBy` to build queries from maps (e.g., from HTTP form data or URL query parameters):
+
+```go
+// Simple exact match
+result, _ := users.QueryBy(map[string]any{
+    "Status": "active",
+})
+
+// With operators (in brackets)
+result, _ := users.QueryBy(map[string]any{
+    "Age": "{>= 18}",
+    "Name": "{LIKE %Alice%}",
+})
+
+// BETWEEN range
+result, _ := products.QueryBy(map[string]any{
+    "Price": "{BETWEEN 10 AND 100}",
+})
+
+// With pagination
+result, _ := users.QueryBy(map[string]any{
+    "Status":  "active",
+    "_limit":  "20",
+    "_offset": "40",
+})
+```
+
+**Supported operators:**
+| Syntax | Meaning |
+|--------|---------|
+| `"field": "value"` | Exact match |
+| `"field": "{> 18}"` | Greater than |
+| `"field": "{>= 18}"` | Greater than or equal |
+| `"field": "{< 65}"` | Less than |
+| `"field": "{<= 65}"` | Less than or equal |
+| `"field": "{!= 0}"` | Not equal |
+| `"field": "{BETWEEN a AND b}"` | Between (inclusive) |
+| `"field": "{LIKE %pattern%}"` | Pattern match |
 
 ### Unindexed Queries (Full Table Scan)
 

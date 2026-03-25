@@ -379,3 +379,221 @@ func TestAllPaged(t *testing.T) {
 		t.Error("expected HasMore to be false")
 	}
 }
+
+func TestQueryBy(t *testing.T) {
+	dbPath := "/tmp/test_query_by.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[Person](dbPath, false, true)
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	defer db.Close()
+
+	table, err := db.Table("people")
+	if err != nil {
+		t.Fatalf("failed to get table: %v", err)
+	}
+
+	// Insert records
+	people := []Person{
+		{Name: "Alice", Age: 30},
+		{Name: "Bob", Age: 25},
+		{Name: "Charlie", Age: 35},
+		{Name: "Diana", Age: 30},
+		{Name: "Eve", Age: 25},
+	}
+	for _, p := range people {
+		_, err := table.Insert(&p)
+		if err != nil {
+			t.Fatalf("failed to insert: %v", err)
+		}
+	}
+
+	// Test simple exact match
+	result, err := table.QueryBy(map[string]any{
+		"Name": "Alice",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy failed: %v", err)
+	}
+	if len(result.Records) != 1 {
+		t.Errorf("expected 1 record, got %d", len(result.Records))
+	}
+	if result.Records[0].Age != 30 {
+		t.Errorf("expected age 30, got %d", result.Records[0].Age)
+	}
+
+	// Test multiple exact matches (AND logic)
+	result, err = table.QueryBy(map[string]any{
+		"Age":  "30",
+		"Name": "Alice",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy failed: %v", err)
+	}
+	if len(result.Records) != 1 {
+		t.Errorf("expected 1 record, got %d", len(result.Records))
+	}
+}
+
+func TestQueryByWithOperators(t *testing.T) {
+	dbPath := "/tmp/test_query_by_ops.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[Person](dbPath, false, false)
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	defer db.Close()
+
+	table, err := db.Table("people")
+	if err != nil {
+		t.Fatalf("failed to get table: %v", err)
+	}
+
+	// Insert records
+	for i := 1; i <= 10; i++ {
+		person := Person{Name: fmt.Sprintf("Person%d", i), Age: 10 + i*5}
+		_, err := table.Insert(&person)
+		if err != nil {
+			t.Fatalf("failed to insert: %v", err)
+		}
+	}
+
+	// Test > operator
+	result, err := table.QueryBy(map[string]any{
+		"Age": "{> 30}",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy failed: %v", err)
+	}
+	// Ages: 15, 20, 25, 30, 35, 40, 45, 50, 55, 60
+	// > 30 = 35, 40, 45, 50, 55, 60 = 6 records
+	if len(result.Records) != 6 {
+		t.Errorf("expected 6 records, got %d", len(result.Records))
+	}
+
+	// Test >= operator
+	result, err = table.QueryBy(map[string]any{
+		"Age": "{>= 30}",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy failed: %v", err)
+	}
+	// >= 30 = 30, 35, 40, 45, 50, 55, 60 = 7 records
+	if len(result.Records) != 7 {
+		t.Errorf("expected 7 records, got %d", len(result.Records))
+	}
+
+	// Test BETWEEN
+	result, err = table.QueryBy(map[string]any{
+		"Age": "{BETWEEN 25 AND 40}",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy failed: %v", err)
+	}
+	// 25 <= age <= 40 = 25, 30, 35, 40 = 4 records
+	if len(result.Records) != 4 {
+		t.Errorf("expected 4 records, got %d", len(result.Records))
+	}
+
+	// Test LIKE
+	result, err = table.QueryBy(map[string]any{
+		"Name": "{LIKE %Person2%}",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy failed: %v", err)
+	}
+	// Only Person2 matches (Person10 doesn't exist, Person20 doesn't exist)
+	if len(result.Records) != 1 {
+		t.Errorf("expected 1 record, got %d", len(result.Records))
+	}
+}
+
+func TestQueryByWithPagination(t *testing.T) {
+	dbPath := "/tmp/test_query_by_page.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[Person](dbPath, false, false)
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	defer db.Close()
+
+	table, err := db.Table("people")
+	if err != nil {
+		t.Fatalf("failed to get table: %v", err)
+	}
+
+	// Insert 20 records
+	for i := 1; i <= 20; i++ {
+		person := Person{Name: fmt.Sprintf("Person%d", i), Age: 10 + i}
+		_, err := table.Insert(&person)
+		if err != nil {
+			t.Fatalf("failed to insert: %v", err)
+		}
+	}
+
+	// Test with _limit and _offset
+	result, err := table.QueryBy(map[string]any{
+		"_limit":  "5",
+		"_offset": "10",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy failed: %v", err)
+	}
+
+	if len(result.Records) != 5 {
+		t.Errorf("expected 5 records, got %d", len(result.Records))
+	}
+	if result.TotalCount != 20 {
+		t.Errorf("expected total count 20, got %d", result.TotalCount)
+	}
+	if !result.HasMore {
+		t.Error("expected HasMore to be true")
+	}
+	if result.Offset != 10 {
+		t.Errorf("expected offset 10, got %d", result.Offset)
+	}
+}
+
+func TestQueryByNoResults(t *testing.T) {
+	dbPath := "/tmp/test_query_by_empty.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[Person](dbPath, false, false)
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	defer db.Close()
+
+	table, err := db.Table("people")
+	if err != nil {
+		t.Fatalf("failed to get table: %v", err)
+	}
+
+	// Insert one record
+	_, err = table.Insert(&Person{Name: "Alice", Age: 30})
+	if err != nil {
+		t.Fatalf("failed to insert: %v", err)
+	}
+
+	// Query for non-existent
+	result, err := table.QueryBy(map[string]any{
+		"Name": "Bob",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy failed: %v", err)
+	}
+	if len(result.Records) != 0 {
+		t.Errorf("expected 0 records, got %d", len(result.Records))
+	}
+	if result.TotalCount != 0 {
+		t.Errorf("expected total count 0, got %d", result.TotalCount)
+	}
+}
