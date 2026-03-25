@@ -1,6 +1,7 @@
 package embeddb
 
 import (
+	"fmt"
 	"os"
 	"testing"
 )
@@ -172,17 +173,22 @@ func TestFilterPaged(t *testing.T) {
 	}
 	defer db.Close()
 
+	table, err := db.Table("people")
+	if err != nil {
+		t.Fatalf("failed to get table: %v", err)
+	}
+
 	// Insert 20 records with different ages
 	for i := 1; i <= 20; i++ {
 		person := Person{Name: "Person", Age: i}
-		_, err := db.Insert(&person)
+		_, err := table.Insert(&person)
 		if err != nil {
 			t.Fatalf("failed to insert: %v", err)
 		}
 	}
 
 	// Filter for ages >= 15
-	result, err := db.FilterPaged(func(p Person) bool {
+	result, err := table.FilterPaged(func(p Person) bool {
 		return p.Age >= 15
 	}, 0, 5)
 	if err != nil {
@@ -207,7 +213,7 @@ func TestFilterPaged(t *testing.T) {
 	}
 
 	// Get second page
-	result, err = db.FilterPaged(func(p Person) bool {
+	result, err = table.FilterPaged(func(p Person) bool {
 		return p.Age >= 15
 	}, 5, 5)
 	if err != nil {
@@ -270,5 +276,106 @@ func TestTablePaged(t *testing.T) {
 		if rec.Age > 10 {
 			t.Errorf("expected age <= 10, got %d", rec.Age)
 		}
+	}
+}
+
+func TestAll(t *testing.T) {
+	dbPath := "/tmp/test_all.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[Person](dbPath, false, false)
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	defer db.Close()
+
+	table, err := db.Table("people")
+	if err != nil {
+		t.Fatalf("failed to get table: %v", err)
+	}
+
+	// Insert 10 records
+	for i := 1; i <= 10; i++ {
+		person := Person{Name: fmt.Sprintf("Person%d", i), Age: i * 10}
+		_, err := table.Insert(&person)
+		if err != nil {
+			t.Fatalf("failed to insert: %v", err)
+		}
+	}
+
+	// Get all records
+	all, err := table.All()
+	if err != nil {
+		t.Fatalf("All failed: %v", err)
+	}
+
+	if len(all) != 10 {
+		t.Errorf("expected 10 records, got %d", len(all))
+	}
+}
+
+func TestAllPaged(t *testing.T) {
+	dbPath := "/tmp/test_all_paged.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[Person](dbPath, false, false)
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	defer db.Close()
+
+	table, err := db.Table("people")
+	if err != nil {
+		t.Fatalf("failed to get table: %v", err)
+	}
+
+	// Insert 20 records
+	for i := 1; i <= 20; i++ {
+		person := Person{Name: fmt.Sprintf("Person%d", i), Age: i}
+		_, err := table.Insert(&person)
+		if err != nil {
+			t.Fatalf("failed to insert: %v", err)
+		}
+	}
+
+	// Get first page
+	result, err := table.AllPaged(0, 5)
+	if err != nil {
+		t.Fatalf("AllPaged failed: %v", err)
+	}
+
+	if len(result.Records) != 5 {
+		t.Errorf("expected 5 records, got %d", len(result.Records))
+	}
+	if result.TotalCount != 20 {
+		t.Errorf("expected total count 20, got %d", result.TotalCount)
+	}
+	if !result.HasMore {
+		t.Error("expected HasMore to be true")
+	}
+
+	// Get second page
+	result, err = table.AllPaged(5, 5)
+	if err != nil {
+		t.Fatalf("AllPaged failed: %v", err)
+	}
+
+	if len(result.Records) != 5 {
+		t.Errorf("expected 5 records, got %d", len(result.Records))
+	}
+
+	// Get beyond bounds
+	result, err = table.AllPaged(20, 5)
+	if err != nil {
+		t.Fatalf("AllPaged failed: %v", err)
+	}
+
+	if len(result.Records) != 0 {
+		t.Errorf("expected 0 records, got %d", len(result.Records))
+	}
+	if result.HasMore {
+		t.Error("expected HasMore to be false")
 	}
 }

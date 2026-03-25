@@ -81,7 +81,7 @@ const (
 	valueEndMarker            byte         = 0x1F
 	embeddedStructType        reflect.Kind = reflect.Struct // Use reflect.Struct
 	defaultIndexPreallocation uint32       = 10240          // 10KB preallocated for index by default
-	Version                   string       = "0.4.0"
+	Version                   string       = "1.0.0"
 	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
 	autoVacuumInterval                     = 24 * time.Hour
 	autoVacuumMinChanges      uint64       = 50000
@@ -490,67 +490,6 @@ func (db *Database[T]) QueryRangeBetween(fieldName string, min, max interface{},
 	return db.indexManager.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
 }
 
-// FilterFunc is a function that returns true if a record matches the filter criteria
-type FilterFunc[T any] func(record T) bool
-
-// Filter scans all records and returns those that match the filter function.
-// This performs an unindexed full table scan - use only when no index is available.
-func (db *Database[T]) Filter(fn FilterFunc[T]) ([]T, error) {
-	// Quick snapshot of index keys
-	db.lock.RLock()
-	var idx map[uint32]uint32
-	var tableID uint8 = 0
-
-	// Find non-empty index (prefer table 0 for legacy, but use any available)
-	for tid, m := range db.indexes {
-		if len(m) > 0 {
-			idx = m
-			tableID = tid
-			break
-		}
-	}
-
-	if idx == nil {
-		db.lock.RUnlock()
-		return nil, nil
-	}
-
-	ids := make([]uint32, 0, len(idx))
-	for id := range idx {
-		ids = append(ids, id)
-	}
-	db.lock.RUnlock()
-
-	// Iterate without holding lock
-	results := make([]T, 0)
-	for _, id := range ids {
-		offset, exists := idx[id]
-		if !exists {
-			continue
-		}
-
-		recordBytes, err := db.readRecordBytesAt(offset, tableID)
-		if err != nil {
-			continue
-		}
-
-		if !isActiveRecord(recordBytes) {
-			continue
-		}
-
-		record, err := db.decodeRecord(recordBytes)
-		if err != nil {
-			continue
-		}
-
-		if fn(*record) {
-			results = append(results, *record)
-		}
-	}
-
-	return results, nil
-}
-
 // Scan iterates over all records, calling the callback for each.
 // This performs an unindexed full table scan - use only when no index is available.
 // The callback can return false to stop iteration early.
@@ -651,82 +590,4 @@ func (db *Database[T]) QueryRangeBetweenPaged(fieldName string, min, max interfa
 		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
 	}
 	return db.indexManager.QueryRangeBetweenPaged(fieldName, min, max, inclusiveMin, inclusiveMax, offset, limit)
-}
-
-// FilterPaged scans all records and returns those that match the filter function with pagination
-func (db *Database[T]) FilterPaged(fn FilterFunc[T], offset, limit int) (*PagedResult[T], error) {
-	// Quick snapshot of index keys
-	db.lock.RLock()
-	var idx map[uint32]uint32
-	var tableID uint8
-
-	for tid, m := range db.indexes {
-		if len(m) > 0 {
-			idx = m
-			tableID = tid
-			break
-		}
-	}
-
-	if idx == nil {
-		db.lock.RUnlock()
-		return &PagedResult[T]{Records: []T{}}, nil
-	}
-
-	ids := make([]uint32, 0, len(idx))
-	for id := range idx {
-		ids = append(ids, id)
-	}
-	db.lock.RUnlock()
-
-	// Iterate without holding lock
-	var results []T
-	totalCount := 0
-	skipped := 0
-
-	for _, id := range ids {
-		offsetVal, exists := idx[id]
-		if !exists {
-			continue
-		}
-
-		recordBytes, err := db.readRecordBytesAt(offsetVal, tableID)
-		if err != nil {
-			continue
-		}
-
-		if !isActiveRecord(recordBytes) {
-			continue
-		}
-
-		record, err := db.decodeRecord(recordBytes)
-		if err != nil {
-			continue
-		}
-
-		if fn(*record) {
-			totalCount++
-			if skipped < offset {
-				skipped++
-				continue
-			}
-			if len(results) < limit {
-				results = append(results, *record)
-			}
-		}
-	}
-
-	if results == nil {
-		results = []T{}
-	}
-
-	hasMore := (skipped + len(results)) < totalCount
-
-	return &PagedResult[T]{
-		Records:    results,
-		TotalCount: totalCount,
-		HasMore:    hasMore,
-		Offset:     offset,
-		Limit:      limit,
-	}, nil
 }

@@ -1,6 +1,6 @@
 # Warning
 
-This project is in testing and used in production in a non life threatening situation. It has many hundreds of hours of human development and many hours of AI breaking things but is new to being shared with others. Do not use if you really can't lose your data. The API will remain the same until go gets generic methods soon tm at which point it will move to v2.0.0.
+This project is in testing and used in production in a non life threatening situation. It has many hundreds of hours of human development and many hours of AI breaking things but is new to being shared with others. Do not use if you really can't lose your data.
 
 # EmbedDB
 
@@ -24,6 +24,18 @@ A lightweight, embedded database for Go that gives you SQLite-like functionality
 - **Auto vacuum** - Automatic file compaction for long-running workloads
 
 ## Recent Releases
+
+### v1.0.0
+
+**Breaking Changes:**
+- Removed `Database.Filter()` and `Database.FilterPaged()` - use `Table.Filter()` and `Table.FilterPaged()` instead
+
+**New Features:**
+- `Table.All()` - Returns all records in the table
+- `Table.AllPaged(offset, limit)` - Returns paginated records with total count
+
+**Performance:**
+- `Table.FilterPaged()` now uses efficient direct reads instead of calling `Get()` per record
 
 ### v0.6.1
 

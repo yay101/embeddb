@@ -499,6 +499,24 @@ func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inc
 	return t.indexManager.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
 }
 
+// All returns all records in the table
+func (t *Table[T]) All() ([]T, error) {
+	scanner := t.ScanRecords()
+	defer scanner.Close()
+
+	results := make([]T, 0)
+
+	for scanner.Next() {
+		record, err := scanner.Record()
+		if err != nil {
+			continue
+		}
+		results = append(results, *record)
+	}
+
+	return results, scanner.Err()
+}
+
 // Filter scans all records and returns those matching the filter
 func (t *Table[T]) Filter(fn func(T) bool) ([]T, error) {
 	scanner := t.ScanRecords()
@@ -787,14 +805,38 @@ func paginateTableResults[T any](all []T, offset, limit int) *PagedResult[T] {
 // FilterPaged scans all records and returns those matching the filter with pagination
 func (t *Table[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedResult[T], error) {
 	t.db.lock.RLock()
-	defer t.db.lock.RUnlock()
+	idx := t.db.indexes[t.tableID]
+	if idx == nil {
+		t.db.lock.RUnlock()
+		return &PagedResult[T]{Records: []T{}}, nil
+	}
+
+	ids := make([]uint32, 0, len(idx))
+	for id := range idx {
+		ids = append(ids, id)
+	}
+	t.db.lock.RUnlock()
 
 	var results []T
 	totalCount := 0
 	skipped := 0
 
-	for id := range t.db.indexes[t.tableID] {
-		record, err := t.Get(id)
+	for _, id := range ids {
+		offsetVal, exists := idx[id]
+		if !exists {
+			continue
+		}
+
+		recordBytes, err := t.db.readRecordBytesAt(offsetVal, t.tableID)
+		if err != nil {
+			continue
+		}
+
+		if !isActiveRecord(recordBytes) {
+			continue
+		}
+
+		record, err := t.db.decodeRecordWithLayout(recordBytes, t.layout)
 		if err != nil {
 			continue
 		}
@@ -821,6 +863,71 @@ func (t *Table[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedResult
 		Records:    results,
 		TotalCount: totalCount,
 		HasMore:    hasMore,
+		Offset:     offset,
+		Limit:      limit,
+	}, nil
+}
+
+// AllPaged returns all records with pagination
+func (t *Table[T]) AllPaged(offset, limit int) (*PagedResult[T], error) {
+	t.db.lock.RLock()
+	idx := t.db.indexes[t.tableID]
+	if idx == nil {
+		t.db.lock.RUnlock()
+		return &PagedResult[T]{Records: []T{}}, nil
+	}
+
+	ids := make([]uint32, 0, len(idx))
+	for id := range idx {
+		ids = append(ids, id)
+	}
+	t.db.lock.RUnlock()
+
+	totalCount := len(ids)
+	if offset >= totalCount || limit <= 0 {
+		return &PagedResult[T]{
+			Records:    []T{},
+			TotalCount: totalCount,
+			HasMore:    false,
+			Offset:     offset,
+			Limit:      limit,
+		}, nil
+	}
+
+	end := offset + limit
+	if end > totalCount {
+		end = totalCount
+	}
+
+	results := make([]T, 0, end-offset)
+	for i := offset; i < end; i++ {
+		id := ids[i]
+		offsetVal, exists := idx[id]
+		if !exists {
+			continue
+		}
+
+		recordBytes, err := t.db.readRecordBytesAt(offsetVal, t.tableID)
+		if err != nil {
+			continue
+		}
+
+		if !isActiveRecord(recordBytes) {
+			continue
+		}
+
+		record, err := t.db.decodeRecordWithLayout(recordBytes, t.layout)
+		if err != nil {
+			continue
+		}
+
+		results = append(results, *record)
+	}
+
+	return &PagedResult[T]{
+		Records:    results,
+		TotalCount: totalCount,
+		HasMore:    end < totalCount,
 		Offset:     offset,
 		Limit:      limit,
 	}, nil

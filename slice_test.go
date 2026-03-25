@@ -162,6 +162,11 @@ func TestSliceContainsFilter(t *testing.T) {
 	}
 	defer db.Close()
 
+	table, err := db.Table("records")
+	if err != nil {
+		t.Fatalf("Failed to get table: %v", err)
+	}
+
 	records := []SliceRecord{
 		{ID: 1, Name: "Alice", Tags: []string{"admin", "developer"}, Scores: []int{10, 20, 30}},
 		{ID: 2, Name: "Bob", Tags: []string{"user", "developer"}, Scores: []int{15, 25}},
@@ -170,14 +175,14 @@ func TestSliceContainsFilter(t *testing.T) {
 	}
 
 	for _, record := range records {
-		_, err := db.Insert(&record)
+		_, err := table.Insert(&record)
 		if err != nil {
 			t.Fatalf("Failed to insert: %v", err)
 		}
 	}
 
 	// Filter for admin users using slices.Contains
-	adminResults, err := db.Filter(func(r SliceRecord) bool {
+	adminResults, err := table.Filter(func(r SliceRecord) bool {
 		return slices.Contains(r.Tags, "admin")
 	})
 	if err != nil {
@@ -188,7 +193,7 @@ func TestSliceContainsFilter(t *testing.T) {
 	}
 
 	// Filter for developers
-	devResults, err := db.Filter(func(r SliceRecord) bool {
+	devResults, err := table.Filter(func(r SliceRecord) bool {
 		return slices.Contains(r.Tags, "developer")
 	})
 	if err != nil {
@@ -199,7 +204,7 @@ func TestSliceContainsFilter(t *testing.T) {
 	}
 
 	// Filter for users with score 10
-	score10Results, err := db.Filter(func(r SliceRecord) bool {
+	score10Results, err := table.Filter(func(r SliceRecord) bool {
 		return slices.Contains(r.Scores, 10)
 	})
 	if err != nil {
@@ -210,7 +215,7 @@ func TestSliceContainsFilter(t *testing.T) {
 	}
 
 	// Filter for users with score 25
-	score25Results, err := db.Filter(func(r SliceRecord) bool {
+	score25Results, err := table.Filter(func(r SliceRecord) bool {
 		return slices.Contains(r.Scores, 25)
 	})
 	if err != nil {
@@ -221,7 +226,7 @@ func TestSliceContainsFilter(t *testing.T) {
 	}
 
 	// Filter for users with non-existent tag
-	nonexistentResults, err := db.Filter(func(r SliceRecord) bool {
+	nonexistentResults, err := table.Filter(func(r SliceRecord) bool {
 		return slices.Contains(r.Tags, "nonexistent")
 	})
 	if err != nil {

@@ -12,11 +12,16 @@ func TestFilter(t *testing.T) {
 	os.Remove(dbPath)
 	defer cleanupTestFiles(dbPath)
 
-	db, err := New[TestRecord](dbPath, false, false) // No indexes
+	db, err := New[TestRecord](dbPath, false, false)
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
 	defer db.Close()
+
+	table, err := db.Table("records")
+	if err != nil {
+		t.Fatalf("Failed to get table: %v", err)
+	}
 
 	// Insert records with various ages
 	ages := []int{18, 25, 30, 35, 40, 45, 50, 55, 60}
@@ -27,14 +32,14 @@ func TestFilter(t *testing.T) {
 			Score:     float64(age * 10),
 			CreatedAt: time.Now(),
 		}
-		_, err := db.Insert(record)
+		_, err := table.Insert(record)
 		if err != nil {
 			t.Fatalf("Failed to insert: %v", err)
 		}
 	}
 
 	// Filter: Age > 30
-	results, err := db.Filter(func(r TestRecord) bool {
+	results, err := table.Filter(func(r TestRecord) bool {
 		return r.Age > 30
 	})
 	if err != nil {
@@ -48,7 +53,7 @@ func TestFilter(t *testing.T) {
 	}
 
 	// Filter: Age >= 30 AND Age <= 50
-	results, err = db.Filter(func(r TestRecord) bool {
+	results, err = table.Filter(func(r TestRecord) bool {
 		return r.Age >= 30 && r.Age <= 50
 	})
 	if err != nil {
@@ -67,7 +72,7 @@ func TestFilter(t *testing.T) {
 	}
 
 	// Filter: Name contains "User1"
-	results, err = db.Filter(func(r TestRecord) bool {
+	results, err = table.Filter(func(r TestRecord) bool {
 		return len(r.Name) > 0 && r.Name[0] == 'U'
 	})
 	if err != nil {
@@ -90,6 +95,11 @@ func TestScan(t *testing.T) {
 	}
 	defer db.Close()
 
+	table, err := db.Table("records")
+	if err != nil {
+		t.Fatalf("Failed to get table: %v", err)
+	}
+
 	// Insert records
 	for i := 0; i < 10; i++ {
 		record := &TestRecord{
@@ -97,12 +107,12 @@ func TestScan(t *testing.T) {
 			Age:   20 + i,
 			Score: float64(i * 10),
 		}
-		db.Insert(record)
+		table.Insert(record)
 	}
 
 	// Scan and collect all
 	allRecords := make([]TestRecord, 0)
-	err = db.Scan(func(r TestRecord) bool {
+	err = table.Scan(func(r TestRecord) bool {
 		allRecords = append(allRecords, r)
 		return true
 	})
@@ -116,7 +126,7 @@ func TestScan(t *testing.T) {
 
 	// Scan with early exit
 	earlyExit := make([]TestRecord, 0)
-	err = db.Scan(func(r TestRecord) bool {
+	err = table.Scan(func(r TestRecord) bool {
 		earlyExit = append(earlyExit, r)
 		return len(earlyExit) < 3 // Stop after 3 records
 	})
@@ -140,28 +150,33 @@ func TestCount(t *testing.T) {
 	}
 	defer db.Close()
 
-	count := db.Count()
+	table, err := db.Table("records")
+	if err != nil {
+		t.Fatalf("Failed to get table: %v", err)
+	}
+
+	count := table.Count()
 	if count != 0 {
 		t.Errorf("Expected 0 initial records, got %d", count)
 	}
 
 	// Insert some records
 	for i := 0; i < 5; i++ {
-		db.Insert(&TestRecord{Name: fmt.Sprintf("User%d", i), Age: 20 + i})
+		table.Insert(&TestRecord{Name: fmt.Sprintf("User%d", i), Age: 20 + i})
 	}
 
-	count = db.Count()
+	count = table.Count()
 	if count != 5 {
 		t.Errorf("Expected 5 records, got %d", count)
 	}
 
 	// Delete one (soft delete - record stays in index but marked inactive)
-	db.Delete(1)
+	table.Delete(1)
 
 	// Count still returns 5 because soft-deleted records remain in index
 	// Use Filter to count only active records
-	activeCount, _ := db.Filter(func(r TestRecord) bool { return true })
-	count = db.Count()
+	activeCount, _ := table.Filter(func(r TestRecord) bool { return true })
+	count = table.Count()
 	if count != 5 {
 		t.Errorf("Expected 5 (including deleted), got %d", count)
 	}
@@ -187,6 +202,11 @@ func TestFilterWithNestedStruct(t *testing.T) {
 	}
 	defer db.Close()
 
+	table, err := db.Table("people")
+	if err != nil {
+		t.Fatalf("Failed to get table: %v", err)
+	}
+
 	// Insert records
 	people := []Person{
 		{Name: "Alice", Address: Address{City: "New York", ZipCode: 10001}, Age: 30},
@@ -195,11 +215,11 @@ func TestFilterWithNestedStruct(t *testing.T) {
 	}
 
 	for _, p := range people {
-		db.Insert(&p)
+		table.Insert(&p)
 	}
 
 	// Filter by nested struct field
-	results, err := db.Filter(func(p Person) bool {
+	results, err := table.Filter(func(p Person) bool {
 		return p.Address.City == "New York"
 	})
 	if err != nil {
@@ -211,7 +231,7 @@ func TestFilterWithNestedStruct(t *testing.T) {
 	}
 
 	// Filter by nested int
-	results, err = db.Filter(func(p Person) bool {
+	results, err = table.Filter(func(p Person) bool {
 		return p.Address.ZipCode > 50000
 	})
 	if err != nil {
@@ -234,11 +254,16 @@ func TestFilterWithTime(t *testing.T) {
 	}
 	defer db.Close()
 
+	table, err := db.Table("records")
+	if err != nil {
+		t.Fatalf("Failed to get table: %v", err)
+	}
+
 	baseTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// Insert records with different times
 	for i := 0; i < 5; i++ {
-		db.Insert(&TestRecord{
+		table.Insert(&TestRecord{
 			Name:      fmt.Sprintf("User%d", i),
 			CreatedAt: baseTime.Add(time.Duration(i) * 24 * time.Hour),
 		})
@@ -247,7 +272,7 @@ func TestFilterWithTime(t *testing.T) {
 	// Filter by time - created after 48 hours from baseTime
 	// i=0: day 0, i=1: day 1, i=2: day 2, i=3: day 3, i=4: day 4
 	// After 48 hours = after day 2 starts = day 3 and 4 = 2 records
-	results, err := db.Filter(func(r TestRecord) bool {
+	results, err := table.Filter(func(r TestRecord) bool {
 		return r.CreatedAt.After(baseTime.Add(48 * time.Hour))
 	})
 	if err != nil {
