@@ -365,7 +365,7 @@ func (t *Table[T]) matchesCondition(record T, conditions []*Condition) bool {
 	}
 
 	for _, cond := range conditions {
-		fieldVal := v.FieldByName(cond.Field)
+		fieldVal := getFieldByPath(v, cond.Field)
 		if !fieldVal.IsValid() {
 			return false
 		}
@@ -628,4 +628,51 @@ func containsID(ids []uint32, target uint32) bool {
 		}
 	}
 	return false
+}
+
+func getFieldByPath(v reflect.Value, path string) reflect.Value {
+	parts := strings.Split(path, ".")
+	current := v
+
+	for i, part := range parts {
+		if !current.IsValid() {
+			return reflect.Value{}
+		}
+
+		fieldIndex := -1
+		t := current.Type()
+		if t.Kind() == reflect.Ptr {
+			t = t.Elem()
+			if current.Elem().Kind() != reflect.Struct {
+				return reflect.Value{}
+			}
+			current = current.Elem()
+		}
+
+		if current.Kind() != reflect.Struct {
+			return reflect.Value{}
+		}
+
+		for j := 0; j < t.NumField(); j++ {
+			if t.Field(j).Name == part {
+				fieldIndex = j
+				break
+			}
+		}
+
+		if fieldIndex == -1 {
+			return reflect.Value{}
+		}
+
+		current = current.Field(fieldIndex)
+
+		if i < len(parts)-1 && current.Kind() == reflect.Ptr {
+			if current.IsNil() {
+				return reflect.Value{}
+			}
+			current = current.Elem()
+		}
+	}
+
+	return current
 }

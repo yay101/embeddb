@@ -81,7 +81,7 @@ const (
 	valueEndMarker            byte         = 0x1F
 	embeddedStructType        reflect.Kind = reflect.Struct // Use reflect.Struct
 	defaultIndexPreallocation uint32       = 10240          // 10KB preallocated for index by default
-	Version                   string       = "1.0.1"
+	Version                   string       = "1.0.2"
 	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
 	autoVacuumInterval                     = 24 * time.Hour
 	autoVacuumMinChanges      uint64       = 50000

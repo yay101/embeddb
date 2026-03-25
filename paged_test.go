@@ -597,3 +597,65 @@ func TestQueryByNoResults(t *testing.T) {
 		t.Errorf("expected total count 0, got %d", result.TotalCount)
 	}
 }
+
+func TestQueryByNestedStruct(t *testing.T) {
+	type Address struct {
+		City    string
+		ZipCode int
+	}
+
+	type PersonWithAddress struct {
+		Name    string
+		Address Address
+	}
+
+	dbPath := "/tmp/test_query_by_nested.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := New[PersonWithAddress](dbPath, false, false)
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	defer db.Close()
+
+	table, err := db.Table("people")
+	if err != nil {
+		t.Fatalf("failed to get table: %v", err)
+	}
+
+	// Insert records with nested structs
+	people := []PersonWithAddress{
+		{Name: "Alice", Address: Address{City: "New York", ZipCode: 10001}},
+		{Name: "Bob", Address: Address{City: "Los Angeles", ZipCode: 90001}},
+		{Name: "Charlie", Address: Address{City: "New York", ZipCode: 10002}},
+	}
+	for _, p := range people {
+		_, err := table.Insert(&p)
+		if err != nil {
+			t.Fatalf("failed to insert: %v", err)
+		}
+	}
+
+	// Query by nested field
+	result, err := table.QueryBy(map[string]any{
+		"Address.City": "New York",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy nested failed: %v", err)
+	}
+	if len(result.Records) != 2 {
+		t.Errorf("expected 2 records, got %d", len(result.Records))
+	}
+
+	// Query by nested int field
+	result, err = table.QueryBy(map[string]any{
+		"Address.ZipCode": "{BETWEEN 10000 AND 50000}",
+	})
+	if err != nil {
+		t.Fatalf("QueryBy nested failed: %v", err)
+	}
+	if len(result.Records) != 2 {
+		t.Errorf("expected 2 records, got %d", len(result.Records))
+	}
+}

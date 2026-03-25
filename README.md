@@ -25,6 +25,10 @@ A lightweight, embedded database for Go that gives you SQLite-like functionality
 
 ## Recent Releases
 
+### v1.0.2
+
+- `QueryBy` now supports nested struct fields with dot notation: `{"Address.City": "New York"}`
+
 ### v1.0.1
 
 - `Table.QueryBy(conditions)` - Query using a map with operators: `"{> 18}"`, `"{BETWEEN a AND b}"`, `"{LIKE %pattern%}"`
