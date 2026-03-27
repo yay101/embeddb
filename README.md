@@ -91,10 +91,13 @@ func main() {
 
 | Tag | Description |
 |-----|-------------|
-| `db:"id,primary"` | Primary key for Get/Update/Delete |
+| `db:"id"` | Primary key field (for Get/Update/Delete) |
+| `db:"primary"` | Same as `db:"id"` - marks primary key |
 | `db:"index"` | Create index on this field |
 | `db:"unique"` | Enforce uniqueness on insert |
 | `db:"-"` | Skip field (not stored) |
+
+**Note:** `db:"id,primary"` is equivalent to `db:"id"` - the comma is just a separator.
 
 ## API Reference
 
