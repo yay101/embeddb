@@ -1,593 +1,692 @@
 package embeddb
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"os"
-	"reflect"
+	"slices"
 	"sync"
-	"time"
-
-	embedcore "github.com/yay101/embeddbcore"
-	"golang.org/x/exp/mmap"
+	"syscall"
 )
-
-// Record format description:
-// [escCode,startMarker]2 bytes - Marks the beginning of a record.
-// [id]4 bytes - The unique identifier for the record (uint32).
-// [length]4 bytes - The length of the actual record data (uint32).
-// [active]1 byte - Status of the record (1 for active, 0 for inactive).
-// -- Actual record data bytes --
-// [escCode,endMarker]2 bytes - Marks the end of a record.
-
-// Database is a generic type that represents a database for storing records of type T.
-// For multi-table support, use db.Table() to get typed table access.
-type Database[T any] struct {
-	header             DBHeader
-	lock               sync.RWMutex
-	writeLock          *sync.Mutex // Serializes writes per database file
-	fileKey            string
-	sharedState        *sharedFileState
-	file               *os.File
-	mfile              *mmap.ReaderAt
-	mlock              sync.RWMutex
-	indexes            map[uint8]map[uint32]uint32 // tableID -> recordID -> file offset
-	layout             *embedcore.StructLayout     // Struct layout information using unsafe
-	nextRecordID       uint32
-	nlock              sync.Mutex
-	transaction        *Transaction       // Transaction manager for atomicity
-	indexManager       *IndexManager[T]   // Manager for field indexes
-	tableCatalog       *TableCatalog      // Table catalog for multi-table support
-	defaultTable       string             // Default table name for single-table mode
-	tableIndexManagers []*IndexManager[T] // Track table index managers for cleanup
-
-	autoVacuumEnabled       bool
-	changesSinceVacuum      uint64
-	tableDroppedSinceVacuum bool
-	lastVacuumTime          time.Time
-	vacuumStateLock         sync.Mutex
-	regionStartHint         int64
-	regionSafeUntil         int64
-	regionCheckCounter      uint64
-}
-
-type DBHeader struct {
-	Version                      string
-	indexStart                   uint32
-	indexEnd                     uint32
-	nextRecordID                 uint32
-	nextOffset                   uint32
-	tocStart                     uint32
-	entryStart                   uint32
-	lgIndexStart                 uint32 // Last good index start position
-	lock                         sync.Mutex
-	indexCapacity                uint32 // Capacity allocated for the index
-	tableCatalogOffset           uint32 // Offset to table catalog
-	tableCount                   uint32 // Number of tables
-	secondaryIndexRegionStart    uint32 // Embedded secondary index region start
-	secondaryIndexRegionCapacity uint32 // Embedded secondary index region capacity
-	secondaryIndexRegionUsed     uint32 // Embedded secondary index region used bytes
-	secondaryIndexRegionFlags    uint32 // Embedded secondary index region flags/version
-}
-
-// This type is no longer used and has been replaced by FieldOffset in field_offsets.go
 
 const (
-	headerSize                int          = 64
-	chunkSize                 int          = 4096
-	escCode                   byte         = 0x1B
-	startMarker               byte         = 0x02
-	endMarker                 byte         = 0x03
-	valueStartMarker          byte         = 0x1E
-	valueEndMarker            byte         = 0x1F
-	embeddedStructType        reflect.Kind = reflect.Struct // Use reflect.Struct
-	defaultIndexPreallocation uint32       = 10240          // 10KB preallocated for index by default
-	Version                   string       = "1.0.2"
-	defaultAutoIndexFields    bool         = false // Whether to auto-index tagged fields
-	autoVacuumInterval                     = 24 * time.Hour
-	autoVacuumMinChanges      uint64       = 50000
-	regionOverlapCheckEvery   uint64       = 1024
-	regionOverlapGuardBytes   int64        = 64 * 1024
+	EcCode           = byte(0x1B)
+	RecordStartMark  = byte(0x02)
+	RecordEndMark    = byte(0x03)
+	valueStartMarker = byte(0x1E)
+	valueEndMarker   = byte(0x1F)
 )
 
-// Table returns a typed Table[T] for accessing records.
-// If name is not provided or empty, the table name is auto-derived from the type name.
-// Example: db.Table() or db.Table("users")
-func (db *Database[T]) Table(name ...string) (*Table[T], error) {
-	var instance T
-	layout, err := embedcore.ComputeStructLayout(instance)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compute struct layout: %w", err)
-	}
-
-	tableName := reflect.TypeOf(instance).Name()
-	if len(name) > 0 && name[0] != "" {
-		tableName = name[0]
-	}
-
-	db.writeLock.Lock()
-	defer db.writeLock.Unlock()
-
-	if db.needsCrossHandleSync() {
-		if err := db.syncStateFromDiskForWrite(); err != nil {
-			return nil, fmt.Errorf("failed to sync database state for table access: %w", err)
-		}
-	}
-
-	if db.tableCatalog == nil {
-		db.tableCatalog = NewTableCatalog()
-	}
-
-	tableID, exists := db.tableCatalog.GetTableID(tableName)
-	if !exists {
-		tableID = db.tableCatalog.AddTable(tableName, layout.Hash)
-		db.lock.Lock()
-		if err := db.writeTableCatalogLocked(); err != nil {
-			db.lock.Unlock()
-			return nil, fmt.Errorf("failed to persist table catalog: %w", err)
-		}
-		db.lock.Unlock()
-	}
-	indexManager := NewIndexManager(db, layout, tableName)
-
-	// Check for existing indexes on disk and load them
-	if err := indexManager.CheckIndexes(); err != nil {
-		fmt.Printf("Warning: failed to check indexes for table '%s': %v\n", tableName, err)
-	}
-
-	// Track the table's index manager for cleanup when database closes
-	db.tableIndexManagers = append(db.tableIndexManagers, indexManager)
-
-	return &Table[T]{
-		db:           db,
-		name:         tableName,
-		tableID:      tableID,
-		layout:       layout,
-		indexManager: indexManager,
-	}, nil
+type MapIndex struct {
+	mu   sync.RWMutex
+	data map[string][]byte
 }
 
-func (db *Database[T]) nextId() uint32 {
-	db.nlock.Lock()
-	defer db.nlock.Unlock()
-	id := db.nextRecordID
-	db.nextRecordID++
-	return id
+func NewMapIndex() *MapIndex {
+	return &MapIndex{
+		data: make(map[string][]byte),
+	}
 }
 
-// getTableIndex returns the index for a specific table, creating if needed
-func (db *Database[T]) getTableIndex(tableID uint8) map[uint32]uint32 {
-	if db.indexes == nil {
-		db.indexes = make(map[uint8]map[uint32]uint32)
-	}
-	if db.indexes[tableID] == nil {
-		db.indexes[tableID] = make(map[uint32]uint32)
-	}
-	return db.indexes[tableID]
+func (mi *MapIndex) Set(key []byte, value []byte) {
+	mi.mu.Lock()
+	defer mi.mu.Unlock()
+	keyCopy := make([]byte, len(key))
+	valCopy := make([]byte, len(value))
+	copy(keyCopy, key)
+	copy(valCopy, value)
+	mi.data[string(keyCopy)] = valCopy
 }
 
-// setRecordOffset sets the file offset for a record in a specific table
-func (db *Database[T]) setRecordOffset(tableID uint8, recordID uint32, offset uint32) {
-	db.getTableIndex(tableID)[recordID] = offset
+func (mi *MapIndex) SetUint32(key []byte, value uint32) {
+	mi.mu.Lock()
+	defer mi.mu.Unlock()
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	val := make([]byte, 4)
+	binary.BigEndian.PutUint32(val, value)
+	mi.data[string(keyCopy)] = val
 }
 
-// getRecordOffset gets the file offset for a record in a specific table
-func (db *Database[T]) getRecordOffset(tableID uint8, recordID uint32) (uint32, bool) {
-	if db.indexes == nil {
-		return 0, false
+func (mi *MapIndex) Get(key []byte) ([]byte, bool) {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	val, ok := mi.data[string(key)]
+	if !ok {
+		return nil, false
 	}
-	idx, ok := db.indexes[tableID]
+	valCopy := make([]byte, len(val))
+	copy(valCopy, val)
+	return valCopy, true
+}
+
+func (mi *MapIndex) GetUint32(key []byte) (uint32, bool) {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	val, ok := mi.data[string(key)]
 	if !ok {
 		return 0, false
 	}
-	offset, ok := idx[recordID]
-	return offset, ok
+	return binary.BigEndian.Uint32(val), true
 }
 
-// hasRecord checks if a record exists in a specific table
-func (db *Database[T]) hasRecord(tableID uint8, recordID uint32) bool {
-	_, ok := db.getRecordOffset(tableID, recordID)
-	return ok
+func (mi *MapIndex) Delete(key []byte) {
+	mi.mu.Lock()
+	defer mi.mu.Unlock()
+	delete(mi.data, string(key))
 }
 
-// deleteRecord removes a record from a specific table's index
-func (db *Database[T]) deleteRecord(tableID uint8, recordID uint32) {
-	if db.indexes != nil {
-		if idx, ok := db.indexes[tableID]; ok {
-			delete(idx, recordID)
+func (mi *MapIndex) Range(fn func(k []byte, v []byte) bool) {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	for k, v := range mi.data {
+		keyCopy := make([]byte, len(k))
+		valCopy := make([]byte, len(v))
+		copy(keyCopy, k)
+		copy(valCopy, v)
+		if !fn(keyCopy, valCopy) {
+			return
 		}
 	}
 }
 
-// tableRecordCount returns the number of records in a specific table
-func (db *Database[T]) tableRecordCount(tableID uint8) int {
-	if db.indexes == nil {
-		return 0
-	}
-	if idx, ok := db.indexes[tableID]; ok {
-		return len(idx)
-	}
-	return 0
+func (mi *MapIndex) Size() int {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	return len(mi.data)
 }
 
-func (db *Database[T]) markMutation() {
-	db.vacuumStateLock.Lock()
-	db.changesSinceVacuum++
-	db.vacuumStateLock.Unlock()
+type Uint32MapIndex struct {
+	mu   sync.RWMutex
+	data map[string]uint32
 }
 
-func (db *Database[T]) markTableDropped() {
-	db.vacuumStateLock.Lock()
-	db.tableDroppedSinceVacuum = true
-	db.vacuumStateLock.Unlock()
+func NewUint32MapIndex() *Uint32MapIndex {
+	return &Uint32MapIndex{
+		data: make(map[string]uint32),
+	}
 }
 
-func (db *Database[T]) markVacuumCompleted() {
-	db.vacuumStateLock.Lock()
-	db.lastVacuumTime = time.Now()
-	db.changesSinceVacuum = 0
-	db.tableDroppedSinceVacuum = false
-	db.vacuumStateLock.Unlock()
+func (mi *Uint32MapIndex) Set(key string, value uint32) {
+	mi.mu.Lock()
+	defer mi.mu.Unlock()
+	mi.data[key] = value
 }
 
-func (db *Database[T]) shouldAutoVacuum() bool {
-	if !db.autoVacuumEnabled {
-		return false
-	}
-	db.vacuumStateLock.Lock()
-	defer db.vacuumStateLock.Unlock()
-	if time.Since(db.lastVacuumTime) < autoVacuumInterval {
-		return false
-	}
-	return db.tableDroppedSinceVacuum || db.changesSinceVacuum >= autoVacuumMinChanges
+func (mi *Uint32MapIndex) Get(key string) (uint32, bool) {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	val, ok := mi.data[key]
+	return val, ok
 }
 
-func (db *Database[T]) maybeAutoVacuum() error {
-	if !db.shouldAutoVacuum() {
-		return nil
-	}
-	if err := db.Vacuum(); err != nil {
-		return fmt.Errorf("auto vacuum failed: %w", err)
-	}
-	return nil
+func (mi *Uint32MapIndex) Delete(key string) {
+	mi.mu.Lock()
+	defer mi.mu.Unlock()
+	delete(mi.data, key)
 }
 
-// CreateIndex creates an index for the specified field
-// Note: When used on Database directly (not via Table), tableName is empty
-// so indexes are stored without table prefix for backward compatibility
-func (db *Database[T]) CreateIndex(fieldName string) error {
-	if db.indexManager == nil {
-		db.indexManager = NewIndexManager(db, db.layout, "")
-	}
-	return db.indexManager.CreateIndex(fieldName)
-}
-
-// DropIndex removes an index for the specified field
-func (db *Database[T]) DropIndex(fieldName string) error {
-	if db.indexManager == nil {
-		return nil
-	}
-	return db.indexManager.DropIndex(fieldName)
-}
-
-// Close closes the database and any open indexes
-func (db *Database[T]) Close() error {
-	defer db.unregisterHandle()
-
-	// Persist the index and header before closing
-	if err := db.Sync(); err != nil {
-		return fmt.Errorf("failed to sync before close: %w", err)
-	}
-
-	// Close database-level indexes
-	if db.indexManager != nil {
-		if err := db.indexManager.Close(); err != nil {
-			return err
+func (mi *Uint32MapIndex) Range(fn func(k string, v uint32) bool) {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	for k, v := range mi.data {
+		if !fn(k, v) {
+			return
 		}
 	}
-
-	// Close all table-level index managers
-	for _, im := range db.tableIndexManagers {
-		if err := im.Close(); err != nil {
-			return err
-		}
-	}
-
-	if useExperimentalRegionIndex() {
-		db.lock.Lock()
-		if err := syncRegionCatalogHeaderPointersFromFooter(db.file, &db.header); err != nil {
-			db.lock.Unlock()
-			return fmt.Errorf("failed final region header sync: %w", err)
-		}
-		if err := db.encodeHeaderLocked(); err != nil {
-			db.lock.Unlock()
-			return fmt.Errorf("failed final header write: %w", err)
-		}
-		if err := db.file.Sync(); err != nil {
-			db.lock.Unlock()
-			return fmt.Errorf("failed final file sync: %w", err)
-		}
-		db.lock.Unlock()
-	}
-
-	// Close memory mapping
-	db.mlock.Lock()
-	if db.mfile != nil {
-		db.mfile.Close()
-		db.mfile = nil
-	}
-	db.mlock.Unlock()
-
-	// Close file
-	return db.file.Close()
 }
 
-// Sync persists the in-memory index and header to disk.
-// This should be called periodically for durability, and is automatically
-// called by Close().
-func (db *Database[T]) Sync() error {
-	db.lock.Lock()
-
-	// Write the index to disk
-	if err := db.writeIndexLocked(); err != nil {
-		db.lock.Unlock()
-		return fmt.Errorf("failed to write index: %w", err)
-	}
-
-	// Write the table catalog to disk (must be after index to avoid overwrite)
-	if err := db.writeTableCatalogLocked(); err != nil {
-		db.lock.Unlock()
-		return fmt.Errorf("failed to write table catalog: %w", err)
-	}
-
-	if useExperimentalRegionIndex() {
-		if err := syncRegionCatalogHeaderPointersFromFooter(db.file, &db.header); err != nil {
-			db.lock.Unlock()
-			return fmt.Errorf("failed to sync region catalog header pointers: %w", err)
-		}
-	}
-
-	// Write the header to disk
-	if err := db.encodeHeaderLocked(); err != nil {
-		db.lock.Unlock()
-		return fmt.Errorf("failed to write header: %w", err)
-	}
-
-	// Sync the file
-	if err := db.file.Sync(); err != nil {
-		db.lock.Unlock()
-		return err
-	}
-	db.lock.Unlock()
-
-	return db.maybeAutoVacuum()
+func (mi *Uint32MapIndex) Size() int {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	return len(mi.data)
 }
 
-// RebuildAllIndexes scans the database file to rebuild the primary index mapping
-// and all secondary field indexes.
-func (db *Database[T]) RebuildAllIndexes() error {
-	// 1. Rebuild primary index (record ID -> offset)
-	if err := db.RebuildPrimaryIndex(); err != nil {
-		return fmt.Errorf("failed to rebuild primary index: %w", err)
-	}
-
-	// 2. Rebuild database-level field indexes
-	if db.indexManager != nil {
-		if err := db.indexManager.RebuildAll(); err != nil {
-			return fmt.Errorf("failed to rebuild database field indexes: %w", err)
-		}
-	}
-
-	// 3. Rebuild table-level field indexes
-	// Note: We only rebuild already loaded index managers.
-	for _, im := range db.tableIndexManagers {
-		if err := im.RebuildAll(); err != nil {
-			return fmt.Errorf("failed to rebuild table field indexes: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// SecondaryIndexStoreStats reports embedded secondary-index blob usage.
-func (db *Database[T]) SecondaryIndexStoreStats() (*SecondaryIndexStoreStats, error) {
-	if db == nil || db.file == nil {
-		return nil, fmt.Errorf("database is not open")
-	}
-	return GetSecondaryIndexStoreStats(db.file.Name())
-}
-
-// Query finds all records that match a field value using an index
-func (db *Database[T]) Query(fieldName string, value interface{}) ([]T, error) {
-	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
-		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
-	}
-
-	// Find matching record IDs using the index
-	recordIDs, err := db.indexManager.Query(fieldName, value)
+func lockFile(f *os.File) error {
+	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
+		return fmt.Errorf("database is locked by another process")
+	}
+	return nil
+}
+
+func unlockFile(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+}
+
+type tableCatalogEntry struct {
+	ID           uint8
+	Name         string
+	LayoutHash   string
+	NextRecordID uint32
+	Dropped      bool
+}
+
+type tableCatalog map[string]*tableCatalogEntry
+
+func (tc tableCatalog) GetTableID(name string) (uint8, bool) {
+	entry := tc[name]
+	if entry == nil || entry.Dropped {
+		return 0, false
+	}
+	return entry.ID, true
+}
+
+func (tc tableCatalog) AddTable(name string, layoutHash string) uint8 {
+	var maxID uint8
+	for _, entry := range tc {
+		if entry.ID > maxID && !entry.Dropped {
+			maxID = entry.ID
+		}
+	}
+	maxID++
+	tc[name] = &tableCatalogEntry{
+		ID:           maxID,
+		Name:         name,
+		LayoutHash:   layoutHash,
+		NextRecordID: 1,
+	}
+	return maxID
+}
+
+type database struct {
+	mu       sync.RWMutex
+	file     *os.File
+	filename string
+	pkIndex  *MapIndex
+	alloc    *Allocator
+	tableCat tableCatalog
+	tx       *Transaction
+}
+
+func OpenDatabase(filename string, migrate bool) (*database, error) {
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+
+	if err := lockFile(file); err != nil {
+		file.Close()
 		return nil, err
 	}
 
-	return db.collectRecordsByIDs(recordIDs), nil
+	db := &database{
+		filename: filename,
+		file:     file,
+		pkIndex:  NewMapIndex(),
+		alloc:    &Allocator{},
+		tableCat: make(tableCatalog),
+	}
+
+	stat, _ := file.Stat()
+	if stat.Size() == 0 {
+		db.alloc.Reset(4096, nil)
+	}
+
+	if err := db.load(); err != nil {
+		unlockFile(file)
+		file.Close()
+		return nil, err
+	}
+
+	return db, nil
 }
 
-func (db *Database[T]) resolveQueryTableIDLocked() uint8 {
-	tableID := uint8(0)
-	if db.tableCatalog != nil && db.defaultTable != "" {
-		if tid, ok := db.tableCatalog.GetTableID(db.defaultTable); ok {
-			tableID = tid
-		}
-	}
-	return tableID
-}
-
-func (db *Database[T]) collectRecordsByIDs(recordIDs []uint32) []T {
-	if len(recordIDs) == 0 {
-		return []T{}
+func (db *database) load() error {
+	stat, err := db.file.Stat()
+	if err != nil {
+		return err
 	}
 
-	results := make([]T, 0, len(recordIDs))
-	var scratch []byte
-
-	db.mlock.Lock()
-	if err := db.ensureMmapSizeLocked(); err != nil {
-		db.mlock.Unlock()
-		return results
-	}
-	db.mlock.Unlock()
-
-	db.lock.RLock()
-	db.mlock.RLock()
-	tableID := db.resolveQueryTableIDLocked()
-	for _, id := range recordIDs {
-		offset, exists := db.getRecordOffset(tableID, id)
-		if !exists {
-			continue
-		}
-
-		recordBytes, err := db.readRecordBytesAtIntoNoLock(offset, tableID, scratch)
-		if err != nil {
-			continue
-		}
-		scratch = recordBytes[:0]
-
-		if !isActiveRecord(recordBytes) {
-			continue
-		}
-
-		record, err := db.decodeRecord(recordBytes)
-		if err == nil && record != nil {
-			results = append(results, *record)
-		}
-	}
-	db.mlock.RUnlock()
-	db.lock.RUnlock()
-
-	return results
-}
-
-// QueryRangeGreaterThan finds all records where field > value (or >= if inclusive)
-func (db *Database[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
-	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
-		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
-	}
-	return db.indexManager.QueryRangeGreaterThan(fieldName, value, inclusive)
-}
-
-// QueryRangeLessThan finds all records where field < value (or <= if inclusive)
-func (db *Database[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
-	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
-		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
-	}
-	return db.indexManager.QueryRangeLessThan(fieldName, value, inclusive)
-}
-
-// QueryRangeBetween finds all records where min <= field <= max
-func (db *Database[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
-	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
-		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
-	}
-	return db.indexManager.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
-}
-
-// Scan iterates over all records, calling the callback for each.
-// This performs an unindexed full table scan - use only when no index is available.
-// The callback can return false to stop iteration early.
-func (db *Database[T]) Scan(fn func(record T) bool) error {
-	// Quick snapshot of index keys
-	db.lock.RLock()
-	var idx map[uint32]uint32
-	var tableID uint8
-
-	for tid, m := range db.indexes {
-		if len(m) > 0 {
-			idx = m
-			tableID = tid
-			break
-		}
-	}
-
-	if idx == nil {
-		db.lock.RUnlock()
+	if stat.Size() == 0 {
 		return nil
 	}
 
-	ids := make([]uint32, 0, len(idx))
-	for id := range idx {
-		ids = append(ids, id)
+	var header [64]byte
+	if _, err := db.file.ReadAt(header[:], 0); err != nil {
+		return err
 	}
-	db.lock.RUnlock()
 
-	// Iterate without holding lock
-	for _, id := range ids {
-		offsetVal, exists := idx[id]
-		if !exists {
-			continue
+	if header[0] != EcCode || header[1] != RecordStartMark {
+		return fmt.Errorf("invalid database header")
+	}
+
+	tableCount := binary.LittleEndian.Uint32(header[32:36])
+	tocOffset := binary.LittleEndian.Uint32(header[36:40])
+	nextOffset := binary.LittleEndian.Uint64(header[40:48])
+
+	db.alloc.Reset(nextOffset, nil)
+
+	if tableCount > 0 && tocOffset > 0 {
+		var tocData []byte
+		if int(tocOffset) < int(stat.Size()) {
+			tocLen := int(stat.Size()) - int(tocOffset)
+			if tocLen > 0 && tocLen < 1024*1024 {
+				tocData = make([]byte, tocLen)
+				_, err = db.file.ReadAt(tocData, int64(tocOffset))
+				if err != nil {
+					return err
+				}
+			}
 		}
 
-		recordBytes, err := db.readRecordBytesAt(offsetVal, tableID)
-		if err != nil {
-			continue
+		if tocData != nil {
+			db.tableCat = decodeTableCatalog(tocData)
 		}
+	}
 
-		if !isActiveRecord(recordBytes) {
-			continue
-		}
+	db.pkIndex.Range(func(k []byte, v []byte) bool {
+		return true
+	})
 
-		record, err := db.decodeRecord(recordBytes)
-		if err != nil {
-			continue
-		}
+	recordStart := int64(64)
+	if stat.Size() > recordStart && int64(tocOffset) > recordStart {
+		for offset := recordStart; offset < int64(tocOffset); offset++ {
+			hdrBuf := make([]byte, 12)
+			_, err := db.file.ReadAt(hdrBuf, offset)
+			if err != nil || hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
+				continue
+			}
 
-		if !fn(*record) {
-			break
+			recLen := binary.BigEndian.Uint32(hdrBuf[7:11])
+			totalLen := 12 + int(recLen) + 2
+
+			if int64(offset)+int64(totalLen) > int64(tocOffset) {
+				break
+			}
+
+			recordBuf := make([]byte, totalLen)
+			copy(recordBuf, hdrBuf)
+			_, err = db.file.ReadAt(recordBuf[12:], offset+12)
+			if err != nil {
+				break
+			}
+
+			tableID := recordBuf[2]
+			recordID := binary.BigEndian.Uint32(recordBuf[3:7])
+			active := recordBuf[11]
+
+			if active == 1 {
+				key := encodePKForIndex(tableID, recordID)
+				val := make([]byte, 8)
+				binary.BigEndian.PutUint64(val, uint64(offset))
+				db.pkIndex.Set(key, val)
+			}
+
+			offset += int64(totalLen) - 1
 		}
 	}
 
 	return nil
 }
 
-// Count returns the total number of records in the database
-func (db *Database[T]) Count() int {
-	db.lock.RLock()
-	defer db.lock.RUnlock()
-
-	// Sum records across all tables
-	total := 0
-	for _, idx := range db.indexes {
-		total += len(idx)
+func decodeTableCatalog(data []byte) tableCatalog {
+	tc := make(tableCatalog)
+	if len(data) < 4 {
+		return tc
 	}
-	return total
+
+	offset := 0
+	count := binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+
+	for i := uint32(0); i < count && offset < len(data); i++ {
+		if offset+5 > len(data) {
+			break
+		}
+
+		id := data[offset]
+		offset++
+
+		nameLen := int(data[offset])
+		offset++
+		if offset+nameLen > len(data) {
+			break
+		}
+		name := string(data[offset : offset+nameLen])
+		offset += nameLen
+
+		if offset+8 > len(data) {
+			break
+		}
+		hashLen := int(data[offset])
+		offset++
+		if offset+hashLen > len(data) {
+			break
+		}
+		layoutHash := string(data[offset : offset+hashLen])
+		offset += hashLen
+
+		nextRecID := binary.LittleEndian.Uint32(data[offset:])
+		offset += 4
+
+		tc[name] = &tableCatalogEntry{
+			ID:           id,
+			Name:         name,
+			LayoutHash:   layoutHash,
+			NextRecordID: nextRecID,
+		}
+	}
+
+	return tc
 }
 
-// QueryPaged finds records that match a field value using an index with pagination
-func (db *Database[T]) QueryPaged(fieldName string, value interface{}, offset, limit int) (*PagedResult[T], error) {
-	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
-		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+func (db *database) Flush() error {
+	header := make([]byte, 64)
+	header[0] = EcCode
+	header[1] = RecordStartMark
+	copy(header[2:34], []byte("embeddb v1.0"))
+	binary.LittleEndian.PutUint32(header[32:36], uint32(len(db.tableCat)))
+	binary.LittleEndian.PutUint64(header[40:48], db.alloc.nextOffset)
+
+	encodedCat := db.encodeTableCatalog()
+	recordStart := int64(db.alloc.nextOffset)
+	if recordStart < 64 {
+		recordStart = 64
 	}
-	return db.indexManager.QueryPaged(fieldName, value, offset, limit)
+
+	type recordInfo struct {
+		offset uint64
+		key    []byte
+		length int
+	}
+
+	var records []recordInfo
+	db.pkIndex.Range(func(k []byte, v []byte) bool {
+		off, _ := binary.ReadUvarint(bytes.NewReader(v))
+		records = append(records, recordInfo{
+			offset: off,
+			key:    k,
+		})
+		return true
+	})
+
+	slices.SortFunc(records, func(a, b recordInfo) int {
+		return slices.Compare(a.key, b.key)
+	})
+
+	recordDataStart := recordStart
+	updatedIndex := make(map[string][]byte)
+
+	for _, rec := range records {
+		hdrBuf := make([]byte, 12)
+		_, err := db.file.ReadAt(hdrBuf, int64(rec.offset))
+		if err != nil {
+			continue
+		}
+		if hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
+			continue
+		}
+		recLen := binary.BigEndian.Uint32(hdrBuf[7:11])
+		totalLen := 12 + int(recLen) + 2
+
+		recData := make([]byte, totalLen)
+		copy(recData, hdrBuf)
+
+		if totalLen > 12 {
+			n, err := db.file.ReadAt(recData[12:], int64(rec.offset)+12)
+			if err != nil || n < totalLen-12 {
+				continue
+			}
+		}
+
+		db.file.WriteAt(recData, recordDataStart)
+
+		newVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(newVal, uint64(recordDataStart))
+		updatedIndex[string(rec.key)] = newVal
+
+		recordDataStart += int64(totalLen)
+	}
+
+	for k, v := range updatedIndex {
+		db.pkIndex.Set([]byte(k), v)
+	}
+
+	catOffset := recordDataStart
+
+	binary.LittleEndian.PutUint32(header[36:40], uint32(catOffset))
+
+	if _, err := db.file.WriteAt(header, 0); err != nil {
+		return err
+	}
+
+	if _, err := db.file.WriteAt(encodedCat, catOffset); err != nil {
+		return err
+	}
+
+	newSize := catOffset + int64(len(encodedCat))
+	if err := db.file.Truncate(newSize); err != nil {
+		return err
+	}
+
+	if _, err := db.file.WriteAt(header, 0); err != nil {
+		return err
+	}
+
+	return db.file.Sync()
 }
 
-// QueryRangeGreaterThanPaged finds records where field > value with pagination
-func (db *Database[T]) QueryRangeGreaterThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
-	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
-		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+func (db *database) encodeTableCatalog() []byte {
+	count := uint32(0)
+	for _, entry := range db.tableCat {
+		if !entry.Dropped {
+			count++
+		}
 	}
-	return db.indexManager.QueryRangeGreaterThanPaged(fieldName, value, inclusive, offset, limit)
+
+	var buf []byte
+	buf = binary.LittleEndian.AppendUint32(buf, count)
+
+	for _, entry := range db.tableCat {
+		if entry.Dropped {
+			continue
+		}
+		buf = append(buf, entry.ID)
+		buf = append(buf, byte(len(entry.Name)))
+		buf = append(buf, []byte(entry.Name)...)
+		buf = append(buf, byte(len(entry.LayoutHash)))
+		buf = append(buf, []byte(entry.LayoutHash)...)
+		buf = binary.LittleEndian.AppendUint32(buf, entry.NextRecordID)
+	}
+
+	return buf
 }
 
-// QueryRangeLessThanPaged finds records where field < value with pagination
-func (db *Database[T]) QueryRangeLessThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
-	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
-		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+func (db *database) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if err := db.Flush(); err != nil {
+		return err
 	}
-	return db.indexManager.QueryRangeLessThanPaged(fieldName, value, inclusive, offset, limit)
+
+	unlockFile(db.file)
+	return db.file.Close()
 }
 
-// QueryRangeBetweenPaged finds records where min <= field <= max with pagination
-func (db *Database[T]) QueryRangeBetweenPaged(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool, offset, limit int) (*PagedResult[T], error) {
-	if db.indexManager == nil || !db.indexManager.HasIndex(fieldName) {
-		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+func (db *database) Use(tableName string) (*tableCatalogEntry, error) {
+	entry, exists := db.tableCat[tableName]
+	if !exists {
+		return nil, fmt.Errorf("table not found: %s", tableName)
 	}
-	return db.indexManager.QueryRangeBetweenPaged(fieldName, min, max, inclusiveMin, inclusiveMax, offset, limit)
+	if entry.Dropped {
+		return nil, fmt.Errorf("table was dropped: %s", tableName)
+	}
+	return entry, nil
+}
+
+func (db *database) Vacuum() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	newFile, err := os.OpenFile(db.filename+".vacuum", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(db.filename + ".vacuum")
+
+	stat, _ := db.file.Stat()
+	if stat == nil {
+		newFile.Close()
+		return fmt.Errorf("could not stat database file")
+	}
+
+	header := make([]byte, 64)
+	header[0] = EcCode
+	header[1] = RecordStartMark
+	copy(header[2:34], []byte("embeddb v1.0"))
+	binary.LittleEndian.PutUint32(header[32:36], uint32(len(db.tableCat)))
+	binary.LittleEndian.PutUint64(header[40:48], db.alloc.nextOffset)
+
+	if _, err := newFile.Write(header); err != nil {
+		newFile.Close()
+		return err
+	}
+
+	newOffset := int64(64)
+	newPkIndex := NewMapIndex()
+
+	entries := make([]*tableCatalogEntry, 0)
+	for _, entry := range db.tableCat {
+		if !entry.Dropped {
+			entries = append(entries, entry)
+		}
+	}
+
+	for _, entry := range entries {
+		ids := make([]uint32, 0)
+		db.pkIndex.Range(func(k []byte, v []byte) bool {
+			if len(k) >= 2 && k[0] == entry.ID {
+				ids = append(ids, binary.BigEndian.Uint32(k[1:5]))
+			}
+			return true
+		})
+
+		for _, recID := range ids {
+			key := encodePKForIndex(entry.ID, recID)
+			val, ok := db.pkIndex.Get(key)
+			if !ok {
+				continue
+			}
+
+			offset := binary.BigEndian.Uint64(val)
+			recordBuf := make([]byte, 4096)
+			n, err := db.file.ReadAt(recordBuf, int64(offset))
+			if err != nil || n < 14 {
+				continue
+			}
+
+			if recordBuf[0] != EcCode || recordBuf[1] != RecordStartMark {
+				continue
+			}
+
+			active := recordBuf[11]
+			if active != 1 {
+				continue
+			}
+
+			recLen := binary.BigEndian.Uint32(recordBuf[7:11])
+			totalLen := 12 + int(recLen) + 2
+
+			if totalLen <= n {
+				record := recordBuf[:totalLen]
+				if _, err := newFile.Write(record); err != nil {
+					newFile.Close()
+					return err
+				}
+
+				newVal := make([]byte, 8)
+				binary.BigEndian.PutUint64(newVal, uint64(newOffset))
+				newPkIndex.Set(key, newVal)
+
+				newOffset += int64(totalLen)
+			}
+		}
+	}
+
+	tocData := db.encodeTableCatalog()
+	if _, err := newFile.Write(tocData); err != nil {
+		newFile.Close()
+		return err
+	}
+
+	newPkIndex.Range(func(k []byte, v []byte) bool {
+		db.pkIndex.Set(k, v)
+		return true
+	})
+
+	newFile.Close()
+	db.file.Close()
+
+	if err := os.Rename(db.filename+".vacuum", db.filename); err != nil {
+		return err
+	}
+
+	db.file, err = os.OpenFile(db.filename, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+
+	return lockFile(db.file)
+}
+
+type Transaction struct {
+	db        *database
+	snapshot  *MapIndex
+	committed bool
+}
+
+func (db *database) Begin() *Transaction {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	snapshot := NewMapIndex()
+	db.pkIndex.Range(func(k []byte, v []byte) bool {
+		keyCopy := make([]byte, len(k))
+		valCopy := make([]byte, len(v))
+		copy(keyCopy, k)
+		copy(valCopy, v)
+		snapshot.Set(keyCopy, valCopy)
+		return true
+	})
+
+	tx := &Transaction{
+		db:       db,
+		snapshot: snapshot,
+	}
+	db.tx = tx
+	return tx
+}
+
+func (tx *Transaction) Commit() error {
+	if tx.committed {
+		return fmt.Errorf("transaction already committed")
+	}
+	tx.committed = true
+	tx.db.tx = nil
+	return nil
+}
+
+func (tx *Transaction) Rollback() error {
+	if tx.committed {
+		return fmt.Errorf("cannot rollback committed transaction")
+	}
+
+	var keys [][]byte
+	tx.db.pkIndex.Range(func(k []byte, v []byte) bool {
+		keys = append(keys, k)
+		return true
+	})
+	for _, k := range keys {
+		tx.db.pkIndex.Delete(k)
+	}
+
+	tx.snapshot.Range(func(k []byte, v []byte) bool {
+		tx.db.pkIndex.Set(k, v)
+		return true
+	})
+	tx.db.tx = nil
+	return nil
 }

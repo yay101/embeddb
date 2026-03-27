@@ -1,4 +1,2 @@
 github.com/yay101/embeddbcore v0.0.0-20260323021533-fd2b7395c9dd h1:OvBD+QCfkMQV8Duh/E7GpdjXKTkDEz9gK12BRqfKLpU=
 github.com/yay101/embeddbcore v0.0.0-20260323021533-fd2b7395c9dd/go.mod h1:lUAbYOm+zaTjhO9ABKoyWpPHE8zsD4sOfaM2noNNs1o=
-golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 h1:fQsdNF2N+/YewlRZiricy4P1iimyPKZ/xwniHj8Q2a0=
-golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93/go.mod h1:EPRbTFwzwjXj9NpYyyrvenVh9Y+GFeEvMNh7Xuz7xgU=
