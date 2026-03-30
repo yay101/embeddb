@@ -1777,7 +1777,7 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 }
 
 func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
-	var buf []byte
+	buf := make([]byte, 0, 64)
 	for key, field := range t.layout.FieldOffsets {
 		if field.IsStruct && !field.IsTime {
 			continue
