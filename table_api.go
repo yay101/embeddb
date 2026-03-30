@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	embedcore "github.com/yay101/embeddbcore"
 )
@@ -356,11 +355,10 @@ func (im *indexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 		if !found {
 			continue
 		}
-		val, err := embedcore.GetFieldValue(record, field)
-		if err != nil {
+		key := embedcore.GetFieldAsString(record, field)
+		if key == "" {
 			continue
 		}
-		key := valueToIndexKey(val, field.Type)
 		idx.Set(key, recordID)
 	}
 	return nil
@@ -372,11 +370,10 @@ func (im *indexManager[T]) UpdateIndexes(record *T, recordID uint32) error {
 		if !found {
 			continue
 		}
-		val, err := embedcore.GetFieldValue(record, field)
-		if err != nil {
+		key := embedcore.GetFieldAsString(record, field)
+		if key == "" {
 			continue
 		}
-		key := valueToIndexKey(val, field.Type)
 		idx.Set(key, recordID)
 	}
 	return nil
@@ -387,8 +384,7 @@ func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint32,
 	if !ok {
 		return nil, fmt.Errorf("no index for field %s", fieldName)
 	}
-	fieldType, _ := im.fieldCache[fieldName]
-	key := valueToIndexKey(value, fieldType.Type)
+	key := fmt.Sprintf("%v", value)
 	ids, ok := idx.GetAll(key)
 	if !ok {
 		return []uint32{}, nil
@@ -1785,38 +1781,39 @@ func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 
 		buf = append(buf, key, valueStartMarker)
 
-		val, _ := embedcore.GetFieldValue(record, field)
-		switch v := val.(type) {
-		case int:
-			buf = embedcore.EncodeVarint(buf, int64(v))
-		case int8:
-			buf = embedcore.EncodeVarint(buf, int64(v))
-		case int16:
-			buf = embedcore.EncodeVarint(buf, int64(v))
-		case int32:
-			buf = embedcore.EncodeVarint(buf, int64(v))
-		case int64:
-			buf = embedcore.EncodeVarint(buf, v)
-		case uint:
-			buf = embedcore.EncodeUvarint(buf, uint64(v))
-		case uint8:
-			buf = embedcore.EncodeUvarint(buf, uint64(v))
-		case uint16:
-			buf = embedcore.EncodeUvarint(buf, uint64(v))
-		case uint32:
-			buf = embedcore.EncodeUvarint(buf, uint64(v))
-		case uint64:
-			buf = embedcore.EncodeUvarint(buf, v)
-		case string:
-			buf = embedcore.EncodeString(buf, v)
-		case bool:
-			buf = embedcore.EncodeBool(buf, v)
-		case float64:
-			buf = embedcore.EncodeFloat64(buf, v)
-		case float32:
-			buf = embedcore.EncodeFloat64(buf, float64(v))
-		case time.Time:
-			buf = embedcore.EncodeVarint(buf, v.Unix())
+		switch field.Type {
+		case reflect.Int:
+			buf = embedcore.EncodeVarint(buf, int64(embedcore.GetIntField(record, field)))
+		case reflect.Int8:
+			buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt8Field(record, field)))
+		case reflect.Int16:
+			buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt16Field(record, field)))
+		case reflect.Int32:
+			buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt32Field(record, field)))
+		case reflect.Int64:
+			buf = embedcore.EncodeVarint(buf, embedcore.GetInt64Field(record, field))
+		case reflect.Uint:
+			buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUintField(record, field)))
+		case reflect.Uint8:
+			buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint8Field(record, field)))
+		case reflect.Uint16:
+			buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint16Field(record, field)))
+		case reflect.Uint32:
+			buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint32Field(record, field)))
+		case reflect.Uint64:
+			buf = embedcore.EncodeUvarint(buf, embedcore.GetUint64Field(record, field))
+		case reflect.String:
+			buf = embedcore.EncodeString(buf, embedcore.GetStringField(record, field))
+		case reflect.Bool:
+			buf = embedcore.EncodeBool(buf, embedcore.GetBoolField(record, field))
+		case reflect.Float64:
+			buf = embedcore.EncodeFloat64(buf, embedcore.GetFloat64Field(record, field))
+		case reflect.Float32:
+			buf = embedcore.EncodeFloat64(buf, float64(embedcore.GetFloat32Field(record, field)))
+		case reflect.Struct:
+			if field.IsTime {
+				buf = embedcore.EncodeVarint(buf, embedcore.GetTimeField(record, field).Unix())
+			}
 		default:
 			buf = buf[:len(buf)-2]
 			continue
