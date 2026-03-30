@@ -18,18 +18,18 @@ const (
 	valueEndMarker   = byte(0x1F)
 )
 
-type MapIndex struct {
+type mapIndex struct {
 	mu   sync.RWMutex
 	data map[string][]byte
 }
 
-func NewMapIndex() *MapIndex {
-	return &MapIndex{
+func newMapIndex() *mapIndex {
+	return &mapIndex{
 		data: make(map[string][]byte),
 	}
 }
 
-func (mi *MapIndex) Set(key []byte, value []byte) {
+func (mi *mapIndex) Set(key []byte, value []byte) {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
 	keyCopy := make([]byte, len(key))
@@ -39,7 +39,7 @@ func (mi *MapIndex) Set(key []byte, value []byte) {
 	mi.data[string(keyCopy)] = valCopy
 }
 
-func (mi *MapIndex) SetUint32(key []byte, value uint32) {
+func (mi *mapIndex) SetUint32(key []byte, value uint32) {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
 	keyCopy := make([]byte, len(key))
@@ -49,7 +49,7 @@ func (mi *MapIndex) SetUint32(key []byte, value uint32) {
 	mi.data[string(keyCopy)] = val
 }
 
-func (mi *MapIndex) Get(key []byte) ([]byte, bool) {
+func (mi *mapIndex) Get(key []byte) ([]byte, bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	val, ok := mi.data[string(key)]
@@ -61,7 +61,7 @@ func (mi *MapIndex) Get(key []byte) ([]byte, bool) {
 	return valCopy, true
 }
 
-func (mi *MapIndex) GetUint32(key []byte) (uint32, bool) {
+func (mi *mapIndex) GetUint32(key []byte) (uint32, bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	val, ok := mi.data[string(key)]
@@ -71,13 +71,13 @@ func (mi *MapIndex) GetUint32(key []byte) (uint32, bool) {
 	return binary.BigEndian.Uint32(val), true
 }
 
-func (mi *MapIndex) Delete(key []byte) {
+func (mi *mapIndex) Delete(key []byte) {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
 	delete(mi.data, string(key))
 }
 
-func (mi *MapIndex) Range(fn func(k []byte, v []byte) bool) {
+func (mi *mapIndex) Range(fn func(k []byte, v []byte) bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	for k, v := range mi.data {
@@ -91,43 +91,43 @@ func (mi *MapIndex) Range(fn func(k []byte, v []byte) bool) {
 	}
 }
 
-func (mi *MapIndex) Size() int {
+func (mi *mapIndex) Size() int {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	return len(mi.data)
 }
 
-type Uint32MapIndex struct {
+type uint32MapIndex struct {
 	mu   sync.RWMutex
 	data map[string]uint32
 }
 
-func NewUint32MapIndex() *Uint32MapIndex {
-	return &Uint32MapIndex{
+func newUint32MapIndex() *uint32MapIndex {
+	return &uint32MapIndex{
 		data: make(map[string]uint32),
 	}
 }
 
-func (mi *Uint32MapIndex) Set(key string, value uint32) {
+func (mi *uint32MapIndex) Set(key string, value uint32) {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
 	mi.data[key] = value
 }
 
-func (mi *Uint32MapIndex) Get(key string) (uint32, bool) {
+func (mi *uint32MapIndex) Get(key string) (uint32, bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	val, ok := mi.data[key]
 	return val, ok
 }
 
-func (mi *Uint32MapIndex) Delete(key string) {
+func (mi *uint32MapIndex) Delete(key string) {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
 	delete(mi.data, key)
 }
 
-func (mi *Uint32MapIndex) Range(fn func(k string, v uint32) bool) {
+func (mi *uint32MapIndex) Range(fn func(k string, v uint32) bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	for k, v := range mi.data {
@@ -137,7 +137,7 @@ func (mi *Uint32MapIndex) Range(fn func(k string, v uint32) bool) {
 	}
 }
 
-func (mi *Uint32MapIndex) Size() int {
+func (mi *uint32MapIndex) Size() int {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	return len(mi.data)
@@ -194,13 +194,13 @@ type database struct {
 	mu       sync.RWMutex
 	file     *os.File
 	filename string
-	pkIndex  *MapIndex
-	alloc    *Allocator
+	pkIndex  *mapIndex
+	alloc    *allocator
 	tableCat tableCatalog
 	tx       *Transaction
 }
 
-func OpenDatabase(filename string, migrate bool) (*database, error) {
+func openDatabase(filename string, migrate bool) (*database, error) {
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
@@ -214,8 +214,8 @@ func OpenDatabase(filename string, migrate bool) (*database, error) {
 	db := &database{
 		filename: filename,
 		file:     file,
-		pkIndex:  NewMapIndex(),
-		alloc:    &Allocator{},
+		pkIndex:  newMapIndex(),
+		alloc:    &allocator{},
 		tableCat: make(tableCatalog),
 	}
 
@@ -372,7 +372,7 @@ func decodeTableCatalog(data []byte) tableCatalog {
 	return tc
 }
 
-func (db *database) Flush() error {
+func (db *database) flush() error {
 	header := make([]byte, 64)
 	header[0] = EcCode
 	header[1] = RecordStartMark
@@ -498,7 +498,7 @@ func (db *database) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := db.Flush(); err != nil {
+	if err := db.flush(); err != nil {
 		return err
 	}
 
@@ -546,7 +546,7 @@ func (db *database) Vacuum() error {
 	}
 
 	newOffset := int64(64)
-	newPkIndex := NewMapIndex()
+	newPkIndex := newMapIndex()
 
 	entries := make([]*tableCatalogEntry, 0)
 	for _, entry := range db.tableCat {
@@ -634,7 +634,7 @@ func (db *database) Vacuum() error {
 
 type Transaction struct {
 	db        *database
-	snapshot  *MapIndex
+	snapshot  *mapIndex
 	committed bool
 }
 
@@ -642,7 +642,7 @@ func (db *database) Begin() *Transaction {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	snapshot := NewMapIndex()
+	snapshot := newMapIndex()
 	db.pkIndex.Range(func(k []byte, v []byte) bool {
 		keyCopy := make([]byte, len(k))
 		valCopy := make([]byte, len(v))

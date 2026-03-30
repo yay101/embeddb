@@ -86,7 +86,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	}, nil
 }
 
-func Use[T any](db *DB, name ...string) (*TypedTable[T], error) {
+func Use[T any](db *DB, name ...string) (*Table[T], error) {
 	if db == nil {
 		return nil, fmt.Errorf("db is nil")
 	}
@@ -106,7 +106,7 @@ func Use[T any](db *DB, name ...string) (*TypedTable[T], error) {
 			return nil, fmt.Errorf("table not found")
 		}
 		layout := computeLayout[T]()
-		return &TypedTable[T]{
+		return &Table[T]{
 			db:      existing,
 			name:    tableName,
 			tableID: existingTable.ID,
@@ -119,7 +119,7 @@ func Use[T any](db *DB, name ...string) (*TypedTable[T], error) {
 		typedDB = db.database
 	} else {
 		var err error
-		typedDB, err = OpenDatabase(db.filename, false)
+		typedDB, err = openDatabase(db.filename, false)
 		if err != nil {
 			return nil, err
 		}
@@ -148,7 +148,7 @@ func Use[T any](db *DB, name ...string) (*TypedTable[T], error) {
 	}
 	typedDB.mu.Unlock()
 
-	typedTable := &TypedTable[T]{
+	typedTable := &Table[T]{
 		db:      typedDB,
 		name:    tableName,
 		tableID: table.ID,
@@ -233,7 +233,7 @@ func (db *DB) Sync() error {
 	}
 
 	for _, t := range db.tables {
-		return t.Flush()
+		return t.flush()
 	}
 	return nil
 }
@@ -281,49 +281,49 @@ func computeLayout[T any]() *embedcore.StructLayout {
 	return layout
 }
 
-type TypedTable[T any] struct {
+type Table[T any] struct {
 	db      *database
 	name    string
 	tableID uint8
 	layout  *embedcore.StructLayout
-	idxMgr  *typedIndexManager[T]
+	idxMgr  *indexManager[T]
 }
 
-type typedIndexManager[T any] struct {
+type indexManager[T any] struct {
 	db      *database
 	layout  *embedcore.StructLayout
-	indexes map[string]*Uint32MapIndex
+	indexes map[string]*uint32MapIndex
 }
 
-func newTypedIndexManager[T any](db *database, layout *embedcore.StructLayout) *typedIndexManager[T] {
-	return &typedIndexManager[T]{
+func newIndexManager[T any](db *database, layout *embedcore.StructLayout) *indexManager[T] {
+	return &indexManager[T]{
 		db:      db,
 		layout:  layout,
-		indexes: make(map[string]*Uint32MapIndex),
+		indexes: make(map[string]*uint32MapIndex),
 	}
 }
 
-func (im *typedIndexManager[T]) CreateIndex(fieldName string) error {
+func (im *indexManager[T]) CreateIndex(fieldName string) error {
 	for _, field := range im.layout.FieldOffsets {
 		if field.Name == fieldName {
-			im.indexes[fieldName] = NewUint32MapIndex()
+			im.indexes[fieldName] = newUint32MapIndex()
 			return nil
 		}
 	}
 	return fmt.Errorf("field %s not found", fieldName)
 }
 
-func (im *typedIndexManager[T]) DropIndex(fieldName string) error {
+func (im *indexManager[T]) DropIndex(fieldName string) error {
 	delete(im.indexes, fieldName)
 	return nil
 }
 
-func (im *typedIndexManager[T]) HasIndex(fieldName string) bool {
+func (im *indexManager[T]) HasIndex(fieldName string) bool {
 	_, ok := im.indexes[fieldName]
 	return ok
 }
 
-func (im *typedIndexManager[T]) GetIndexedFields() []string {
+func (im *indexManager[T]) GetIndexedFields() []string {
 	fields := make([]string, 0, len(im.indexes))
 	for f := range im.indexes {
 		fields = append(fields, f)
@@ -331,7 +331,7 @@ func (im *typedIndexManager[T]) GetIndexedFields() []string {
 	return fields
 }
 
-func (im *typedIndexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
+func (im *indexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 	for fieldName, idx := range im.indexes {
 		var field embedcore.FieldOffset
 		var found bool
@@ -355,7 +355,7 @@ func (im *typedIndexManager[T]) InsertIntoIndexes(record *T, recordID uint32) er
 	return nil
 }
 
-func (im *typedIndexManager[T]) UpdateIndexes(record *T, recordID uint32) error {
+func (im *indexManager[T]) UpdateIndexes(record *T, recordID uint32) error {
 	for fieldName, idx := range im.indexes {
 		var field embedcore.FieldOffset
 		var found bool
@@ -379,7 +379,7 @@ func (im *typedIndexManager[T]) UpdateIndexes(record *T, recordID uint32) error 
 	return nil
 }
 
-func (im *typedIndexManager[T]) Query(fieldName string, value interface{}) ([]uint32, error) {
+func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint32, error) {
 	idx, ok := im.indexes[fieldName]
 	if !ok {
 		return nil, fmt.Errorf("no index for field %s", fieldName)
@@ -392,19 +392,19 @@ func (im *typedIndexManager[T]) Query(fieldName string, value interface{}) ([]ui
 	return []uint32{id}, nil
 }
 
-func (im *typedIndexManager[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]uint32, error) {
+func (im *indexManager[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]uint32, error) {
 	return nil, errors.New("QueryRangeGreaterThan not yet implemented")
 }
 
-func (im *typedIndexManager[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]uint32, error) {
+func (im *indexManager[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]uint32, error) {
 	return nil, errors.New("QueryRangeLessThan not yet implemented")
 }
 
-func (im *typedIndexManager[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
+func (im *indexManager[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
 	return nil, errors.New("QueryRangeBetween not yet implemented")
 }
 
-func (t *TypedTable[T]) Insert(record *T) (uint32, error) {
+func (t *Table[T]) Insert(record *T) (uint32, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
@@ -457,7 +457,7 @@ func (t *TypedTable[T]) Insert(record *T) (uint32, error) {
 	return recordID, nil
 }
 
-func (t *TypedTable[T]) isZeroPK(val any) bool {
+func (t *Table[T]) isZeroPK(val any) bool {
 	if val == nil {
 		return true
 	}
@@ -488,7 +488,7 @@ func (t *TypedTable[T]) isZeroPK(val any) bool {
 	return false
 }
 
-func (t *TypedTable[T]) setPKValue(record *T, val any) {
+func (t *Table[T]) setPKValue(record *T, val any) {
 	for _, field := range t.layout.FieldOffsets {
 		if field.Primary {
 			embedcore.SetFieldValue(record, field, val)
@@ -497,7 +497,7 @@ func (t *TypedTable[T]) setPKValue(record *T, val any) {
 	}
 }
 
-func (t *TypedTable[T]) getPKValue(record *T) (any, error) {
+func (t *Table[T]) getPKValue(record *T) (any, error) {
 	for _, field := range t.layout.FieldOffsets {
 		if field.Primary {
 			val, err := embedcore.GetFieldValue(record, field)
@@ -510,7 +510,7 @@ func (t *TypedTable[T]) getPKValue(record *T) (any, error) {
 	return nil, fmt.Errorf("no primary key found")
 }
 
-func (t *TypedTable[T]) Get(id any) (*T, error) {
+func (t *Table[T]) Get(id any) (*T, error) {
 	t.db.mu.RLock()
 	defer t.db.mu.RUnlock()
 
@@ -546,7 +546,7 @@ func (t *TypedTable[T]) Get(id any) (*T, error) {
 	return &result, nil
 }
 
-func (t *TypedTable[T]) queryByPK(pkValue string) (uint32, bool) {
+func (t *Table[T]) queryByPK(pkValue string) (uint32, bool) {
 	if t.idxMgr == nil {
 		return 0, false
 	}
@@ -567,7 +567,7 @@ func (t *TypedTable[T]) queryByPK(pkValue string) (uint32, bool) {
 	return 0, false
 }
 
-func (t *TypedTable[T]) Update(id any, record *T) error {
+func (t *Table[T]) Update(id any, record *T) error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
@@ -617,7 +617,7 @@ func (t *TypedTable[T]) Update(id any, record *T) error {
 	return nil
 }
 
-func (t *TypedTable[T]) Delete(id any) error {
+func (t *Table[T]) Delete(id any) error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
@@ -636,7 +636,7 @@ func (t *TypedTable[T]) Delete(id any) error {
 	return nil
 }
 
-func (t *TypedTable[T]) DeleteMany(ids []any) (int, error) {
+func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
@@ -656,7 +656,7 @@ func (t *TypedTable[T]) DeleteMany(ids []any) (int, error) {
 	return deleted, nil
 }
 
-func (t *TypedTable[T]) InsertMany(records []*T) ([]uint32, error) {
+func (t *Table[T]) InsertMany(records []*T) ([]uint32, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
@@ -671,7 +671,7 @@ func (t *TypedTable[T]) InsertMany(records []*T) ([]uint32, error) {
 	return ids, nil
 }
 
-func (t *TypedTable[T]) UpdateMany(ids []any, updater func(*T) error) (int, error) {
+func (t *Table[T]) UpdateMany(ids []any, updater func(*T) error) (int, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
@@ -692,7 +692,7 @@ func (t *TypedTable[T]) UpdateMany(ids []any, updater func(*T) error) (int, erro
 	return updated, nil
 }
 
-func (t *TypedTable[T]) insertLocked(record *T) (uint32, error) {
+func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	entry := t.db.tableCat[t.name]
 	if entry == nil {
 		return 0, fmt.Errorf("table not found")
@@ -742,7 +742,7 @@ func (t *TypedTable[T]) insertLocked(record *T) (uint32, error) {
 	return recordID, nil
 }
 
-func (t *TypedTable[T]) getLocked(id any) (*T, error) {
+func (t *Table[T]) getLocked(id any) (*T, error) {
 	indexKey := encodePKForIndex(t.tableID, id)
 	val, ok := t.db.pkIndex.Get(indexKey)
 	if !ok {
@@ -774,7 +774,7 @@ func (t *TypedTable[T]) getLocked(id any) (*T, error) {
 	return &result, nil
 }
 
-func (t *TypedTable[T]) updateLocked(id any, record *T) error {
+func (t *Table[T]) updateLocked(id any, record *T) error {
 	indexKey := encodePKForIndex(t.tableID, id)
 	val, ok := t.db.pkIndex.Get(indexKey)
 	if !ok {
@@ -814,7 +814,7 @@ func (t *TypedTable[T]) updateLocked(id any, record *T) error {
 	return nil
 }
 
-func (t *TypedTable[T]) Upsert(id any, record *T) (uint32, bool, error) {
+func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	existing, err := t.Get(id)
 	if err == nil && existing != nil {
 		if updateErr := t.Update(id, record); updateErr != nil {
@@ -830,7 +830,7 @@ func (t *TypedTable[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	return insertID, true, nil
 }
 
-func (t *TypedTable[T]) Query(fieldName string, value interface{}) ([]T, error) {
+func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
 		recordIDs, err := t.idxMgr.Query(fieldName, value)
 		if err != nil {
@@ -860,21 +860,21 @@ func (t *TypedTable[T]) Query(fieldName string, value interface{}) ([]T, error) 
 	return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
 }
 
-func (t *TypedTable[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) > 0 || (inclusive && compareValues(fieldValue, value) == 0)
 	}
 	return t.filterByField(fieldName, comparator)
 }
 
-func (t *TypedTable[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) < 0 || (inclusive && compareValues(fieldValue, value) == 0)
 	}
 	return t.filterByField(fieldName, comparator)
 }
 
-func (t *TypedTable[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
+func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		cMin := compareValues(fieldValue, min)
 		cMax := compareValues(fieldValue, max)
@@ -885,28 +885,28 @@ func (t *TypedTable[T]) QueryRangeBetween(fieldName string, min, max interface{}
 	return t.filterByField(fieldName, comparator)
 }
 
-func (t *TypedTable[T]) QueryNotEqual(fieldName string, value interface{}) ([]T, error) {
+func (t *Table[T]) QueryNotEqual(fieldName string, value interface{}) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) != 0
 	}
 	return t.filterByField(fieldName, comparator)
 }
 
-func (t *TypedTable[T]) QueryGreaterOrEqual(fieldName string, value interface{}) ([]T, error) {
+func (t *Table[T]) QueryGreaterOrEqual(fieldName string, value interface{}) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) >= 0
 	}
 	return t.filterByField(fieldName, comparator)
 }
 
-func (t *TypedTable[T]) QueryLessOrEqual(fieldName string, value interface{}) ([]T, error) {
+func (t *Table[T]) QueryLessOrEqual(fieldName string, value interface{}) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) <= 0
 	}
 	return t.filterByField(fieldName, comparator)
 }
 
-func (t *TypedTable[T]) QueryLike(fieldName string, pattern string) ([]T, error) {
+func (t *Table[T]) QueryLike(fieldName string, pattern string) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		str, ok := fieldValue.(string)
 		if !ok {
@@ -917,7 +917,7 @@ func (t *TypedTable[T]) QueryLike(fieldName string, pattern string) ([]T, error)
 	return t.filterByField(fieldName, comparator)
 }
 
-func (t *TypedTable[T]) QueryNotLike(fieldName string, pattern string) ([]T, error) {
+func (t *Table[T]) QueryNotLike(fieldName string, pattern string) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		str, ok := fieldValue.(string)
 		if !ok {
@@ -949,7 +949,7 @@ func matchLike(s, pattern string) bool {
 	return sLower == patternLower
 }
 
-func (t *TypedTable[T]) filterByField(fieldName string, fn func(interface{}) bool) ([]T, error) {
+func (t *Table[T]) filterByField(fieldName string, fn func(interface{}) bool) ([]T, error) {
 	field, err := t.findField(fieldName)
 	if err != nil {
 		return nil, err
@@ -975,7 +975,7 @@ func (t *TypedTable[T]) filterByField(fieldName string, fn func(interface{}) boo
 	return results, nil
 }
 
-func (t *TypedTable[T]) filterPagedByField(field embedcore.FieldOffset, fn func(interface{}) bool, offset, limit int) (*PagedResult[T], error) {
+func (t *Table[T]) filterPagedByField(field embedcore.FieldOffset, fn func(interface{}) bool, offset, limit int) (*PagedResult[T], error) {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
 
@@ -1016,7 +1016,7 @@ func (t *TypedTable[T]) filterPagedByField(field embedcore.FieldOffset, fn func(
 	}, nil
 }
 
-func (t *TypedTable[T]) findField(fieldName string) (embedcore.FieldOffset, error) {
+func (t *Table[T]) findField(fieldName string) (embedcore.FieldOffset, error) {
 	for _, f := range t.layout.FieldOffsets {
 		if f.Name == fieldName {
 			return f, nil
@@ -1159,7 +1159,7 @@ func toFloat64(v interface{}) float64 {
 	return 0
 }
 
-func (t *TypedTable[T]) All() ([]T, error) {
+func (t *Table[T]) All() ([]T, error) {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
 
@@ -1176,7 +1176,7 @@ func (t *TypedTable[T]) All() ([]T, error) {
 	return results, scanner.Err()
 }
 
-func (t *TypedTable[T]) Filter(fn func(T) bool) ([]T, error) {
+func (t *Table[T]) Filter(fn func(T) bool) ([]T, error) {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
 
@@ -1196,7 +1196,7 @@ func (t *TypedTable[T]) Filter(fn func(T) bool) ([]T, error) {
 	return results, scanner.Err()
 }
 
-func (t *TypedTable[T]) Scan(fn func(T) bool) error {
+func (t *Table[T]) Scan(fn func(T) bool) error {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
 
@@ -1214,8 +1214,8 @@ func (t *TypedTable[T]) Scan(fn func(T) bool) error {
 	return scanner.Err()
 }
 
-type TypedScanner[T any] struct {
-	table     *TypedTable[T]
+type Scanner[T any] struct {
+	table     *Table[T]
 	indexSnap []uint32
 	indexKeys [][]byte
 	pos       int
@@ -1223,7 +1223,7 @@ type TypedScanner[T any] struct {
 	err       error
 }
 
-func (t *TypedTable[T]) ScanRecords() *TypedScanner[T] {
+func (t *Table[T]) ScanRecords() *Scanner[T] {
 	t.db.mu.RLock()
 	keys := make([][]byte, 0)
 	t.db.pkIndex.Range(func(k, v []byte) bool {
@@ -1236,7 +1236,7 @@ func (t *TypedTable[T]) ScanRecords() *TypedScanner[T] {
 	})
 	t.db.mu.RUnlock()
 
-	return &TypedScanner[T]{
+	return &Scanner[T]{
 		table:     t,
 		indexSnap: nil,
 		indexKeys: keys,
@@ -1244,7 +1244,7 @@ func (t *TypedTable[T]) ScanRecords() *TypedScanner[T] {
 	}
 }
 
-func (s *TypedScanner[T]) Next() bool {
+func (s *Scanner[T]) Next() bool {
 	if s.err != nil || s.pos >= len(s.indexKeys) {
 		return false
 	}
@@ -1276,22 +1276,22 @@ func (s *TypedScanner[T]) Next() bool {
 	return true
 }
 
-func (s *TypedScanner[T]) Record() (*T, error) {
+func (s *Scanner[T]) Record() (*T, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
 	return s.current, nil
 }
 
-func (s *TypedScanner[T]) Err() error {
+func (s *Scanner[T]) Err() error {
 	return s.err
 }
 
-func (s *TypedScanner[T]) Close() {
+func (s *Scanner[T]) Close() {
 	s.indexKeys = nil
 }
 
-func (t *TypedTable[T]) Count() int {
+func (t *Table[T]) Count() int {
 	count := 0
 	t.db.pkIndex.Range(func(k, v []byte) bool {
 		if len(k) >= 2 && k[0] == t.tableID {
@@ -1302,21 +1302,21 @@ func (t *TypedTable[T]) Count() int {
 	return count
 }
 
-func (t *TypedTable[T]) CreateIndex(fieldName string) error {
+func (t *Table[T]) CreateIndex(fieldName string) error {
 	if t.idxMgr == nil {
-		t.idxMgr = newTypedIndexManager[T](t.db, t.layout)
+		t.idxMgr = newIndexManager[T](t.db, t.layout)
 	}
 	return t.idxMgr.CreateIndex(fieldName)
 }
 
-func (t *TypedTable[T]) DropIndex(fieldName string) error {
+func (t *Table[T]) DropIndex(fieldName string) error {
 	if t.idxMgr == nil {
 		return nil
 	}
 	return t.idxMgr.DropIndex(fieldName)
 }
 
-func (t *TypedTable[T]) Drop() error {
+func (t *Table[T]) Drop() error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
@@ -1341,18 +1341,18 @@ func (t *TypedTable[T]) Drop() error {
 	return nil
 }
 
-func (t *TypedTable[T]) GetIndexedFields() []string {
+func (t *Table[T]) GetIndexedFields() []string {
 	if t.idxMgr == nil {
 		return nil
 	}
 	return t.idxMgr.GetIndexedFields()
 }
 
-func (t *TypedTable[T]) Name() string {
+func (t *Table[T]) Name() string {
 	return t.name
 }
 
-func (t *TypedTable[T]) QueryPaged(fieldName string, value interface{}, offset, limit int) (*PagedResult[T], error) {
+func (t *Table[T]) QueryPaged(fieldName string, value interface{}, offset, limit int) (*PagedResult[T], error) {
 	all, err := t.Query(fieldName, value)
 	if err != nil {
 		field, fieldErr := t.findField(fieldName)
@@ -1367,19 +1367,19 @@ func (t *TypedTable[T]) QueryPaged(fieldName string, value interface{}, offset, 
 	return paginateResults(all, offset, limit), nil
 }
 
-func (t *TypedTable[T]) QueryRangeGreaterThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
+func (t *Table[T]) QueryRangeGreaterThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
 	return nil, errors.New("QueryRangeGreaterThanPaged not yet implemented")
 }
 
-func (t *TypedTable[T]) QueryRangeLessThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
+func (t *Table[T]) QueryRangeLessThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
 	return nil, errors.New("QueryRangeLessThanPaged not yet implemented")
 }
 
-func (t *TypedTable[T]) QueryRangeBetweenPaged(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool, offset, limit int) (*PagedResult[T], error) {
+func (t *Table[T]) QueryRangeBetweenPaged(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool, offset, limit int) (*PagedResult[T], error) {
 	return nil, errors.New("QueryRangeBetweenPaged not yet implemented")
 }
 
-func (t *TypedTable[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedResult[T], error) {
+func (t *Table[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedResult[T], error) {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
 
@@ -1420,7 +1420,7 @@ func (t *TypedTable[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedR
 	}, nil
 }
 
-func (t *TypedTable[T]) AllPaged(offset, limit int) (*PagedResult[T], error) {
+func (t *Table[T]) AllPaged(offset, limit int) (*PagedResult[T], error) {
 	all, err := t.All()
 	if err != nil {
 		return nil, err
@@ -1466,7 +1466,7 @@ func paginateResults[T any](all []T, offset, limit int) *PagedResult[T] {
 	}
 }
 
-func (t *TypedTable[T]) decodeRecord(data []byte, result *T) error {
+func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 	data = data[12:]
 	data = data[:len(data)-2]
 
@@ -1540,7 +1540,7 @@ func (t *TypedTable[T]) decodeRecord(data []byte, result *T) error {
 	return nil
 }
 
-func (t *TypedTable[T]) encodeRecord(record *T) ([]byte, error) {
+func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 	var buf []byte
 	for key, field := range t.layout.FieldOffsets {
 		if field.IsStruct && !field.IsTime {

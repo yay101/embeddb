@@ -4,8 +4,8 @@ import (
 	"sync"
 )
 
-// Allocator manages free space in the database file.
-type Allocator struct {
+// allocator manages free space in the database file.
+type allocator struct {
 	nextOffset uint64      // next free offset assuming no reuse
 	freeList   []freeBlock // sorted by offset, coalesced
 	mu         sync.Mutex  // protects freeList and nextOffset
@@ -19,7 +19,7 @@ type freeBlock struct {
 
 // Allocate returns a free region of at least size bytes.
 // It prefers to reuse a free block; if none is large enough, it extends the file.
-func (a *Allocator) Allocate(size uint64) (offset uint64, length uint64) {
+func (a *allocator) Allocate(size uint64) (offset uint64, length uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	// Find the first free block that fits.
@@ -46,7 +46,7 @@ func (a *Allocator) Allocate(size uint64) (offset uint64, length uint64) {
 
 // Free releases the region [offset, offset+length) back to the free list.
 // It coalesces with adjacent free blocks.
-func (a *Allocator) Free(offset uint64, length uint64) {
+func (a *allocator) Free(offset uint64, length uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	// Insert the new block in the correct position to keep the list sorted by offset.
@@ -86,7 +86,7 @@ func (a *Allocator) Free(offset uint64, length uint64) {
 // It is used to decide when to run a more aggressive cleanup (e.g., when >1MB has been freed).
 // Note: This function does not modify the allocator; it only reports the potential reclaim.
 // For simplicity, we just return the total free length.
-func (a *Allocator) ReclaimIfNeeded() uint64 {
+func (a *allocator) ReclaimIfNeeded() uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var total uint64
@@ -97,7 +97,7 @@ func (a *Allocator) ReclaimIfNeeded() uint64 {
 }
 
 // Reset sets the allocator to a known state (used when loading from header).
-func (a *Allocator) Reset(nextOffset uint64, freeList []freeBlock) {
+func (a *allocator) Reset(nextOffset uint64, freeList []freeBlock) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.nextOffset = nextOffset
@@ -105,7 +105,7 @@ func (a *Allocator) Reset(nextOffset uint64, freeList []freeBlock) {
 }
 
 // CopyFreeList returns a copy of the current free list (for serialization).
-func (a *Allocator) CopyFreeList() []freeBlock {
+func (a *allocator) CopyFreeList() []freeBlock {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	freelistCopy := make([]freeBlock, len(a.freeList))

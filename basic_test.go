@@ -184,7 +184,7 @@ func TestDelete(t *testing.T) {
 }
 
 func TestMapIndex(t *testing.T) {
-	mi := NewMapIndex()
+	mi := newMapIndex()
 
 	mi.Set([]byte("key1"), []byte("value1"))
 	mi.Set([]byte("key2"), []byte("value2"))
@@ -214,7 +214,7 @@ func TestMapIndex(t *testing.T) {
 }
 
 func TestUint32MapIndex(t *testing.T) {
-	mi := NewUint32MapIndex()
+	mi := newUint32MapIndex()
 
 	mi.Set("key1", 100)
 	mi.Set("key2", 200)
