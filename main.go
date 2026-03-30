@@ -1,12 +1,15 @@
 package embeddb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
 	"slices"
 	"sync"
 	"syscall"
+
+	embedcore "github.com/yay101/embeddbcore"
 )
 
 const (
@@ -98,26 +101,39 @@ func (mi *mapIndex) Size() int {
 
 type uint32MapIndex struct {
 	mu   sync.RWMutex
-	data map[string]uint32
+	data map[string][]uint32
 }
 
 func newUint32MapIndex() *uint32MapIndex {
 	return &uint32MapIndex{
-		data: make(map[string]uint32),
+		data: make(map[string][]uint32),
 	}
 }
 
 func (mi *uint32MapIndex) Set(key string, value uint32) {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
-	mi.data[key] = value
+	mi.data[key] = append(mi.data[key], value)
 }
 
 func (mi *uint32MapIndex) Get(key string) (uint32, bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
-	val, ok := mi.data[key]
-	return val, ok
+	vals, ok := mi.data[key]
+	if !ok || len(vals) == 0 {
+		return 0, false
+	}
+	return vals[0], true
+}
+
+func (mi *uint32MapIndex) GetAll(key string) ([]uint32, bool) {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	vals, ok := mi.data[key]
+	if !ok || len(vals) == 0 {
+		return nil, false
+	}
+	return vals, true
 }
 
 func (mi *uint32MapIndex) Delete(key string) {
@@ -130,8 +146,10 @@ func (mi *uint32MapIndex) Range(fn func(k string, v uint32) bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	for k, v := range mi.data {
-		if !fn(k, v) {
-			return
+		if len(v) > 0 {
+			if !fn(k, v[0]) {
+				return
+			}
 		}
 	}
 }
@@ -771,5 +789,119 @@ func (tx *Transaction) Rollback() error {
 		return true
 	})
 	tx.db.tx = nil
+	return nil
+}
+
+func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.StructLayout) error {
+	type migrateRecord struct {
+		key    []byte
+		offset uint64
+	}
+
+	var records []migrateRecord
+
+	db.pkIndex.Range(func(k []byte, v []byte) bool {
+		if len(k) >= 2 && k[0] == table.ID {
+			offset := binary.BigEndian.Uint64(v)
+			records = append(records, migrateRecord{
+				key:    k,
+				offset: offset,
+			})
+		}
+		return true
+	})
+
+	if len(records) == 0 {
+		return nil
+	}
+
+	var maxOffset uint64 = 64
+
+	for _, rec := range records {
+		hdrBuf := make([]byte, 12)
+		_, err := db.file.ReadAt(hdrBuf, int64(rec.offset))
+		if err != nil || hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
+			continue
+		}
+
+		recLen := binary.BigEndian.Uint32(hdrBuf[7:11])
+		totalLen := 12 + int(recLen) + 2
+
+		recordBuf := make([]byte, totalLen)
+		copy(recordBuf, hdrBuf)
+		_, err = db.file.ReadAt(recordBuf[12:], int64(rec.offset)+12)
+		if err != nil {
+			continue
+		}
+
+		recordID := binary.BigEndian.Uint32(recordBuf[3:7])
+		active := recordBuf[11]
+
+		if active != 1 {
+			continue
+		}
+
+		encoded := recordBuf[12 : len(recordBuf)-2]
+
+		var newEncoded []byte
+		for _, field := range newLayout.FieldOffsets {
+			if field.IsStruct && !field.IsTime {
+				continue
+			}
+
+			key := field.Key
+			startIdx := bytes.Index(encoded, []byte{key, valueStartMarker})
+			if startIdx == -1 {
+				continue
+			}
+
+			startIdx += 2
+			endIdx := bytes.Index(encoded[startIdx:], []byte{valueEndMarker})
+			if endIdx == -1 {
+				continue
+			}
+
+			fieldData := encoded[startIdx : startIdx+endIdx]
+
+			newEncoded = append(newEncoded, key)
+			newEncoded = append(newEncoded, valueStartMarker)
+			newEncoded = append(newEncoded, fieldData...)
+			newEncoded = append(newEncoded, valueEndMarker)
+		}
+
+		if len(newEncoded) == 0 {
+			continue
+		}
+
+		newHeader := make([]byte, 12)
+		newHeader[0] = EcCode
+		newHeader[1] = RecordStartMark
+		newHeader[2] = table.ID
+		binary.BigEndian.PutUint32(newHeader[3:7], recordID)
+		binary.BigEndian.PutUint32(newHeader[7:11], uint32(len(newEncoded)))
+		newHeader[11] = 1
+
+		newFooter := []byte{EcCode, RecordEndMark}
+
+		newRecord := make([]byte, 0, len(newHeader)+len(newEncoded)+len(newFooter))
+		newRecord = append(newRecord, newHeader...)
+		newRecord = append(newRecord, newEncoded...)
+		newRecord = append(newRecord, newFooter...)
+
+		newOffset, _ := db.alloc.Allocate(uint64(len(newRecord)))
+		db.file.WriteAt(newRecord, int64(newOffset))
+
+		newVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(newVal, newOffset)
+		db.pkIndex.Set(rec.key, newVal)
+
+		endOffset := newOffset + uint64(len(newRecord))
+		if endOffset > maxOffset {
+			maxOffset = endOffset
+		}
+	}
+
+	db.alloc.Reset(maxOffset, nil)
+
 	return nil
 }

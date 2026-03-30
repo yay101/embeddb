@@ -8,7 +8,7 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **Type-safe** - Full Go generics support
 - **Single file** - Database and indexes in one file
 - **Map-based indexes** - Fast O(1) lookups on indexed fields
-- **Range queries** - Greater than, less than, between
+- **Range queries** - Greater than, less than, between (indexed and non-indexed)
 - **Nested structs** - Query fields like `Address.City`
 - **Multiple tables** - Different struct types in one file
 - **Efficient pagination** - Built-in paged queries
@@ -16,6 +16,9 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **Scanner** - Low-lock sequential access with early exit
 - **Transactions** - Commit and rollback support
 - **Vacuum** - File compaction
+- **Auto-indexing** - Automatically creates indexes for `db:"index"` fields
+- **Schema migration** - Automatically migrates records when struct changes
+- **Index recovery** - Automatically rebuilds indexes on startup if corrupted
 
 ## Performance
 
@@ -105,12 +108,19 @@ func main() {
 
 ```go
 // Open database (creates if not exists)
+// AutoIndex and Migrate default to true
 db, err := embeddb.Open("/tmp/app.db")
 
-// Open with options
+// Open with options (both default to true)
 db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
     AutoIndex: true,  // Auto-create indexes for db:"index" fields
-    Migrate:   false, // Migrate schema on open
+    Migrate:   true,  // Automatically migrate schema changes
+})
+
+// Disable auto-indexing or migration
+db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
+    AutoIndex: false,
+    Migrate:   false,
 })
 
 // Get table handle
@@ -144,6 +154,18 @@ count := users.Count()
 ```go
 // Exact match
 results, err := users.Query("Name", "Alice")
+
+// Greater than (indexed)
+results, err := users.QueryRangeGreaterThan("Age", 18, false)
+results, err := users.QueryRangeGreaterThan("Age", 18, true) // inclusive
+
+// Less than (indexed)
+results, err := users.QueryRangeLessThan("Age", 65, false)
+results, err := users.QueryRangeLessThan("Age", 65, true) // inclusive
+
+// Between (indexed)
+results, err := users.QueryRangeBetween("Age", 18, 65, true, true) // inclusive both
+results, err := users.QueryRangeBetween("Age", 18, 65, false, false) // exclusive both
 
 // Greater than or equal
 results, err := users.QueryGreaterOrEqual("Age", 18)
@@ -304,7 +326,7 @@ results, _ := users.Filter(func(u User) bool {
 - Header: 64 bytes (magic, version, catalog offset)
 - Records: stored sequentially after header (4096+)
 - Catalog: table definitions at end of file
-- Indexes: in-memory maps, rebuilt on load
+- Indexes: in-memory maps, rebuilt on load with automatic recovery from corruption
 - 51 bytes per record overhead + field data
 
 ## Why EmbedDB?

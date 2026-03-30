@@ -947,7 +947,7 @@ func TestGetIndexedFields(t *testing.T) {
 	os.Remove("/tmp/indexed_fields.db")
 	defer os.Remove("/tmp/indexed_fields.db")
 
-	db, _ := Open("/tmp/indexed_fields.db")
+	db, _ := Open("/tmp/indexed_fields.db", OpenOptions{AutoIndex: false})
 	defer db.Close()
 
 	users, _ := Use[User](db, "users")

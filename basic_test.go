@@ -479,3 +479,157 @@ func TestRestartCorruptMultipleTables(t *testing.T) {
 	db2.Close()
 	os.Remove("/tmp/test_corrupt_multi.db")
 }
+
+func TestAutoIndexRangeQuery(t *testing.T) {
+	os.Remove("/tmp/test_autoindex.db")
+	defer os.Remove("/tmp/test_autoindex.db")
+
+	db, err := Open("/tmp/test_autoindex.db", OpenOptions{AutoIndex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	users, err := Use[TestRecord](db, "users")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	users.Insert(&TestRecord{Name: "Alice", Data: "data1"})
+	users.Insert(&TestRecord{Name: "Bob", Data: "data2"})
+	users.Insert(&TestRecord{Name: "Charlie", Data: "data3"})
+
+	results, err := users.QueryRangeGreaterThan("Name", "Bob", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Errorf("expected 1 result, got %d", len(results))
+	}
+
+	results, err = users.QueryRangeBetween("Name", "Alice", "Charlie", true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Errorf("expected 3 results, got %d", len(results))
+	}
+}
+
+func TestAutoIndexRestart(t *testing.T) {
+	os.Remove("/tmp/test_autoindex_restart.db")
+	defer os.Remove("/tmp/test_autoindex_restart.db")
+
+	{
+		db, err := Open("/tmp/test_autoindex_restart.db", OpenOptions{AutoIndex: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		users, err := Use[TestRecord](db, "users")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		users.Insert(&TestRecord{Name: "Alice", Data: "data1"})
+		users.Insert(&TestRecord{Name: "Bob", Data: "data2"})
+		users.Insert(&TestRecord{Name: "Charlie", Data: "data3"})
+
+		db.Close()
+	}
+
+	{
+		db2, err := Open("/tmp/test_autoindex_restart.db", OpenOptions{AutoIndex: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db2.Close()
+
+		users2, err := Use[TestRecord](db2, "users")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		results, err := users2.QueryRangeGreaterThan("Name", "Bob", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 {
+			t.Errorf("expected 1 result after restart, got %d", len(results))
+		}
+
+		results, err = users2.QueryRangeBetween("Name", "Alice", "Charlie", true, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 3 {
+			t.Errorf("expected 3 results after restart, got %d", len(results))
+		}
+	}
+}
+
+func TestMigrateOption(t *testing.T) {
+	os.Remove("/tmp/test_migrate.db")
+	defer os.Remove("/tmp/test_migrate.db")
+
+	type UserV1 struct {
+		ID   uint32 `db:"id,primary"`
+		Name string
+		Age  int
+	}
+
+	type UserV2 struct {
+		ID   uint32 `db:"id,primary"`
+		Name string
+		Age  int
+		City string
+	}
+
+	{
+		db, err := Open("/tmp/test_migrate.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		users, err := Use[UserV1](db, "users")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		users.Insert(&UserV1{Name: "Alice", Age: 30})
+		users.Insert(&UserV1{Name: "Bob", Age: 25})
+
+		count := users.Count()
+		if count != 2 {
+			t.Errorf("expected 2 records, got %d", count)
+		}
+
+		db.Close()
+	}
+
+	{
+		db2, err := Open("/tmp/test_migrate.db", OpenOptions{Migrate: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db2.Close()
+
+		users2, err := Use[UserV2](db2, "users")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		count := users2.Count()
+		if count != 2 {
+			t.Errorf("expected 2 records after migration, got %d", count)
+		}
+
+		rec, err := users2.Get(uint32(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Name != "Alice" || rec.Age != 30 {
+			t.Errorf("record data mismatch: got %s/%d", rec.Name, rec.Age)
+		}
+	}
+}

@@ -66,9 +66,11 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		return nil, fmt.Errorf("filename is required")
 	}
 
-	config := OpenOptions{}
+	migrate := true
+	autoIndex := true
 	if len(opts) > 0 {
-		config = opts[0]
+		migrate = opts[0].Migrate
+		autoIndex = opts[0].AutoIndex
 	}
 
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
@@ -81,8 +83,8 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 
 	return &DB{
 		filename:  filename,
-		migrate:   config.Migrate,
-		autoIndex: config.AutoIndex,
+		migrate:   migrate,
+		autoIndex: autoIndex,
 		tables:    make(map[string]*database),
 	}, nil
 }
@@ -146,6 +148,14 @@ func Use[T any](db *DB, name ...string) (*Table[T], error) {
 			NextRecordID: 1,
 		}
 		typedDB.tableCat[tableName] = table
+	} else if table.LayoutHash != layout.Hash {
+		if db.migrate {
+			if err := migrateTable(typedDB, table, layout); err != nil {
+				typedDB.mu.Unlock()
+				return nil, fmt.Errorf("migration failed: %w", err)
+			}
+		}
+		table.LayoutHash = layout.Hash
 	}
 	typedDB.mu.Unlock()
 
@@ -157,11 +167,13 @@ func Use[T any](db *DB, name ...string) (*Table[T], error) {
 	}
 
 	if db.autoIndex {
+		typedTable.idxMgr = newIndexManager[T](typedDB, layout)
 		for _, field := range layout.FieldOffsets {
 			if field.Name != "" && !field.Primary && field.Offset > 0 {
-				_ = typedTable.CreateIndex(field.Name)
+				_ = typedTable.idxMgr.CreateIndex(field.Name)
 			}
 		}
+		typedTable.rebuildSecondaryIndexes()
 	}
 
 	db.tables[tableName] = typedDB
@@ -291,16 +303,22 @@ type Table[T any] struct {
 }
 
 type indexManager[T any] struct {
-	db      *database
-	layout  *embedcore.StructLayout
-	indexes map[string]*uint32MapIndex
+	db         *database
+	layout     *embedcore.StructLayout
+	indexes    map[string]*uint32MapIndex
+	fieldCache map[string]embedcore.FieldOffset
 }
 
 func newIndexManager[T any](db *database, layout *embedcore.StructLayout) *indexManager[T] {
+	fieldCache := make(map[string]embedcore.FieldOffset)
+	for _, f := range layout.FieldOffsets {
+		fieldCache[f.Name] = f
+	}
 	return &indexManager[T]{
-		db:      db,
-		layout:  layout,
-		indexes: make(map[string]*uint32MapIndex),
+		db:         db,
+		layout:     layout,
+		indexes:    make(map[string]*uint32MapIndex),
+		fieldCache: fieldCache,
 	}
 }
 
@@ -334,15 +352,7 @@ func (im *indexManager[T]) GetIndexedFields() []string {
 
 func (im *indexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 	for fieldName, idx := range im.indexes {
-		var field embedcore.FieldOffset
-		var found bool
-		for _, f := range im.layout.FieldOffsets {
-			if f.Name == fieldName {
-				field = f
-				found = true
-				break
-			}
-		}
+		field, found := im.fieldCache[fieldName]
 		if !found {
 			continue
 		}
@@ -350,7 +360,7 @@ func (im *indexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 		if err != nil {
 			continue
 		}
-		key := fmt.Sprintf("%v", val)
+		key := valueToIndexKey(val, field.Type)
 		idx.Set(key, recordID)
 	}
 	return nil
@@ -358,15 +368,7 @@ func (im *indexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 
 func (im *indexManager[T]) UpdateIndexes(record *T, recordID uint32) error {
 	for fieldName, idx := range im.indexes {
-		var field embedcore.FieldOffset
-		var found bool
-		for _, f := range im.layout.FieldOffsets {
-			if f.Name == fieldName {
-				field = f
-				found = true
-				break
-			}
-		}
+		field, found := im.fieldCache[fieldName]
 		if !found {
 			continue
 		}
@@ -374,7 +376,7 @@ func (im *indexManager[T]) UpdateIndexes(record *T, recordID uint32) error {
 		if err != nil {
 			continue
 		}
-		key := fmt.Sprintf("%v", val)
+		key := valueToIndexKey(val, field.Type)
 		idx.Set(key, recordID)
 	}
 	return nil
@@ -385,12 +387,13 @@ func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint32,
 	if !ok {
 		return nil, fmt.Errorf("no index for field %s", fieldName)
 	}
-	key := fmt.Sprintf("%v", value)
-	id, ok := idx.Get(key)
+	fieldType, _ := im.fieldCache[fieldName]
+	key := valueToIndexKey(value, fieldType.Type)
+	ids, ok := idx.GetAll(key)
 	if !ok {
 		return []uint32{}, nil
 	}
-	return []uint32{id}, nil
+	return ids, nil
 }
 
 func parseIndexKey(key string, fieldKind reflect.Kind) interface{} {
@@ -417,11 +420,43 @@ func parseIndexKey(key string, fieldKind reflect.Kind) interface{} {
 	return key
 }
 
+func valueToIndexKey(val any, fieldKind reflect.Kind) string {
+	switch v := val.(type) {
+	case int:
+		return strconv.FormatInt(int64(v), 10)
+	case int8:
+		return strconv.FormatInt(int64(v), 10)
+	case int16:
+		return strconv.FormatInt(int64(v), 10)
+	case int32:
+		return strconv.FormatInt(int64(v), 10)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case uint:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint64:
+		return strconv.FormatUint(v, 10)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case string:
+		return v
+	case bool:
+		return strconv.FormatBool(v)
+	}
+	return fmt.Sprintf("%v", val)
+}
+
 func (im *indexManager[T]) getFieldType(fieldName string) reflect.Kind {
-	for _, f := range im.layout.FieldOffsets {
-		if f.Name == fieldName {
-			return f.Type
-		}
+	if f, ok := im.fieldCache[fieldName]; ok {
+		return f.Type
 	}
 	return reflect.Invalid
 }
@@ -440,8 +475,8 @@ func (im *indexManager[T]) QueryRangeGreaterThan(fieldName string, value interfa
 		parsedVal := parseIndexKey(k, fieldType)
 		cmp := compareValues(parsedVal, value)
 		if cmp > 0 || (inclusive && cmp == 0) {
-			if id, ok := idx.Get(k); ok {
-				results = append(results, id)
+			if ids, ok := idx.GetAll(k); ok {
+				results = append(results, ids...)
 			}
 		}
 	}
@@ -465,8 +500,8 @@ func (im *indexManager[T]) QueryRangeLessThan(fieldName string, value interface{
 		parsedVal := parseIndexKey(k, fieldType)
 		cmp := compareValues(parsedVal, value)
 		if cmp < 0 || (inclusive && cmp == 0) {
-			if id, ok := idx.Get(k); ok {
-				results = append(results, id)
+			if ids, ok := idx.GetAll(k); ok {
+				results = append(results, ids...)
 			}
 		}
 	}
@@ -493,8 +528,8 @@ func (im *indexManager[T]) QueryRangeBetween(fieldName string, min, max interfac
 		aboveMin := cMin > 0 || (inclusiveMin && cMin == 0)
 		belowMax := cMax < 0 || (inclusiveMax && cMax == 0)
 		if aboveMin && belowMax {
-			if id, ok := idx.Get(k); ok {
-				results = append(results, id)
+			if ids, ok := idx.GetAll(k); ok {
+				results = append(results, ids...)
 			}
 		}
 	}
@@ -651,14 +686,7 @@ func (t *Table[T]) queryByPK(pkValue string) (uint32, bool) {
 		return 0, false
 	}
 	for fieldName, idx := range t.idxMgr.indexes {
-		var isPrimary bool
-		for _, f := range t.layout.FieldOffsets {
-			if f.Name == fieldName {
-				isPrimary = f.Primary
-				break
-			}
-		}
-		if !isPrimary {
+		if f, ok := t.idxMgr.fieldCache[fieldName]; !ok || !f.Primary {
 			continue
 		}
 		id, ok := idx.Get(pkValue)
@@ -1464,6 +1492,45 @@ func (t *Table[T]) CreateIndex(fieldName string) error {
 		t.idxMgr = newIndexManager[T](t.db, t.layout)
 	}
 	return t.idxMgr.CreateIndex(fieldName)
+}
+
+func (t *Table[T]) rebuildSecondaryIndexes() {
+	if t.idxMgr == nil {
+		return
+	}
+
+	t.db.pkIndex.Range(func(k []byte, v []byte) bool {
+		if len(k) < 2 || k[0] != t.tableID {
+			return true
+		}
+
+		var recordID uint32
+		switch t.layout.PKType {
+		case reflect.String:
+			_, idStr, _ := embedcore.DecodeString(k[1:])
+			if len(idStr) >= 4 {
+				recordID = binary.BigEndian.Uint32(idStr[:4])
+			}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			val, _, _ := embedcore.DecodeVarint(k[1:])
+			recordID = uint32(int64(val))
+		default:
+			val, _, _ := embedcore.DecodeUvarint(k[1:])
+			recordID = uint32(val)
+		}
+
+		if recordID == 0 {
+			return true
+		}
+
+		record, err := t.Get(recordID)
+		if err != nil {
+			return true
+		}
+
+		t.idxMgr.InsertIntoIndexes(record, recordID)
+		return true
+	})
 }
 
 func (t *Table[T]) DropIndex(fieldName string) error {

@@ -3,6 +3,7 @@ package embeddb
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -209,4 +210,134 @@ func BenchmarkConcurrentReads(b *testing.B) {
 	db.Close()
 
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "reads/sec")
+}
+
+func BenchmarkInsert(b *testing.B) {
+	os.Remove("/tmp/bench_insert.db")
+	defer os.Remove("/tmp/bench_insert.db")
+
+	db, _ := Open("/tmp/bench_insert.db")
+	users, _ := Use[User](db, "users")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("User%d", i), Age: i % 100})
+	}
+	b.StopTimer()
+	db.Close()
+}
+
+func BenchmarkGet(b *testing.B) {
+	os.Remove("/tmp/bench_get.db")
+	defer os.Remove("/tmp/bench_get.db")
+
+	db, _ := Open("/tmp/bench_get.db")
+	users, _ := Use[User](db, "users")
+
+	for i := 0; i < 10000; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("User%d", i), Age: i % 100})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		users.Get(uint32(i%10000) + 1)
+	}
+	b.StopTimer()
+	db.Close()
+}
+
+func BenchmarkQueryIndexed(b *testing.B) {
+	os.Remove("/tmp/bench_query_idx.db")
+	defer os.Remove("/tmp/bench_query_idx.db")
+
+	db, _ := Open("/tmp/bench_query_idx.db")
+	users, _ := Use[User](db, "users")
+	users.CreateIndex("Age")
+
+	for i := 0; i < 10000; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("User%d", i), Age: i % 100})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		users.Query("Age", 50)
+	}
+	b.StopTimer()
+	db.Close()
+}
+
+func BenchmarkQueryRange(b *testing.B) {
+	os.Remove("/tmp/bench_query_range.db")
+	defer os.Remove("/tmp/bench_query_range.db")
+
+	db, _ := Open("/tmp/bench_query_range.db")
+	users, _ := Use[User](db, "users")
+	users.CreateIndex("Age")
+
+	for i := 0; i < 10000; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("User%d", i), Age: i % 100})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		users.QueryRangeBetween("Age", 20, 80, true, true)
+	}
+	b.StopTimer()
+	db.Close()
+}
+
+func BenchmarkScan(b *testing.B) {
+	os.Remove("/tmp/bench_scan.db")
+	defer os.Remove("/tmp/bench_scan.db")
+
+	db, _ := Open("/tmp/bench_scan.db")
+	users, _ := Use[User](db, "users")
+
+	for i := 0; i < 10000; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("User%d", i), Age: i % 100})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		scanner := users.ScanRecords()
+		count := 0
+		for scanner.Next() {
+			count++
+		}
+		scanner.Close()
+	}
+	b.StopTimer()
+	db.Close()
+}
+
+func BenchmarkMemoryUsage(b *testing.B) {
+	os.Remove("/tmp/bench_memory.db")
+	defer os.Remove("/tmp/bench_memory.db")
+
+	var m1, m2 runtime.MemStats
+
+	db, _ := Open("/tmp/bench_memory.db")
+	users, _ := Use[User](db, "users")
+
+	runtime.GC()
+	runtime.ReadMemStats(&m1)
+
+	for i := 0; i < 100000; i++ {
+		users.Insert(&User{
+			Name:  fmt.Sprintf("User%d", i),
+			Email: fmt.Sprintf("user%d@example.com", i),
+			Age:   i % 100,
+		})
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&m2)
+
+	fmt.Printf("\nMemory usage for 100k records:\n")
+	fmt.Printf("  Alloc:      %.2f MB\n", float64(m2.Alloc-m1.Alloc)/1024/1024)
+	fmt.Printf("  TotalAlloc: %.2f MB\n", float64(m2.TotalAlloc-m1.TotalAlloc)/1024/1024)
+	fmt.Printf("  Sys:        %.2f MB\n", float64(m2.Sys)/1024/1024)
+
+	b.StopTimer()
+	db.Close()
 }
