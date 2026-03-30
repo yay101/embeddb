@@ -223,6 +223,242 @@ func TestQueryRangeBetween(t *testing.T) {
 	}
 }
 
+func TestQueryRangeGreaterThanIndexed(t *testing.T) {
+	os.Remove("/tmp/query_gt_idx.db")
+	defer os.Remove("/tmp/query_gt_idx.db")
+
+	db, _ := Open("/tmp/query_gt_idx.db")
+	defer db.Close()
+
+	users, _ := Use[User](db, "users")
+	users.CreateIndex("Age")
+
+	users.Insert(&User{Name: "Alice", Age: 30})
+	users.Insert(&User{Name: "Bob", Age: 25})
+	users.Insert(&User{Name: "Charlie", Age: 35})
+	users.Insert(&User{Name: "Diana", Age: 40})
+
+	results, err := users.QueryRangeGreaterThan("Age", 30, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Errorf("expected 2 results, got %d", len(results))
+	}
+
+	results, err = users.QueryRangeGreaterThan("Age", 30, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Errorf("expected 3 results with inclusive, got %d", len(results))
+	}
+}
+
+func TestQueryRangeLessThanIndexed(t *testing.T) {
+	os.Remove("/tmp/query_lt_idx.db")
+	defer os.Remove("/tmp/query_lt_idx.db")
+
+	db, _ := Open("/tmp/query_lt_idx.db")
+	defer db.Close()
+
+	users, _ := Use[User](db, "users")
+	users.CreateIndex("Age")
+
+	users.Insert(&User{Name: "Alice", Age: 30})
+	users.Insert(&User{Name: "Bob", Age: 25})
+	users.Insert(&User{Name: "Charlie", Age: 35})
+	users.Insert(&User{Name: "Diana", Age: 40})
+
+	results, err := users.QueryRangeLessThan("Age", 35, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Errorf("expected 2 results, got %d", len(results))
+	}
+
+	results, err = users.QueryRangeLessThan("Age", 35, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Errorf("expected 3 results with inclusive, got %d", len(results))
+	}
+}
+
+func TestQueryRangeBetweenIndexed(t *testing.T) {
+	os.Remove("/tmp/query_between_idx.db")
+	defer os.Remove("/tmp/query_between_idx.db")
+
+	db, _ := Open("/tmp/query_between_idx.db")
+	defer db.Close()
+
+	users, _ := Use[User](db, "users")
+	users.CreateIndex("Age")
+
+	users.Insert(&User{Name: "Alice", Age: 30})
+	users.Insert(&User{Name: "Bob", Age: 25})
+	users.Insert(&User{Name: "Charlie", Age: 35})
+	users.Insert(&User{Name: "Diana", Age: 40})
+
+	results, err := users.QueryRangeBetween("Age", 25, 35, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Errorf("expected 3 results, got %d", len(results))
+	}
+
+	results, err = users.QueryRangeBetween("Age", 25, 35, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Errorf("expected 1 result for exclusive bounds, got %d", len(results))
+	}
+
+	results, err = users.QueryRangeBetween("Age", 25, 35, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Errorf("expected 2 results for min inclusive, max exclusive, got %d", len(results))
+	}
+}
+
+func TestQueryRangeGreaterThanPaged(t *testing.T) {
+	os.Remove("/tmp/query_gt_paged.db")
+	defer os.Remove("/tmp/query_gt_paged.db")
+
+	db, _ := Open("/tmp/query_gt_paged.db")
+	defer db.Close()
+
+	users, _ := Use[User](db, "users")
+	users.CreateIndex("Age")
+
+	for i := 1; i <= 10; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("User%d", i), Age: i * 10})
+	}
+
+	result, err := users.QueryRangeGreaterThanPaged("Age", 30, false, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Records) != 3 {
+		t.Errorf("expected 3 records, got %d", len(result.Records))
+	}
+	if result.TotalCount != 7 {
+		t.Errorf("expected total count 7, got %d", result.TotalCount)
+	}
+	if !result.HasMore {
+		t.Error("expected HasMore to be true")
+	}
+
+	result, err = users.QueryRangeGreaterThanPaged("Age", 30, false, 6, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Records) != 1 {
+		t.Errorf("expected 1 record on last page, got %d", len(result.Records))
+	}
+	if result.HasMore {
+		t.Error("expected HasMore to be false on last page")
+	}
+}
+
+func TestQueryRangeLessThanPaged(t *testing.T) {
+	os.Remove("/tmp/query_lt_paged.db")
+	defer os.Remove("/tmp/query_lt_paged.db")
+
+	db, _ := Open("/tmp/query_lt_paged.db")
+	defer db.Close()
+
+	users, _ := Use[User](db, "users")
+	users.CreateIndex("Age")
+
+	for i := 1; i <= 10; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("User%d", i), Age: i * 10})
+	}
+
+	result, err := users.QueryRangeLessThanPaged("Age", 60, false, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Records) != 3 {
+		t.Errorf("expected 3 records, got %d", len(result.Records))
+	}
+	if result.TotalCount != 5 {
+		t.Errorf("expected total count 5, got %d", result.TotalCount)
+	}
+}
+
+func TestQueryRangeBetweenPaged(t *testing.T) {
+	os.Remove("/tmp/query_between_paged.db")
+	defer os.Remove("/tmp/query_between_paged.db")
+
+	db, _ := Open("/tmp/query_between_paged.db")
+	defer db.Close()
+
+	users, _ := Use[User](db, "users")
+	users.CreateIndex("Age")
+
+	for i := 1; i <= 10; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("User%d", i), Age: i * 10})
+	}
+
+	result, err := users.QueryRangeBetweenPaged("Age", 20, 70, true, true, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Records) != 3 {
+		t.Errorf("expected 3 records, got %d", len(result.Records))
+	}
+	if result.TotalCount != 6 {
+		t.Errorf("expected total count 6, got %d", result.TotalCount)
+	}
+}
+
+func TestQueryRangeStringIndexed(t *testing.T) {
+	os.Remove("/tmp/query_str_idx.db")
+	defer os.Remove("/tmp/query_str_idx.db")
+
+	db, _ := Open("/tmp/query_str_idx.db")
+	defer db.Close()
+
+	users, _ := Use[User](db, "users")
+	users.CreateIndex("Name")
+
+	users.Insert(&User{Name: "Apple"})
+	users.Insert(&User{Name: "Banana"})
+	users.Insert(&User{Name: "Cherry"})
+	users.Insert(&User{Name: "Date"})
+
+	results, err := users.QueryRangeGreaterThan("Name", "Banana", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Errorf("expected 2 results, got %d", len(results))
+	}
+
+	results, err = users.QueryRangeLessThan("Name", "Cherry", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Errorf("expected 3 results, got %d", len(results))
+	}
+
+	results, err = users.QueryRangeBetween("Name", "Apple", "Cherry", true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Errorf("expected 3 results, got %d", len(results))
+	}
+}
+
 func TestQueryLike(t *testing.T) {
 	os.Remove("/tmp/query_like.db")
 	defer os.Remove("/tmp/query_like.db")

@@ -8,6 +8,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -392,16 +393,115 @@ func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint32,
 	return []uint32{id}, nil
 }
 
+func parseIndexKey(key string, fieldKind reflect.Kind) interface{} {
+	switch fieldKind {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if v, err := strconv.ParseInt(key, 10, 64); err == nil {
+			return v
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if v, err := strconv.ParseUint(key, 10, 64); err == nil {
+			return v
+		}
+	case reflect.Float32, reflect.Float64:
+		if v, err := strconv.ParseFloat(key, 64); err == nil {
+			return v
+		}
+	case reflect.String:
+		return key
+	case reflect.Bool:
+		if v, err := strconv.ParseBool(key); err == nil {
+			return v
+		}
+	}
+	return key
+}
+
+func (im *indexManager[T]) getFieldType(fieldName string) reflect.Kind {
+	for _, f := range im.layout.FieldOffsets {
+		if f.Name == fieldName {
+			return f.Type
+		}
+	}
+	return reflect.Invalid
+}
+
 func (im *indexManager[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]uint32, error) {
-	return nil, errors.New("QueryRangeGreaterThan not yet implemented")
+	idx, ok := im.indexes[fieldName]
+	if !ok {
+		return nil, fmt.Errorf("no index for field %s", fieldName)
+	}
+
+	fieldType := im.getFieldType(fieldName)
+	keys := idx.SortedKeys()
+
+	var results []uint32
+	for _, k := range keys {
+		parsedVal := parseIndexKey(k, fieldType)
+		cmp := compareValues(parsedVal, value)
+		if cmp > 0 || (inclusive && cmp == 0) {
+			if id, ok := idx.Get(k); ok {
+				results = append(results, id)
+			}
+		}
+	}
+	if results == nil {
+		return []uint32{}, nil
+	}
+	return results, nil
 }
 
 func (im *indexManager[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]uint32, error) {
-	return nil, errors.New("QueryRangeLessThan not yet implemented")
+	idx, ok := im.indexes[fieldName]
+	if !ok {
+		return nil, fmt.Errorf("no index for field %s", fieldName)
+	}
+
+	fieldType := im.getFieldType(fieldName)
+	keys := idx.SortedKeys()
+
+	var results []uint32
+	for _, k := range keys {
+		parsedVal := parseIndexKey(k, fieldType)
+		cmp := compareValues(parsedVal, value)
+		if cmp < 0 || (inclusive && cmp == 0) {
+			if id, ok := idx.Get(k); ok {
+				results = append(results, id)
+			}
+		}
+	}
+	if results == nil {
+		return []uint32{}, nil
+	}
+	return results, nil
 }
 
 func (im *indexManager[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
-	return nil, errors.New("QueryRangeBetween not yet implemented")
+	idx, ok := im.indexes[fieldName]
+	if !ok {
+		return nil, fmt.Errorf("no index for field %s", fieldName)
+	}
+
+	fieldType := im.getFieldType(fieldName)
+	keys := idx.SortedKeys()
+
+	var results []uint32
+	for _, k := range keys {
+		parsedVal := parseIndexKey(k, fieldType)
+		cMin := compareValues(parsedVal, min)
+		cMax := compareValues(parsedVal, max)
+		aboveMin := cMin > 0 || (inclusiveMin && cMin == 0)
+		belowMax := cMax < 0 || (inclusiveMax && cMax == 0)
+		if aboveMin && belowMax {
+			if id, ok := idx.Get(k); ok {
+				results = append(results, id)
+			}
+		}
+	}
+	if results == nil {
+		return []uint32{}, nil
+	}
+	return results, nil
 }
 
 func (t *Table[T]) Insert(record *T) (uint32, error) {
@@ -861,6 +961,25 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 }
 
 func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
+		recordIDs, err := t.idxMgr.QueryRangeGreaterThan(fieldName, value, inclusive)
+		if err != nil {
+			return nil, err
+		}
+
+		slices.Sort(recordIDs)
+		results := make([]T, 0, len(recordIDs))
+
+		for _, id := range recordIDs {
+			record, err := t.Get(id)
+			if err == nil && record != nil {
+				results = append(results, *record)
+			}
+		}
+
+		return results, nil
+	}
+
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) > 0 || (inclusive && compareValues(fieldValue, value) == 0)
 	}
@@ -868,6 +987,25 @@ func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, in
 }
 
 func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
+		recordIDs, err := t.idxMgr.QueryRangeLessThan(fieldName, value, inclusive)
+		if err != nil {
+			return nil, err
+		}
+
+		slices.Sort(recordIDs)
+		results := make([]T, 0, len(recordIDs))
+
+		for _, id := range recordIDs {
+			record, err := t.Get(id)
+			if err == nil && record != nil {
+				results = append(results, *record)
+			}
+		}
+
+		return results, nil
+	}
+
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) < 0 || (inclusive && compareValues(fieldValue, value) == 0)
 	}
@@ -875,6 +1013,25 @@ func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclu
 }
 
 func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
+	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
+		recordIDs, err := t.idxMgr.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
+		if err != nil {
+			return nil, err
+		}
+
+		slices.Sort(recordIDs)
+		results := make([]T, 0, len(recordIDs))
+
+		for _, id := range recordIDs {
+			record, err := t.Get(id)
+			if err == nil && record != nil {
+				results = append(results, *record)
+			}
+		}
+
+		return results, nil
+	}
+
 	comparator := func(fieldValue interface{}) bool {
 		cMin := compareValues(fieldValue, min)
 		cMax := compareValues(fieldValue, max)
@@ -1368,15 +1525,27 @@ func (t *Table[T]) QueryPaged(fieldName string, value interface{}, offset, limit
 }
 
 func (t *Table[T]) QueryRangeGreaterThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
-	return nil, errors.New("QueryRangeGreaterThanPaged not yet implemented")
+	all, err := t.QueryRangeGreaterThan(fieldName, value, inclusive)
+	if err != nil {
+		return nil, err
+	}
+	return paginateResults(all, offset, limit), nil
 }
 
 func (t *Table[T]) QueryRangeLessThanPaged(fieldName string, value interface{}, inclusive bool, offset, limit int) (*PagedResult[T], error) {
-	return nil, errors.New("QueryRangeLessThanPaged not yet implemented")
+	all, err := t.QueryRangeLessThan(fieldName, value, inclusive)
+	if err != nil {
+		return nil, err
+	}
+	return paginateResults(all, offset, limit), nil
 }
 
 func (t *Table[T]) QueryRangeBetweenPaged(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool, offset, limit int) (*PagedResult[T], error) {
-	return nil, errors.New("QueryRangeBetweenPaged not yet implemented")
+	all, err := t.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
+	if err != nil {
+		return nil, err
+	}
+	return paginateResults(all, offset, limit), nil
 }
 
 func (t *Table[T]) FilterPaged(fn func(T) bool, offset, limit int) (*PagedResult[T], error) {

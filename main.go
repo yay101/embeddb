@@ -1,7 +1,6 @@
 package embeddb
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -143,6 +142,17 @@ func (mi *uint32MapIndex) Size() int {
 	return len(mi.data)
 }
 
+func (mi *uint32MapIndex) SortedKeys() []string {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	keys := make([]string, 0, len(mi.data))
+	for k := range mi.data {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
 func lockFile(f *os.File) error {
 	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
@@ -225,9 +235,11 @@ func openDatabase(filename string, migrate bool) (*database, error) {
 	}
 
 	if err := db.load(); err != nil {
-		unlockFile(file)
-		file.Close()
-		return nil, err
+		if rebuildErr := db.rebuildIndexFromScan(); rebuildErr != nil {
+			unlockFile(file)
+			file.Close()
+			return nil, fmt.Errorf("failed to load index: %w, failed to rebuild: %v", err, rebuildErr)
+		}
 	}
 
 	return db, nil
@@ -321,6 +333,77 @@ func (db *database) load() error {
 	return nil
 }
 
+func (db *database) rebuildIndexFromScan() error {
+	stat, err := db.file.Stat()
+	if err != nil {
+		return err
+	}
+
+	if stat.Size() == 0 {
+		db.alloc.Reset(4096, nil)
+		return nil
+	}
+
+	fileSize := stat.Size()
+	var maxOffset uint64 = 64
+
+	offset := int64(64)
+	for offset < fileSize-12 {
+		hdrBuf := make([]byte, 12)
+		n, err := db.file.ReadAt(hdrBuf, offset)
+		if err != nil || n < 12 {
+			offset++
+			continue
+		}
+
+		if hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
+			offset++
+			continue
+		}
+
+		recLen := binary.BigEndian.Uint32(hdrBuf[7:11])
+		totalLen := 12 + int(recLen) + 2
+
+		if totalLen < 14 || offset+int64(totalLen) > fileSize {
+			offset++
+			continue
+		}
+
+		recordBuf := make([]byte, totalLen)
+		copy(recordBuf, hdrBuf)
+		_, err = db.file.ReadAt(recordBuf[12:], offset+12)
+		if err != nil {
+			offset++
+			continue
+		}
+
+		if recordBuf[totalLen-2] == EcCode && recordBuf[totalLen-1] == RecordEndMark {
+			tableID := recordBuf[2]
+			recordID := binary.BigEndian.Uint32(recordBuf[3:7])
+			active := recordBuf[11]
+
+			if active == 1 {
+				key := encodePKForIndex(tableID, recordID)
+				val := make([]byte, 8)
+				binary.BigEndian.PutUint64(val, uint64(offset))
+				db.pkIndex.Set(key, val)
+
+				endOffset := uint64(offset) + uint64(totalLen)
+				if endOffset > maxOffset {
+					maxOffset = endOffset
+				}
+				offset += int64(totalLen)
+				continue
+			}
+		}
+		offset++
+	}
+
+	db.alloc.Reset(maxOffset, nil)
+
+	return nil
+}
+
 func decodeTableCatalog(data []byte) tableCatalog {
 	tc := make(tableCatalog)
 	if len(data) < 4 {
@@ -394,7 +477,7 @@ func (db *database) flush() error {
 
 	var records []recordInfo
 	db.pkIndex.Range(func(k []byte, v []byte) bool {
-		off, _ := binary.ReadUvarint(bytes.NewReader(v))
+		off := binary.BigEndian.Uint64(v)
 		records = append(records, recordInfo{
 			offset: off,
 			key:    k,
