@@ -145,6 +145,7 @@ func Use[T any](db *DB, name ...string) (*Table[T], error) {
 			Name:         tableName,
 			LayoutHash:   layout.Hash,
 			NextRecordID: 1,
+			RecordCount:  0,
 		}
 		typedDB.tableCat[tableName] = table
 	} else if table.LayoutHash != layout.Hash {
@@ -581,6 +582,12 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	binary.BigEndian.PutUint64(val, offset)
 	t.db.pkIndex.Set(indexKey, val)
 
+	if t.db.tx != nil {
+		t.db.tx.recordCounts[t.name]++
+	} else {
+		entry.RecordCount++
+	}
+
 	if t.idxMgr != nil {
 		t.idxMgr.InsertIntoIndexes(record, recordID)
 	}
@@ -745,6 +752,8 @@ func (t *Table[T]) Delete(id any) error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
+	entry := t.db.tableCat[t.name]
+
 	indexKey := encodePKForIndex(t.tableID, id)
 	val, ok := t.db.pkIndex.Get(indexKey)
 	if !ok {
@@ -757,12 +766,20 @@ func (t *Table[T]) Delete(id any) error {
 
 	t.db.pkIndex.Delete(indexKey)
 
+	if t.db.tx != nil {
+		t.db.tx.recordCounts[t.name]--
+	} else {
+		entry.RecordCount--
+	}
+
 	return nil
 }
 
 func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
+
+	entry := t.db.tableCat[t.name]
 
 	deleted := 0
 	for _, id := range ids {
@@ -776,6 +793,7 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 		t.db.file.WriteAt([]byte{0}, int64(offset+11))
 		t.db.pkIndex.Delete(indexKey)
 		deleted++
+		entry.RecordCount--
 	}
 	return deleted, nil
 }
@@ -858,6 +876,12 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	val := make([]byte, 8)
 	binary.BigEndian.PutUint64(val, offset)
 	t.db.pkIndex.Set(indexKey, val)
+
+	if t.db.tx != nil {
+		t.db.tx.recordCounts[t.name]++
+	} else {
+		entry.RecordCount++
+	}
 
 	if t.idxMgr != nil {
 		t.idxMgr.InsertIntoIndexes(record, recordID)
@@ -1473,6 +1497,10 @@ func (s *Scanner[T]) Close() {
 }
 
 func (t *Table[T]) Count() int {
+	entry := t.db.tableCat[t.name]
+	if entry != nil && entry.RecordCount > 0 {
+		return int(entry.RecordCount)
+	}
 	count := 0
 	t.db.pkIndex.Range(func(k, v []byte) bool {
 		if len(k) >= 2 && k[0] == t.tableID {
@@ -1557,6 +1585,8 @@ func (t *Table[T]) Drop() error {
 	for _, k := range keys {
 		t.db.pkIndex.Delete(k)
 	}
+
+	entry.RecordCount = 0
 
 	return nil
 }

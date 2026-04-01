@@ -189,6 +189,7 @@ type tableCatalogEntry struct {
 	LayoutHash   string
 	NextRecordID uint32
 	Dropped      bool
+	RecordCount  uint32
 }
 
 type tableCatalog map[string]*tableCatalogEntry
@@ -462,11 +463,18 @@ func decodeTableCatalog(data []byte) tableCatalog {
 		nextRecID := binary.LittleEndian.Uint32(data[offset:])
 		offset += 4
 
+		recordCount := uint32(0)
+		if offset+4 <= len(data) {
+			recordCount = binary.LittleEndian.Uint32(data[offset:])
+			offset += 4
+		}
+
 		tc[name] = &tableCatalogEntry{
 			ID:           id,
 			Name:         name,
 			LayoutHash:   layoutHash,
 			NextRecordID: nextRecID,
+			RecordCount:  recordCount,
 		}
 	}
 
@@ -590,6 +598,7 @@ func (db *database) encodeTableCatalog() []byte {
 		buf = append(buf, byte(len(entry.LayoutHash)))
 		buf = append(buf, []byte(entry.LayoutHash)...)
 		buf = binary.LittleEndian.AppendUint32(buf, entry.NextRecordID)
+		buf = binary.LittleEndian.AppendUint32(buf, entry.RecordCount)
 	}
 
 	return buf
@@ -734,9 +743,10 @@ func (db *database) Vacuum() error {
 }
 
 type Transaction struct {
-	db        *database
-	snapshot  *mapIndex
-	committed bool
+	db           *database
+	snapshot     *mapIndex
+	committed    bool
+	recordCounts map[string]uint32
 }
 
 func (db *database) Begin() *Transaction {
@@ -754,8 +764,9 @@ func (db *database) Begin() *Transaction {
 	})
 
 	tx := &Transaction{
-		db:       db,
-		snapshot: snapshot,
+		db:           db,
+		snapshot:     snapshot,
+		recordCounts: make(map[string]uint32),
 	}
 	db.tx = tx
 	return tx
@@ -788,6 +799,15 @@ func (tx *Transaction) Rollback() error {
 		tx.db.pkIndex.Set(k, v)
 		return true
 	})
+
+	for tableName, delta := range tx.recordCounts {
+		if entry := tx.db.tableCat[tableName]; entry != nil {
+			if entry.RecordCount >= delta {
+				entry.RecordCount -= delta
+			}
+		}
+	}
+
 	tx.db.tx = nil
 	return nil
 }
