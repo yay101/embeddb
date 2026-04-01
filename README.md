@@ -19,6 +19,9 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **Auto-indexing** - Automatically creates indexes for `db:"index"` fields
 - **Schema migration** - Automatically migrates records when struct changes
 - **Index recovery** - Automatically rebuilds indexes on startup if corrupted
+- **Auto-sync** - Periodic disk flush (every N writes or idle timeout)
+- **FastSync** - Quick fsync without defragmentation
+- **PK uniqueness** - Error on duplicate primary keys
 
 ## Performance
 
@@ -56,6 +59,8 @@ package main
 
 import (
     "fmt"
+    "time"
+
     "github.com/yay101/embeddb"
 )
 
@@ -101,6 +106,7 @@ func main() {
 | `db:"-"` | Skip field (not stored) |
 
 **Note:** `db:"id,primary"` is equivalent to `db:"id"` - the comma is just a separator.
+**Note:** Duplicate primary keys return an error on Insert.
 
 ## API Reference
 
@@ -119,8 +125,10 @@ db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
 
 // Disable auto-indexing or migration
 db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
-    AutoIndex: false,
-    Migrate:   false,
+    AutoIndex:     false,
+    Migrate:       false,
+    SyncThreshold: 1000,         // fsync every N writes (default 1000)
+    IdleThreshold: 10 * time.Second,  // fsync after idle (default 10s)
 })
 
 // Get table handle
@@ -262,8 +270,11 @@ users.Drop()
 // Vacuum - compact file and cleanup
 db.Vacuum()
 
-// Sync - flush to disk
+// Sync - flush to disk (full defragmentation)
 db.Sync()
+
+// FastSync - quick fsync without defragmentation (used by auto-sync)
+db.FastSync()
 
 // Close
 db.Close()
