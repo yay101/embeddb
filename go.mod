@@ -1,4 +1,4 @@
-module github.com/yay101/embeddb/v2
+module github.com/yay101/embeddb
 
 go 1.25.8
 
