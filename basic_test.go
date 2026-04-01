@@ -633,3 +633,137 @@ func TestMigrateOption(t *testing.T) {
 		}
 	}
 }
+
+func TestLargeStrings(t *testing.T) {
+	os.Remove("/tmp/test_large_string.db")
+
+	db, err := Open("/tmp/test_large_string.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type LargeRecord struct {
+		ID          uint32 `db:"id,primary"`
+		Title       string
+		Description string
+		Data        string
+	}
+
+	tbl, err := Use[LargeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	longDesc := makeString(5000)
+	longData := makeString(20000)
+
+	id, err := tbl.Insert(&LargeRecord{
+		Title:       "Test with large strings",
+		Description: longDesc,
+		Data:        longData,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := tbl.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if rec.Title != "Test with large strings" {
+		t.Errorf("title mismatch: got '%s'", rec.Title)
+	}
+	if len(rec.Description) != 5000 {
+		t.Errorf("description length mismatch: got %d, expected 5000", len(rec.Description))
+	}
+	if len(rec.Data) != 20000 {
+		t.Errorf("data length mismatch: got %d, expected 20000", len(rec.Data))
+	}
+
+	db.Close()
+	os.Remove("/tmp/test_large_string.db")
+}
+
+func TestLargeStringsInNestedStruct(t *testing.T) {
+	os.Remove("/tmp/test_nested_large.db")
+
+	db, err := Open("/tmp/test_nested_large.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type Contact struct {
+		Name  string
+		Email string
+		Notes string
+	}
+
+	type Alert struct {
+		ID          uint32 `db:"id,primary"`
+		TenantID    string
+		Title       string
+		Description string
+		Manager     Contact
+		Tags        []string
+		IncludedIDs []string
+	}
+
+	tbl, err := Use[Alert](db, "alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alert := Alert{
+		TenantID:    "tenant-123",
+		Title:       "Power BI Pro and licenses expire",
+		Description: makeString(8000),
+		Manager: Contact{
+			Name:  "Peter Black",
+			Email: "peter@example.com",
+			Notes: makeString(3000),
+		},
+		Tags:        []string{"tag1", "tag2", "tag3"},
+		IncludedIDs: []string{makeString(36), makeString(36), makeString(36)},
+	}
+
+	id, err := tbl.Insert(&alert)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := tbl.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if rec.TenantID != "tenant-123" {
+		t.Errorf("tenantid mismatch")
+	}
+	if len(rec.Description) != 8000 {
+		t.Errorf("description length: got %d, expected 8000", len(rec.Description))
+	}
+	if rec.Manager.Name != "Peter Black" {
+		t.Errorf("manager name mismatch")
+	}
+	if len(rec.Manager.Notes) != 3000 {
+		t.Errorf("manager notes length: got %d, expected 3000", len(rec.Manager.Notes))
+	}
+	if len(rec.Tags) != 3 {
+		t.Errorf("tags length: got %d, expected 3", len(rec.Tags))
+	}
+	if len(rec.IncludedIDs) != 3 {
+		t.Errorf("includedids length: got %d, expected 3", len(rec.IncludedIDs))
+	}
+
+	db.Close()
+	os.Remove("/tmp/test_nested_large.db")
+}
+
+func makeString(n int) string {
+	b := make([]byte, n)
+	for i := 0; i < n; i++ {
+		b[i] = byte('a' + (i % 26))
+	}
+	return string(b)
+}

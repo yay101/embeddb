@@ -1855,6 +1855,17 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 			if err == nil {
 				val = float32(v)
 			}
+		case reflect.Slice:
+			if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.String {
+				val, data, err = embedcore.DecodeSlice(data)
+			} else {
+				endIdx := bytes.IndexByte(data, valueEndMarker)
+				if endIdx == -1 {
+					break
+				}
+				data = data[endIdx+1:]
+				continue
+			}
 		default:
 			endIdx := bytes.IndexByte(data, valueEndMarker)
 			if endIdx == -1 {
@@ -1924,6 +1935,11 @@ func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 		case reflect.Struct:
 			if field.IsTime {
 				buf = embedcore.EncodeVarint(buf, embedcore.GetTimeField(record, field).Unix())
+			}
+		case reflect.Slice:
+			if field.IsSlice && field.SliceElem.Kind() == reflect.String {
+				sliceVal := embedcore.GetStringSlice(record, field)
+				buf = embedcore.EncodeSlice(buf, sliceVal)
 			}
 		default:
 			buf = buf[:len(buf)-2]
