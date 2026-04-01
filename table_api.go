@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	embedcore "github.com/yay101/embeddbcore"
 )
@@ -46,18 +47,25 @@ func encodePKForIndex(tableID uint8, pkValue any) []byte {
 }
 
 type OpenOptions struct {
-	Migrate   bool
-	AutoIndex bool
+	Migrate       bool
+	AutoIndex     bool
+	SyncThreshold uint64
+	IdleThreshold time.Duration
 }
 
 type DB struct {
-	filename  string
-	migrate   bool
-	autoIndex bool
-	lock      sync.Mutex
-	closed    bool
-	database  *database
-	tables    map[string]*database
+	filename      string
+	migrate       bool
+	autoIndex     bool
+	syncThreshold uint64
+	idleThreshold time.Duration
+	writeCount    uint64
+	lastSync      time.Time
+	idleTimer     *time.Timer
+	lock          sync.Mutex
+	closed        bool
+	database      *database
+	tables        map[string]*database
 }
 
 func Open(filename string, opts ...OpenOptions) (*DB, error) {
@@ -67,9 +75,17 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 
 	migrate := true
 	autoIndex := true
+	syncThreshold := uint64(1000)
+	idleThreshold := 10 * time.Second
 	if len(opts) > 0 {
 		migrate = opts[0].Migrate
 		autoIndex = opts[0].AutoIndex
+		if opts[0].SyncThreshold > 0 {
+			syncThreshold = opts[0].SyncThreshold
+		}
+		if opts[0].IdleThreshold > 0 {
+			idleThreshold = opts[0].IdleThreshold
+		}
 	}
 
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
@@ -81,10 +97,14 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	}
 
 	return &DB{
-		filename:  filename,
-		migrate:   migrate,
-		autoIndex: autoIndex,
-		tables:    make(map[string]*database),
+		filename:      filename,
+		migrate:       migrate,
+		autoIndex:     autoIndex,
+		syncThreshold: syncThreshold,
+		idleThreshold: idleThreshold,
+		writeCount:    0,
+		lastSync:      time.Now(),
+		tables:        make(map[string]*database),
 	}, nil
 }
 
@@ -121,7 +141,7 @@ func Use[T any](db *DB, name ...string) (*Table[T], error) {
 		typedDB = db.database
 	} else {
 		var err error
-		typedDB, err = openDatabase(db.filename, false)
+		typedDB, err = openDatabase(db.filename, false, db)
 		if err != nil {
 			return nil, err
 		}
@@ -268,6 +288,10 @@ func (db *DB) FastSync() error {
 			return err
 		}
 	}
+
+	db.writeCount = 0
+	db.lastSync = time.Now()
+
 	return nil
 }
 
@@ -612,6 +636,8 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		t.idxMgr.InsertIntoIndexes(record, recordID)
 	}
 
+	t.db.autoSync()
+
 	return recordID, nil
 }
 
@@ -765,6 +791,8 @@ func (t *Table[T]) Update(id any, record *T) error {
 	binary.BigEndian.PutUint64(newVal, newOffset)
 	t.db.pkIndex.Set(indexKey, newVal)
 
+	t.db.autoSync()
+
 	return nil
 }
 
@@ -830,6 +858,9 @@ func (t *Table[T]) InsertMany(records []*T) ([]uint32, error) {
 		}
 		ids = append(ids, id)
 	}
+
+	t.db.autoSync()
+
 	return ids, nil
 }
 

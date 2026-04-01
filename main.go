@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sync"
 	"syscall"
+	"time"
 
 	embedcore "github.com/yay101/embeddbcore"
 )
@@ -227,9 +228,10 @@ type database struct {
 	alloc    *allocator
 	tableCat tableCatalog
 	tx       *Transaction
+	parent   *DB
 }
 
-func openDatabase(filename string, migrate bool) (*database, error) {
+func openDatabase(filename string, migrate bool, parent *DB) (*database, error) {
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
@@ -246,6 +248,7 @@ func openDatabase(filename string, migrate bool) (*database, error) {
 		pkIndex:  newMapIndex(),
 		alloc:    &allocator{},
 		tableCat: make(tableCatalog),
+		parent:   parent,
 	}
 
 	stat, _ := file.Stat()
@@ -614,6 +617,36 @@ func (db *database) Close() error {
 
 	unlockFile(db.file)
 	return db.file.Close()
+}
+
+func (db *database) autoSync() {
+	if db.parent == nil {
+		return
+	}
+
+	db.parent.lock.Lock()
+	defer db.parent.lock.Unlock()
+
+	if db.parent.closed {
+		return
+	}
+
+	db.parent.writeCount++
+
+	syncNeeded := false
+	if db.parent.syncThreshold > 0 && db.parent.writeCount >= db.parent.syncThreshold {
+		syncNeeded = true
+	} else if db.parent.idleThreshold > 0 && time.Since(db.parent.lastSync) >= db.parent.idleThreshold {
+		syncNeeded = true
+	}
+
+	if syncNeeded {
+		for _, t := range db.parent.tables {
+			t.file.Sync()
+		}
+		db.parent.writeCount = 0
+		db.parent.lastSync = time.Now()
+	}
 }
 
 func (db *database) Use(tableName string) (*tableCatalogEntry, error) {
