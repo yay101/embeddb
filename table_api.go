@@ -596,6 +596,11 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	if t.isZeroPK(pkVal) {
 		t.setPKValue(record, recordID)
 		pkVal = recordID
+	} else {
+		indexKey := encodePKForIndex(t.tableID, pkVal)
+		if _, exists := t.db.pkIndex.Get(indexKey); exists {
+			return 0, fmt.Errorf("primary key already exists: %v", pkVal)
+		}
 	}
 
 	encoded, err := t.encodeRecord(record)
@@ -898,6 +903,11 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	if t.isZeroPK(pkVal) {
 		t.setPKValue(record, recordID)
 		pkVal = recordID
+	} else {
+		indexKey := encodePKForIndex(t.tableID, pkVal)
+		if _, exists := t.db.pkIndex.Get(indexKey); exists {
+			return 0, fmt.Errorf("primary key already exists: %v", pkVal)
+		}
 	}
 
 	encoded, err := t.encodeRecord(record)
