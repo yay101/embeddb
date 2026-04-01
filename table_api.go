@@ -712,23 +712,33 @@ func (t *Table[T]) Get(id any) (*T, error) {
 
 	offset := binary.BigEndian.Uint64(val)
 
-	recordBuf := make([]byte, 4096)
-	n, err := t.db.file.ReadAt(recordBuf, int64(offset))
-	if err != nil && n < 12 {
+	headerBuf := make([]byte, 12)
+	_, err := t.db.file.ReadAt(headerBuf, int64(offset))
+	if err != nil {
 		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
 	}
 
-	if recordBuf[0] != EcCode || recordBuf[1] != RecordStartMark {
+	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return nil, fmt.Errorf("invalid record header")
 	}
 
-	active := recordBuf[11]
+	active := headerBuf[11]
 	if active != 1 {
 		return nil, fmt.Errorf("record is deleted")
 	}
 
+	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
+	totalLen := 12 + int(recLen) + 2
+
+	recordBuf := make([]byte, totalLen)
+	copy(recordBuf, headerBuf)
+	n, err := t.db.file.ReadAt(recordBuf[12:], int64(offset)+12)
+	if err != nil || n < int(totalLen-12) {
+		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
+	}
+
 	var result T
-	if err := t.decodeRecord(recordBuf[:n], &result); err != nil {
+	if err := t.decodeRecord(recordBuf, &result); err != nil {
 		return nil, err
 	}
 
@@ -960,23 +970,33 @@ func (t *Table[T]) getLocked(id any) (*T, error) {
 
 	offset := binary.BigEndian.Uint64(val)
 
-	recordBuf := make([]byte, 4096)
-	n, err := t.db.file.ReadAt(recordBuf, int64(offset))
-	if err != nil && n < 12 {
+	headerBuf := make([]byte, 12)
+	_, err := t.db.file.ReadAt(headerBuf, int64(offset))
+	if err != nil {
 		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
 	}
 
-	if recordBuf[0] != EcCode || recordBuf[1] != RecordStartMark {
+	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return nil, fmt.Errorf("invalid record header")
 	}
 
-	active := recordBuf[11]
+	active := headerBuf[11]
 	if active != 1 {
 		return nil, fmt.Errorf("record is deleted")
 	}
 
+	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
+	totalLen := 12 + int(recLen) + 2
+
+	recordBuf := make([]byte, totalLen)
+	copy(recordBuf, headerBuf)
+	n, err := t.db.file.ReadAt(recordBuf[12:], int64(offset)+12)
+	if err != nil || n < int(totalLen-12) {
+		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
+	}
+
 	var result T
-	if err := t.decodeRecord(recordBuf[:n], &result); err != nil {
+	if err := t.decodeRecord(recordBuf, &result); err != nil {
 		return nil, err
 	}
 
