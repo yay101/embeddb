@@ -251,6 +251,26 @@ func (db *DB) Sync() error {
 	return nil
 }
 
+func (db *DB) FastSync() error {
+	if db == nil {
+		return nil
+	}
+
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	if db.closed {
+		return fmt.Errorf("database is closed")
+	}
+
+	for _, t := range db.tables {
+		if err := t.file.Sync(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (db *DB) Vacuum() error {
 	if db == nil {
 		return nil
