@@ -8,6 +8,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1875,6 +1876,8 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 				val, data, err = embedcore.DecodeSlice(data)
 			} else if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.Int {
 				val, data, err = embedcore.DecodeIntSlice(data)
+			} else if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.Struct {
+				val, data, err = t.decodeSliceOfStructs(data, fieldOffset)
 			} else {
 				endIdx := bytes.IndexByte(data, valueEndMarker)
 				if endIdx == -1 {
@@ -1913,8 +1916,16 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 
 func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 	buf := make([]byte, 0, 64)
-	for key, field := range t.layout.FieldOffsets {
-		if field.IsStruct && !field.IsTime {
+
+	keys := make([]byte, 0, len(t.layout.FieldOffsets))
+	for k := range t.layout.FieldOffsets {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	for _, key := range keys {
+		field := t.layout.FieldOffsets[key]
+		if field.IsStruct && !field.IsTime && !field.IsSlice {
 			continue
 		}
 
@@ -1960,6 +1971,8 @@ func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int {
 				sliceVal := embedcore.GetIntSlice(record, field)
 				buf = embedcore.EncodeIntSlice(buf, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Struct {
+				buf = t.encodeSliceOfStructs(record, field, buf)
 			} else {
 				buf = buf[:len(buf)-2]
 				continue
@@ -1977,7 +1990,12 @@ func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 
 func (t *Table[T]) encodeNestedStructs(record *T, buf []byte) ([]byte, error) {
 	for _, field := range t.layout.FieldOffsets {
+		// Skip non-struct fields or time fields
 		if !field.IsStruct || field.IsTime {
+			continue
+		}
+		// Also skip slices - they're handled by encodeSliceOfStructs
+		if field.IsSlice {
 			continue
 		}
 
@@ -2070,4 +2088,187 @@ func (t *Table[T]) encodeNestedStructs(record *T, buf []byte) ([]byte, error) {
 	}
 
 	return buf, nil
+}
+
+func (t *Table[T]) encodeSliceOfStructs(record *T, field embedcore.FieldOffset, buf []byte) []byte {
+	sliceVal := reflect.ValueOf(record).Elem().FieldByName(field.Name)
+	if !sliceVal.IsValid() || sliceVal.IsNil() {
+		return buf
+	}
+
+	numElems := sliceVal.Len()
+	buf = embedcore.EncodeUvarint(buf, uint64(numElems))
+
+	elementType := field.SliceElem
+	elemLayout, err := embedcore.ComputeStructLayout(reflect.New(elementType).Interface())
+	if err != nil {
+		return buf
+	}
+
+	for i := 0; i < numElems; i++ {
+		elem := sliceVal.Index(i)
+		elemPtr := elem.Addr().Interface()
+
+		for key, f := range elemLayout.FieldOffsets {
+			if f.Type == reflect.Struct {
+				continue
+			}
+
+			elemKey := key + 128 // Offset element keys to avoid conflicts with parent
+			buf = append(buf, elemKey, valueStartMarker)
+
+			switch f.Type {
+			case reflect.Int:
+				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetIntField(elemPtr, f)))
+			case reflect.Int8:
+				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt8Field(elemPtr, f)))
+			case reflect.Int16:
+				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt16Field(elemPtr, f)))
+			case reflect.Int32:
+				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt32Field(elemPtr, f)))
+			case reflect.Int64:
+				buf = embedcore.EncodeVarint(buf, embedcore.GetInt64Field(elemPtr, f))
+			case reflect.Uint:
+				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUintField(elemPtr, f)))
+			case reflect.Uint8:
+				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint8Field(elemPtr, f)))
+			case reflect.Uint16:
+				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint16Field(elemPtr, f)))
+			case reflect.Uint32:
+				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint32Field(elemPtr, f)))
+			case reflect.Uint64:
+				buf = embedcore.EncodeUvarint(buf, embedcore.GetUint64Field(elemPtr, f))
+			case reflect.String:
+				buf = embedcore.EncodeString(buf, embedcore.GetStringField(elemPtr, f))
+			case reflect.Bool:
+				buf = embedcore.EncodeBool(buf, embedcore.GetBoolField(elemPtr, f))
+			case reflect.Float64:
+				buf = embedcore.EncodeFloat64(buf, embedcore.GetFloat64Field(elemPtr, f))
+			case reflect.Float32:
+				buf = embedcore.EncodeFloat64(buf, float64(embedcore.GetFloat32Field(elemPtr, f)))
+			default:
+				buf = buf[:len(buf)-2]
+				continue
+			}
+
+			buf = append(buf, valueEndMarker)
+		}
+
+		buf = append(buf, embedcore.SliceElementMarker)
+	}
+
+	return buf
+}
+
+func (t *Table[T]) decodeSliceOfStructs(data []byte, fieldOffset embedcore.FieldOffset) (interface{}, []byte, error) {
+	length, n := binary.Uvarint(data)
+	if n <= 0 {
+		return nil, data, errors.New("invalid slice length")
+	}
+	data = data[n:]
+
+	elementType := fieldOffset.SliceElem
+	elemLayout, err := embedcore.ComputeStructLayout(reflect.New(elementType).Interface())
+	if err != nil {
+		return nil, data, err
+	}
+
+	result := reflect.MakeSlice(reflect.SliceOf(elementType), 0, int(length))
+
+	for i := 0; i < int(length); i++ {
+		elem := reflect.New(elementType)
+
+		for len(data) > 0 {
+			if data[0] == valueEndMarker {
+				data = data[1:]
+				break
+			}
+			if data[0] == embedcore.SliceElementMarker {
+				data = data[1:]
+				break
+			}
+			if len(data) < 2 {
+				break
+			}
+
+			key := data[0]
+			if data[1] != valueStartMarker {
+				data = data[1:]
+				continue
+			}
+			data = data[2:]
+
+			adjustedKey := key - 128
+			f, exists := elemLayout.FieldOffsets[adjustedKey]
+			if !exists {
+				endIdx := bytes.IndexByte(data, valueEndMarker)
+				if endIdx == -1 {
+					endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
+				}
+				if endIdx == -1 {
+					break
+				}
+				data = data[endIdx+1:]
+				continue
+			}
+
+			var val interface{}
+			var decodeErr error
+
+			switch f.Type {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				val, data, decodeErr = embedcore.DecodeVarint(data)
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				val, data, decodeErr = embedcore.DecodeUvarint(data)
+			case reflect.String:
+				val, data, decodeErr = embedcore.DecodeString(data)
+			case reflect.Bool:
+				val, data, decodeErr = embedcore.DecodeBool(data)
+			case reflect.Float64:
+				val, data, decodeErr = embedcore.DecodeFloat64(data)
+			case reflect.Float32:
+				var v float64
+				v, data, decodeErr = embedcore.DecodeFloat64(data)
+				if decodeErr == nil {
+					val = float32(v)
+				}
+			default:
+				endIdx := bytes.IndexByte(data, valueEndMarker)
+				if endIdx == -1 {
+					endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
+				}
+				if endIdx == -1 {
+					break
+				}
+				data = data[endIdx+1:]
+				continue
+			}
+
+			if decodeErr != nil {
+				endIdx := bytes.IndexByte(data, valueEndMarker)
+				if endIdx == -1 {
+					endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
+				}
+				if endIdx == -1 {
+					break
+				}
+				data = data[endIdx+1:]
+				continue
+			}
+
+			endIdx := bytes.IndexByte(data, valueEndMarker)
+			if endIdx == -1 {
+				endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
+			}
+			if endIdx != -1 {
+				data = data[endIdx+1:]
+			}
+
+			embedcore.SetFieldValue(elem.Interface(), f, val)
+		}
+
+		result = reflect.Append(result, elem.Elem())
+	}
+
+	return result.Interface(), data, nil
 }
