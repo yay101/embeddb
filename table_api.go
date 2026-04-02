@@ -1873,6 +1873,8 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 		case reflect.Slice:
 			if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.String {
 				val, data, err = embedcore.DecodeSlice(data)
+			} else if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.Int {
+				val, data, err = embedcore.DecodeIntSlice(data)
 			} else {
 				endIdx := bytes.IndexByte(data, valueEndMarker)
 				if endIdx == -1 {
@@ -1955,6 +1957,12 @@ func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 			if field.IsSlice && field.SliceElem.Kind() == reflect.String {
 				sliceVal := embedcore.GetStringSlice(record, field)
 				buf = embedcore.EncodeSlice(buf, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int {
+				sliceVal := embedcore.GetIntSlice(record, field)
+				buf = embedcore.EncodeIntSlice(buf, sliceVal)
+			} else {
+				buf = buf[:len(buf)-2]
+				continue
 			}
 		default:
 			buf = buf[:len(buf)-2]
@@ -2046,6 +2054,10 @@ func (t *Table[T]) encodeNestedStructs(record *T, buf []byte) ([]byte, error) {
 					buf = append(buf, nestedKey, valueStartMarker)
 					sliceVal := embedcore.GetStringSlice(record, nestedField)
 					buf = embedcore.EncodeSlice(buf, sliceVal)
+				} else if nestedField.IsSlice && nestedField.SliceElem.Kind() == reflect.Int {
+					buf = append(buf, nestedKey, valueStartMarker)
+					sliceVal := embedcore.GetIntSlice(record, nestedField)
+					buf = embedcore.EncodeIntSlice(buf, sliceVal)
 				} else {
 					continue
 				}
