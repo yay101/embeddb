@@ -1855,6 +1855,21 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 			if err == nil {
 				val = float32(v)
 			}
+		case reflect.Struct:
+			if fieldOffset.IsTime {
+				var unixVal int64
+				unixVal, data, err = embedcore.DecodeVarint(data)
+				if err == nil {
+					val = time.Unix(unixVal, 0).UTC()
+				}
+			} else {
+				endIdx := bytes.IndexByte(data, valueEndMarker)
+				if endIdx == -1 {
+					break
+				}
+				data = data[endIdx+1:]
+				continue
+			}
 		case reflect.Slice:
 			if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.String {
 				val, data, err = embedcore.DecodeSlice(data)
