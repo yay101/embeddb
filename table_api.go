@@ -2076,6 +2076,9 @@ func (t *Table[T]) encodeNestedStructs(record *T, buf []byte) ([]byte, error) {
 					buf = append(buf, nestedKey, valueStartMarker)
 					sliceVal := embedcore.GetIntSlice(record, nestedField)
 					buf = embedcore.EncodeIntSlice(buf, sliceVal)
+				} else if nestedField.IsSlice && nestedField.SliceElem.Kind() == reflect.Struct {
+					buf = append(buf, nestedKey, valueStartMarker)
+					buf = t.encodeSliceOfStructs(record, nestedField, buf)
 				} else {
 					continue
 				}
@@ -2091,13 +2094,37 @@ func (t *Table[T]) encodeNestedStructs(record *T, buf []byte) ([]byte, error) {
 }
 
 func (t *Table[T]) encodeSliceOfStructs(record *T, field embedcore.FieldOffset, buf []byte) []byte {
-	sliceVal := reflect.ValueOf(record).Elem().FieldByName(field.Name)
-	if !sliceVal.IsValid() || sliceVal.IsNil() {
+	// Navigate to the slice value using reflection
+	rootVal := reflect.ValueOf(record).Elem()
+
+	// Navigate through parent path to get the nested struct if applicable
+	var val reflect.Value
+	if len(field.Parent) > 0 {
+		val = rootVal
+		for _, part := range field.Parent {
+			val = val.FieldByName(part)
+			if !val.IsValid() {
+				return buf
+			}
+		}
+		// Get the last part of the field name (the actual slice field)
+		fieldParts := strings.Split(field.Name, ".")
+		lastPart := fieldParts[len(fieldParts)-1]
+		val = val.FieldByName(lastPart)
+	} else {
+		val = rootVal.FieldByName(field.Name)
+	}
+
+	if !val.IsValid() || val.IsNil() {
 		return buf
 	}
 
-	numElems := sliceVal.Len()
+	numElems := val.Len()
 	buf = embedcore.EncodeUvarint(buf, uint64(numElems))
+
+	if numElems == 0 {
+		return buf
+	}
 
 	elementType := field.SliceElem
 	elemLayout, err := embedcore.ComputeStructLayout(reflect.New(elementType).Interface())
@@ -2106,7 +2133,7 @@ func (t *Table[T]) encodeSliceOfStructs(record *T, field embedcore.FieldOffset, 
 	}
 
 	for i := 0; i < numElems; i++ {
-		elem := sliceVal.Index(i)
+		elem := val.Index(i)
 		elemPtr := elem.Addr().Interface()
 
 		for key, f := range elemLayout.FieldOffsets {
