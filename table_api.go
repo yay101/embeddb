@@ -1963,5 +1963,99 @@ func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 
 		buf = append(buf, valueEndMarker)
 	}
+
+	return t.encodeNestedStructs(record, buf)
+}
+
+func (t *Table[T]) encodeNestedStructs(record *T, buf []byte) ([]byte, error) {
+	for _, field := range t.layout.FieldOffsets {
+		if !field.IsStruct || field.IsTime {
+			continue
+		}
+
+		parentPath := field.Parent
+		if len(parentPath) == 0 {
+			continue
+		}
+
+		for nestedKey, nestedField := range t.layout.FieldOffsets {
+			if len(nestedField.Parent) != len(parentPath)+1 {
+				continue
+			}
+
+			isChild := true
+			for i, p := range parentPath {
+				if nestedField.Parent[i] != p {
+					isChild = false
+					break
+				}
+			}
+			if !isChild {
+				continue
+			}
+
+			if nestedField.Type == reflect.Struct {
+				continue
+			}
+
+			switch nestedField.Type {
+			case reflect.Int:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetIntField(record, nestedField)))
+			case reflect.Int8:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt8Field(record, nestedField)))
+			case reflect.Int16:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt16Field(record, nestedField)))
+			case reflect.Int32:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt32Field(record, nestedField)))
+			case reflect.Int64:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeVarint(buf, embedcore.GetInt64Field(record, nestedField))
+			case reflect.Uint:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUintField(record, nestedField)))
+			case reflect.Uint8:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint8Field(record, nestedField)))
+			case reflect.Uint16:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint16Field(record, nestedField)))
+			case reflect.Uint32:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint32Field(record, nestedField)))
+			case reflect.Uint64:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeUvarint(buf, embedcore.GetUint64Field(record, nestedField))
+			case reflect.String:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeString(buf, embedcore.GetStringField(record, nestedField))
+			case reflect.Bool:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeBool(buf, embedcore.GetBoolField(record, nestedField))
+			case reflect.Float64:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeFloat64(buf, embedcore.GetFloat64Field(record, nestedField))
+			case reflect.Float32:
+				buf = append(buf, nestedKey, valueStartMarker)
+				buf = embedcore.EncodeFloat64(buf, float64(embedcore.GetFloat32Field(record, nestedField)))
+			case reflect.Slice:
+				if nestedField.IsSlice && nestedField.SliceElem.Kind() == reflect.String {
+					buf = append(buf, nestedKey, valueStartMarker)
+					sliceVal := embedcore.GetStringSlice(record, nestedField)
+					buf = embedcore.EncodeSlice(buf, sliceVal)
+				} else {
+					continue
+				}
+			default:
+				continue
+			}
+
+			buf = append(buf, valueEndMarker)
+		}
+	}
+
 	return buf, nil
 }
