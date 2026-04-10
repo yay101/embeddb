@@ -54,6 +54,15 @@ type OpenOptions struct {
 	IdleThreshold time.Duration
 }
 
+type UseOptions struct {
+	MaxVersions uint8
+}
+
+type VersionMetadata struct {
+	Version   uint32
+	CreatedAt time.Time
+}
+
 type DB struct {
 	filename      string
 	migrate       bool
@@ -109,12 +118,28 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	}, nil
 }
 
-func Use[T any](db *DB, name ...string) (*Table[T], error) {
+func Use[T any](db *DB, args ...any) (*Table[T], error) {
 	if db == nil {
 		return nil, fmt.Errorf("db is nil")
 	}
 
-	tableName := resolveTableName[T](name...)
+	var tableName string
+	var useOpts UseOptions
+
+	for _, arg := range args {
+		switch v := arg.(type) {
+		case string:
+			tableName = v
+		case UseOptions:
+			useOpts = v
+		default:
+			return nil, fmt.Errorf("invalid argument type: %T", arg)
+		}
+	}
+
+	if tableName == "" {
+		tableName = resolveTableName[T]()
+	}
 
 	db.lock.Lock()
 	defer db.lock.Unlock()
@@ -130,10 +155,11 @@ func Use[T any](db *DB, name ...string) (*Table[T], error) {
 		}
 		layout := computeLayout[T]()
 		return &Table[T]{
-			db:      existing,
-			name:    tableName,
-			tableID: existingTable.ID,
-			layout:  layout,
+			db:          existing,
+			name:        tableName,
+			tableID:     existingTable.ID,
+			layout:      layout,
+			maxVersions: existingTable.MaxVersions,
 		}, nil
 	}
 
@@ -167,6 +193,7 @@ func Use[T any](db *DB, name ...string) (*Table[T], error) {
 			LayoutHash:   layout.Hash,
 			NextRecordID: 1,
 			RecordCount:  0,
+			MaxVersions:  useOpts.MaxVersions,
 		}
 		typedDB.tableCat[tableName] = table
 	} else if table.LayoutHash != layout.Hash {
@@ -181,10 +208,11 @@ func Use[T any](db *DB, name ...string) (*Table[T], error) {
 	typedDB.mu.Unlock()
 
 	typedTable := &Table[T]{
-		db:      typedDB,
-		name:    tableName,
-		tableID: table.ID,
-		layout:  layout,
+		db:          typedDB,
+		name:        tableName,
+		tableID:     table.ID,
+		layout:      layout,
+		maxVersions: table.MaxVersions,
 	}
 
 	if db.autoIndex {
@@ -340,11 +368,12 @@ func computeLayout[T any]() *embedcore.StructLayout {
 }
 
 type Table[T any] struct {
-	db      *database
-	name    string
-	tableID uint8
-	layout  *embedcore.StructLayout
-	idxMgr  *indexManager[T]
+	db          *database
+	name        string
+	tableID     uint8
+	layout      *embedcore.StructLayout
+	idxMgr      *indexManager[T]
+	maxVersions uint8
 }
 
 type indexManager[T any] struct {
@@ -632,6 +661,10 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	binary.BigEndian.PutUint64(val, offset)
 	t.db.pkIndex.Set(indexKey, val)
 
+	if t.maxVersions > 0 {
+		t.db.versionIndex.Add(indexKey, 1, offset, time.Now().UnixNano())
+	}
+
 	if t.db.tx != nil {
 		t.db.tx.recordCounts[t.name]++
 	} else {
@@ -760,6 +793,77 @@ func (t *Table[T]) queryByPK(pkValue string) (uint32, bool) {
 	return 0, false
 }
 
+func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
+	if t.maxVersions == 0 {
+		return nil, fmt.Errorf("versioning not enabled for this table")
+	}
+
+	t.db.mu.RLock()
+	defer t.db.mu.RUnlock()
+
+	indexKey := encodePKForIndex(t.tableID, id)
+	versionInfo, ok := t.db.versionIndex.GetVersion(indexKey, version)
+	if !ok {
+		return nil, fmt.Errorf("version %d not found for record", version)
+	}
+
+	offset := versionInfo.Offset
+
+	headerBuf := make([]byte, 12)
+	_, err := t.db.file.ReadAt(headerBuf, int64(offset))
+	if err != nil {
+		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
+	}
+
+	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
+		return nil, fmt.Errorf("invalid record header")
+	}
+
+	active := headerBuf[11]
+	if active != 1 {
+		return nil, fmt.Errorf("record version is deleted")
+	}
+
+	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
+	totalLen := 12 + int(recLen) + 2
+
+	recordBuf := make([]byte, totalLen)
+	copy(recordBuf, headerBuf)
+	n, err := t.db.file.ReadAt(recordBuf[12:], int64(offset)+12)
+	if err != nil || n < int(totalLen-12) {
+		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
+	}
+
+	var result T
+	if err := t.decodeRecord(recordBuf, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func (t *Table[T]) ListVersions(id any) ([]VersionMetadata, error) {
+	if t.maxVersions == 0 {
+		return nil, fmt.Errorf("versioning not enabled for this table")
+	}
+
+	t.db.mu.RLock()
+	defer t.db.mu.RUnlock()
+
+	indexKey := encodePKForIndex(t.tableID, id)
+	versions := t.db.versionIndex.GetVersions(indexKey)
+
+	result := make([]VersionMetadata, 0, len(versions))
+	for _, v := range versions {
+		result = append(result, VersionMetadata{
+			Version:   v.Version,
+			CreatedAt: time.Unix(0, v.CreatedAt),
+		})
+	}
+
+	return result, nil
+}
+
 func (t *Table[T]) Update(id any, record *T) error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -778,7 +882,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 		return fmt.Errorf("invalid record at offset %d", oldOffset)
 	}
 
-	t.db.file.WriteAt([]byte{0}, int64(oldOffset+11))
+	recordID := binary.BigEndian.Uint32(recordBuf[3:7])
 
 	encoded, err := t.encodeRecord(record)
 	if err != nil {
@@ -789,7 +893,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 	headerBytes[0] = EcCode
 	headerBytes[1] = RecordStartMark
 	headerBytes[2] = t.tableID
-	binary.BigEndian.PutUint32(headerBytes[3:7], binary.BigEndian.Uint32(recordBuf[3:7]))
+	binary.BigEndian.PutUint32(headerBytes[3:7], recordID)
 	binary.BigEndian.PutUint32(headerBytes[7:11], uint32(len(encoded)))
 	headerBytes[11] = 1
 
@@ -802,6 +906,28 @@ func (t *Table[T]) Update(id any, record *T) error {
 
 	newOffset, _ := t.db.alloc.Allocate(uint64(len(newRecordBuf)))
 	t.db.file.WriteAt(newRecordBuf, int64(newOffset))
+
+	if t.maxVersions > 0 {
+		versions := t.db.versionIndex.GetVersions(indexKey)
+		if len(versions) == 0 {
+			t.db.versionIndex.Add(indexKey, 1, oldOffset, time.Now().UnixNano())
+		}
+		newVersion := uint32(1)
+		if len(versions) > 0 {
+			newVersion = versions[len(versions)-1].Version + 1
+		}
+		t.db.versionIndex.Add(indexKey, newVersion, newOffset, time.Now().UnixNano())
+		versions = t.db.versionIndex.GetVersions(indexKey)
+		maxTotal := int(t.maxVersions) + 1
+		for len(versions) > maxTotal {
+			oldestOffset := versions[0].Offset
+			t.db.file.WriteAt([]byte{0}, int64(oldestOffset+11))
+			t.db.versionIndex.RemoveVersion(indexKey, versions[0].Version)
+			versions = t.db.versionIndex.GetVersions(indexKey)
+		}
+	} else {
+		t.db.file.WriteAt([]byte{0}, int64(oldOffset+11))
+	}
 
 	newVal := make([]byte, 8)
 	binary.BigEndian.PutUint64(newVal, newOffset)

@@ -191,9 +191,166 @@ type tableCatalogEntry struct {
 	NextRecordID uint32
 	Dropped      bool
 	RecordCount  uint32
+	MaxVersions  uint8
 }
 
 type tableCatalog map[string]*tableCatalogEntry
+
+type VersionInfo struct {
+	Version   uint32
+	Offset    uint64
+	CreatedAt int64
+}
+
+type versionIndex struct {
+	mu   sync.RWMutex
+	data map[string][]VersionInfo
+}
+
+func newVersionIndex() *versionIndex {
+	return &versionIndex{
+		data: make(map[string][]VersionInfo),
+	}
+}
+
+func (vi *versionIndex) Add(key []byte, version uint32, offset uint64, createdAt int64) {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	keyStr := string(key)
+	versions := vi.data[keyStr]
+	versions = append(versions, VersionInfo{
+		Version:   version,
+		Offset:    offset,
+		CreatedAt: createdAt,
+	})
+	vi.data[keyStr] = versions
+}
+
+func (vi *versionIndex) GetVersions(key []byte) []VersionInfo {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	keyStr := string(key)
+	versions := vi.data[keyStr]
+	result := make([]VersionInfo, len(versions))
+	copy(result, versions)
+	return result
+}
+
+func (vi *versionIndex) GetVersion(key []byte, version uint32) (VersionInfo, bool) {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	keyStr := string(key)
+	versions := vi.data[keyStr]
+	for _, v := range versions {
+		if v.Version == version {
+			return v, true
+		}
+	}
+	return VersionInfo{}, false
+}
+
+func (vi *versionIndex) RemoveVersion(key []byte, version uint32) {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	keyStr := string(key)
+	versions := vi.data[keyStr]
+	for i, v := range versions {
+		if v.Version == version {
+			versions = append(versions[:i], versions[i+1:]...)
+			break
+		}
+	}
+	vi.data[keyStr] = versions
+}
+
+func (vi *versionIndex) RemoveKey(key []byte) {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	delete(vi.data, string(key))
+}
+
+func (vi *versionIndex) Range(fn func(key []byte, versions []VersionInfo) bool) {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	for k, versions := range vi.data {
+		keyCopy := []byte(k)
+		versionsCopy := make([]VersionInfo, len(versions))
+		copy(versionsCopy, versions)
+		if !fn(keyCopy, versionsCopy) {
+			return
+		}
+	}
+}
+
+func (vi *versionIndex) Clear() {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	vi.data = make(map[string][]VersionInfo)
+}
+
+func (db *database) encodeVersionCatalog() []byte {
+	var buf []byte
+
+	count := uint32(0)
+	vi := db.versionIndex
+	vi.mu.RLock()
+	for _, versions := range vi.data {
+		count += uint32(len(versions))
+	}
+	vi.mu.RUnlock()
+
+	buf = binary.LittleEndian.AppendUint32(buf, count)
+
+	vi.Range(func(key []byte, versions []VersionInfo) bool {
+		for _, v := range versions {
+			buf = append(buf, byte(len(key)))
+			buf = append(buf, key...)
+			buf = binary.LittleEndian.AppendUint32(buf, v.Version)
+			buf = binary.LittleEndian.AppendUint64(buf, v.Offset)
+			buf = binary.LittleEndian.AppendUint64(buf, uint64(v.CreatedAt))
+		}
+		return true
+	})
+
+	return buf
+}
+
+func decodeVersionCatalog(data []byte, vi *versionIndex) {
+	if len(data) < 4 {
+		return
+	}
+
+	offset := 0
+	count := binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+
+	for i := uint32(0); i < count && offset < len(data); i++ {
+		if offset >= len(data) {
+			break
+		}
+		keyLen := int(data[offset])
+		offset++
+
+		if offset+keyLen > len(data) {
+			break
+		}
+		key := make([]byte, keyLen)
+		copy(key, data[offset:offset+keyLen])
+		offset += keyLen
+
+		if offset+20 > len(data) {
+			break
+		}
+		version := binary.LittleEndian.Uint32(data[offset:])
+		offset += 4
+		recordOffset := binary.LittleEndian.Uint64(data[offset:])
+		offset += 8
+		createdAt := int64(binary.LittleEndian.Uint64(data[offset:]))
+		offset += 8
+
+		vi.Add(key, version, recordOffset, createdAt)
+	}
+}
 
 func (tc tableCatalog) GetTableID(name string) (uint8, bool) {
 	entry := tc[name]
@@ -221,14 +378,15 @@ func (tc tableCatalog) AddTable(name string, layoutHash string) uint8 {
 }
 
 type database struct {
-	mu       sync.RWMutex
-	file     *os.File
-	filename string
-	pkIndex  *mapIndex
-	alloc    *allocator
-	tableCat tableCatalog
-	tx       *Transaction
-	parent   *DB
+	mu           sync.RWMutex
+	file         *os.File
+	filename     string
+	pkIndex      *mapIndex
+	alloc        *allocator
+	tableCat     tableCatalog
+	tx           *Transaction
+	parent       *DB
+	versionIndex *versionIndex
 }
 
 func openDatabase(filename string, migrate bool, parent *DB) (*database, error) {
@@ -243,12 +401,14 @@ func openDatabase(filename string, migrate bool, parent *DB) (*database, error) 
 	}
 
 	db := &database{
-		filename: filename,
-		file:     file,
-		pkIndex:  newMapIndex(),
-		alloc:    &allocator{},
-		tableCat: make(tableCatalog),
-		parent:   parent,
+		filename:     filename,
+		file:         file,
+		pkIndex:      newMapIndex(),
+		alloc:        &allocator{},
+		tableCat:     make(tableCatalog),
+		tx:           nil,
+		parent:       parent,
+		versionIndex: newVersionIndex(),
 	}
 
 	stat, _ := file.Stat()
@@ -289,12 +449,35 @@ func (db *database) load() error {
 	tableCount := binary.LittleEndian.Uint32(header[32:36])
 	tocOffset := binary.LittleEndian.Uint32(header[36:40])
 	nextOffset := binary.LittleEndian.Uint64(header[40:48])
+	var versionCatalogOffset uint32
+	if len(header) >= 56 {
+		versionCatalogOffset = binary.LittleEndian.Uint32(header[48:56])
+	}
 
 	db.alloc.Reset(nextOffset, nil)
 
-	if tableCount > 0 && tocOffset > 0 {
+	if tableCount > 0 && tocOffset > 0 && int64(tocOffset) < stat.Size() {
 		var tocData []byte
-		if int(tocOffset) < int(stat.Size()) {
+		var versionCatalogData []byte
+
+		if versionCatalogOffset > 0 && int64(versionCatalogOffset) > int64(tocOffset) && int64(versionCatalogOffset) < stat.Size() {
+			tocLen := int(versionCatalogOffset) - int(tocOffset)
+			if tocLen > 0 && tocLen < 1024*1024 {
+				tocData = make([]byte, tocLen)
+				_, err = db.file.ReadAt(tocData, int64(tocOffset))
+				if err != nil {
+					return err
+				}
+			}
+			versionLen := int(stat.Size()) - int(versionCatalogOffset)
+			if versionLen > 0 && versionLen < 10*1024*1024 {
+				versionCatalogData = make([]byte, versionLen)
+				_, err = db.file.ReadAt(versionCatalogData, int64(versionCatalogOffset))
+				if err != nil {
+					return err
+				}
+			}
+		} else if int(tocOffset) < int(stat.Size()) {
 			tocLen := int(stat.Size()) - int(tocOffset)
 			if tocLen > 0 && tocLen < 1024*1024 {
 				tocData = make([]byte, tocLen)
@@ -308,6 +491,10 @@ func (db *database) load() error {
 		if tocData != nil {
 			db.tableCat = decodeTableCatalog(tocData)
 		}
+
+		if versionCatalogData != nil {
+			decodeVersionCatalog(versionCatalogData, db.versionIndex)
+		}
 	}
 
 	db.pkIndex.Range(func(k []byte, v []byte) bool {
@@ -315,8 +502,19 @@ func (db *database) load() error {
 	})
 
 	recordStart := int64(64)
-	if stat.Size() > recordStart && int64(tocOffset) > recordStart {
-		for offset := recordStart; offset < int64(tocOffset); offset++ {
+	endOffset := int64(tocOffset)
+	if versionCatalogOffset > 0 && int64(versionCatalogOffset) < stat.Size() {
+		endOffset = int64(versionCatalogOffset)
+	}
+	if endOffset == 0 || endOffset > stat.Size() {
+		endOffset = int64(tocOffset)
+	}
+	if endOffset > stat.Size() {
+		endOffset = stat.Size()
+	}
+
+	if stat.Size() > recordStart && endOffset > recordStart {
+		for offset := recordStart; offset < endOffset; offset++ {
 			hdrBuf := make([]byte, 12)
 			_, err := db.file.ReadAt(hdrBuf, offset)
 			if err != nil || hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
@@ -326,7 +524,7 @@ func (db *database) load() error {
 			recLen := binary.BigEndian.Uint32(hdrBuf[7:11])
 			totalLen := 12 + int(recLen) + 2
 
-			if int64(offset)+int64(totalLen) > int64(tocOffset) {
+			if int64(offset)+int64(totalLen) > endOffset {
 				break
 			}
 
@@ -472,12 +670,19 @@ func decodeTableCatalog(data []byte) tableCatalog {
 			offset += 4
 		}
 
+		maxVersions := uint8(0)
+		if offset < len(data) {
+			maxVersions = data[offset]
+			offset++
+		}
+
 		tc[name] = &tableCatalogEntry{
 			ID:           id,
 			Name:         name,
 			LayoutHash:   layoutHash,
 			NextRecordID: nextRecID,
 			RecordCount:  recordCount,
+			MaxVersions:  maxVersions,
 		}
 	}
 
@@ -493,6 +698,8 @@ func (db *database) flush() error {
 	binary.LittleEndian.PutUint64(header[40:48], db.alloc.nextOffset)
 
 	encodedCat := db.encodeTableCatalog()
+	encodedVersionCat := db.encodeVersionCatalog()
+
 	recordStart := int64(db.alloc.nextOffset)
 	if recordStart < 64 {
 		recordStart = 64
@@ -520,6 +727,7 @@ func (db *database) flush() error {
 
 	recordDataStart := recordStart
 	updatedIndex := make(map[string][]byte)
+	updatedVersionOffsets := make(map[string]map[uint32]uint64)
 
 	for _, rec := range records {
 		hdrBuf := make([]byte, 12)
@@ -549,11 +757,33 @@ func (db *database) flush() error {
 		binary.BigEndian.PutUint64(newVal, uint64(recordDataStart))
 		updatedIndex[string(rec.key)] = newVal
 
+		versionKey := string(rec.key)
+		versions := db.versionIndex.GetVersions(rec.key)
+		for _, v := range versions {
+			if v.Offset == rec.offset {
+				if updatedVersionOffsets[versionKey] == nil {
+					updatedVersionOffsets[versionKey] = make(map[uint32]uint64)
+				}
+				updatedVersionOffsets[versionKey][v.Version] = uint64(recordDataStart)
+				break
+			}
+		}
+
 		recordDataStart += int64(totalLen)
 	}
 
 	for k, v := range updatedIndex {
 		db.pkIndex.Set([]byte(k), v)
+	}
+
+	for key, versionOffsets := range updatedVersionOffsets {
+		versions := db.versionIndex.GetVersions([]byte(key))
+		for _, v := range versions {
+			if newOffset, ok := versionOffsets[v.Version]; ok {
+				db.versionIndex.RemoveVersion([]byte(key), v.Version)
+				db.versionIndex.Add([]byte(key), v.Version, newOffset, v.CreatedAt)
+			}
+		}
 	}
 
 	catOffset := recordDataStart
@@ -568,7 +798,14 @@ func (db *database) flush() error {
 		return err
 	}
 
-	newSize := catOffset + int64(len(encodedCat))
+	versionCatOffset := catOffset + int64(len(encodedCat))
+	binary.LittleEndian.PutUint32(header[48:56], uint32(versionCatOffset))
+
+	if _, err := db.file.WriteAt(encodedVersionCat, versionCatOffset); err != nil {
+		return err
+	}
+
+	newSize := versionCatOffset + int64(len(encodedVersionCat))
 	if err := db.file.Truncate(newSize); err != nil {
 		return err
 	}
@@ -602,6 +839,7 @@ func (db *database) encodeTableCatalog() []byte {
 		buf = append(buf, []byte(entry.LayoutHash)...)
 		buf = binary.LittleEndian.AppendUint32(buf, entry.NextRecordID)
 		buf = binary.LittleEndian.AppendUint32(buf, entry.RecordCount)
+		buf = append(buf, entry.MaxVersions)
 	}
 
 	return buf
@@ -690,6 +928,7 @@ func (db *database) Vacuum() error {
 
 	newOffset := int64(64)
 	newPkIndex := newMapIndex()
+	newVersionIndex := newVersionIndex()
 
 	entries := make([]*tableCatalogEntry, 0)
 	for _, entry := range db.tableCat {
@@ -698,17 +937,20 @@ func (db *database) Vacuum() error {
 		}
 	}
 
+	offsetMap := make(map[uint64]uint64)
+
 	for _, entry := range entries {
-		ids := make([]uint32, 0)
+		var keys [][]byte
 		db.pkIndex.Range(func(k []byte, v []byte) bool {
 			if len(k) >= 2 && k[0] == entry.ID {
-				ids = append(ids, binary.BigEndian.Uint32(k[1:5]))
+				keyCopy := make([]byte, len(k))
+				copy(keyCopy, k)
+				keys = append(keys, keyCopy)
 			}
 			return true
 		})
 
-		for _, recID := range ids {
-			key := encodePKForIndex(entry.ID, recID)
+		for _, key := range keys {
 			val, ok := db.pkIndex.Get(key)
 			if !ok {
 				continue
@@ -716,8 +958,8 @@ func (db *database) Vacuum() error {
 
 			offset := binary.BigEndian.Uint64(val)
 			recordBuf := make([]byte, 4096)
-			n, err := db.file.ReadAt(recordBuf, int64(offset))
-			if err != nil || n < 14 {
+			n, _ := db.file.ReadAt(recordBuf, int64(offset))
+			if n < 14 {
 				continue
 			}
 
@@ -733,7 +975,7 @@ func (db *database) Vacuum() error {
 			recLen := binary.BigEndian.Uint32(recordBuf[7:11])
 			totalLen := 12 + int(recLen) + 2
 
-			if totalLen <= n {
+			if totalLen <= n && totalLen >= 14 {
 				record := recordBuf[:totalLen]
 				if _, err := newFile.Write(record); err != nil {
 					newFile.Close()
@@ -744,13 +986,60 @@ func (db *database) Vacuum() error {
 				binary.BigEndian.PutUint64(newVal, uint64(newOffset))
 				newPkIndex.Set(key, newVal)
 
+				versions := db.versionIndex.GetVersions(key)
+				for _, v := range versions {
+					if v.Offset == offset {
+						newVersionIndex.Add(key, v.Version, uint64(newOffset), v.CreatedAt)
+						break
+					}
+				}
+
+				offsetMap[offset] = uint64(newOffset)
 				newOffset += int64(totalLen)
 			}
 		}
 	}
 
+	db.versionIndex.Range(func(key []byte, versions []VersionInfo) bool {
+		for _, v := range versions {
+			if newOffset, ok := offsetMap[v.Offset]; ok {
+				existing := newVersionIndex.GetVersions(key)
+				found := false
+				for _, ev := range existing {
+					if ev.Version == v.Version {
+						found = true
+						break
+					}
+				}
+				if !found {
+					newVersionIndex.Add(key, v.Version, newOffset, v.CreatedAt)
+				}
+			}
+		}
+		return true
+	})
+
 	tocData := db.encodeTableCatalog()
+	tocOffset := newOffset
+
+	versionCatData := db.encodeVersionCatalog()
+	versionCatOffset := tocOffset + int64(len(tocData))
+
+	binary.LittleEndian.PutUint32(header[36:40], uint32(tocOffset))
+	binary.LittleEndian.PutUint32(header[48:56], uint32(versionCatOffset))
+	binary.LittleEndian.PutUint64(header[40:48], uint64(versionCatOffset+int64(len(versionCatData))))
+
+	if _, err := newFile.WriteAt(header, 0); err != nil {
+		newFile.Close()
+		return err
+	}
+
 	if _, err := newFile.Write(tocData); err != nil {
+		newFile.Close()
+		return err
+	}
+
+	if _, err := newFile.Write(versionCatData); err != nil {
 		newFile.Close()
 		return err
 	}
@@ -759,6 +1048,9 @@ func (db *database) Vacuum() error {
 		db.pkIndex.Set(k, v)
 		return true
 	})
+
+	db.versionIndex = newVersionIndex
+	db.alloc.Reset(uint64(versionCatOffset+int64(len(versionCatData))), nil)
 
 	newFile.Close()
 	db.file.Close()

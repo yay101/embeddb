@@ -22,6 +22,7 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **Auto-sync** - Periodic disk flush (every N writes or idle timeout)
 - **FastSync** - Quick fsync without defragmentation
 - **PK uniqueness** - Error on duplicate primary keys
+- **Versioning** - Keep N previous versions of records with timestamps
 
 ## Performance
 
@@ -131,9 +132,45 @@ db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
     IdleThreshold: 10 * time.Second,  // fsync after idle (default 10s)
 })
 
-// Get table handle
+// Get table handle (versioning disabled by default)
 users, err := embeddb.Use[User](db, "users")
+
+// Enable versioning - keeps last N versions of each record
+docs, err := embeddb.Use[Document](db, embeddb.UseOptions{
+    MaxVersions: 5,  // Keep current + 5 previous versions
+})
 ```
+
+### Versioning
+
+Versioning is disabled by default. Enable it per-table using `UseOptions.MaxVersions`:
+
+```go
+// Enable versioning when creating a table
+docs, err := embeddb.Use[Document](db, embeddb.UseOptions{
+    MaxVersions: 5,  // Keep current + 5 previous versions
+})
+
+// Insert creates version 1
+id, _ := docs.Insert(&Document{Title: "Draft v1", Content: "..."})
+
+// Update creates a new version (v2)
+docs.Update(id, &Document{Title: "Draft v2", Content: "..."})
+
+// Get current version (latest)
+current, _ := docs.Get(id)
+
+// Get a specific version
+v1, _ := docs.GetVersion(id, 1)
+
+// List all versions with metadata
+versions, _ := docs.ListVersions(id)
+for _, v := range versions {
+    fmt.Printf("Version %d created at %v\n", v.Version, v.CreatedAt)
+}
+```
+
+**Note:** When `MaxVersions > 0`, old versions are marked as deleted during `Vacuum()`. The current version is always accessible via `Get()`.
 
 ### CRUD Operations
 
