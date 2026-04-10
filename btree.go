@@ -94,7 +94,9 @@ func (bt *BTree) ensureMmap(size int64) error {
 	if size <= int64(len(bt.mmap)) {
 		return nil
 	}
-	bt.mmap.Unmap()
+	if bt.mmap != nil {
+		bt.mmap.Unmap()
+	}
 	if err := bt.file.Truncate(size); err != nil {
 		return err
 	}
@@ -506,10 +508,20 @@ func (bt *BTree) scanNode(node *BTreeNode, fn func([]byte, uint64) bool) error {
 }
 
 func (bt *BTree) Close() error {
+	if bt.mmap != nil {
+		bt.mmap.Flush()
+		bt.mmap.Unmap()
+		bt.mmap = nil
+	}
 	return nil
 }
 
 func (bt *BTree) Sync() error {
+	if bt.mmap != nil {
+		if err := bt.mmap.Flush(); err != nil {
+			return err
+		}
+	}
 	return bt.file.Sync()
 }
 
