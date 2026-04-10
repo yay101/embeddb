@@ -2016,7 +2016,9 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 				continue
 			}
 		case reflect.Slice:
-			if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.String {
+			if fieldOffset.IsBytes {
+				val, data, err = embedcore.DecodeBytes(data)
+			} else if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.String {
 				val, data, err = embedcore.DecodeSlice(data)
 			} else if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.Int {
 				val, data, err = embedcore.DecodeIntSlice(data)
@@ -2109,7 +2111,10 @@ func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 				buf = embedcore.EncodeVarint(buf, embedcore.GetTimeField(record, field).Unix())
 			}
 		case reflect.Slice:
-			if field.IsSlice && field.SliceElem.Kind() == reflect.String {
+			if field.IsBytes {
+				bytesVal, _ := embedcore.GetBytesField(record, field)
+				buf = embedcore.EncodeBytes(buf, bytesVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.String {
 				sliceVal := embedcore.GetStringSlice(record, field)
 				buf = embedcore.EncodeSlice(buf, sliceVal)
 			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int {
