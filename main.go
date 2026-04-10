@@ -231,8 +231,9 @@ type VersionInfo struct {
 }
 
 type versionIndex struct {
-	mu   sync.RWMutex
-	data map[string][]VersionInfo
+	mu       sync.RWMutex
+	data     map[string][]VersionInfo
+	snapshot map[string][]VersionInfo
 }
 
 func newVersionIndex() *versionIndex {
@@ -314,6 +315,39 @@ func (vi *versionIndex) Clear() {
 	vi.mu.Lock()
 	defer vi.mu.Unlock()
 	vi.data = make(map[string][]VersionInfo)
+}
+
+func (vi *versionIndex) RootOffset() uint64 {
+	return 0
+}
+
+func (vi *versionIndex) SetRootOffset(off uint64) {
+}
+
+func (vi *versionIndex) Snapshot() {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	vi.snapshot = make(map[string][]VersionInfo)
+	for k, versions := range vi.data {
+		versionsCopy := make([]VersionInfo, len(versions))
+		copy(versionsCopy, versions)
+		vi.snapshot[k] = versionsCopy
+	}
+}
+
+func (vi *versionIndex) RestoreSnapshot() {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	if vi.snapshot != nil {
+		vi.data = vi.snapshot
+		vi.snapshot = nil
+	}
+}
+
+func (vi *versionIndex) ClearSnapshot() {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	vi.snapshot = nil
 }
 
 func (db *database) encodeVersionCatalog() []byte {
@@ -1141,11 +1175,12 @@ func (db *database) Vacuum() error {
 }
 
 type Transaction struct {
-	db             *database
-	snapshot       *mapIndex
-	pkRootSnapshot uint64
-	committed      bool
-	recordCounts   map[string]uint32
+	db                   *database
+	snapshot             *mapIndex
+	pkRootSnapshot       uint64
+	versionIndexSnapshot map[string][]VersionInfo
+	committed            bool
+	recordCounts         map[string]uint32
 }
 
 func (db *database) Begin() *Transaction {
@@ -1164,11 +1199,21 @@ func (db *database) Begin() *Transaction {
 
 	pkRootSnapshot := db.pkIndexBTRoot
 
+	db.versionIndex.Snapshot()
+	versionSnap := make(map[string][]VersionInfo)
+	db.versionIndex.Range(func(k []byte, versions []VersionInfo) bool {
+		versionsCopy := make([]VersionInfo, len(versions))
+		copy(versionsCopy, versions)
+		versionSnap[string(k)] = versionsCopy
+		return true
+	})
+
 	tx := &Transaction{
-		db:             db,
-		snapshot:       snapshot,
-		pkRootSnapshot: pkRootSnapshot,
-		recordCounts:   make(map[string]uint32),
+		db:                   db,
+		snapshot:             snapshot,
+		pkRootSnapshot:       pkRootSnapshot,
+		versionIndexSnapshot: versionSnap,
+		recordCounts:         make(map[string]uint32),
 	}
 	db.tx = tx
 	return tx
@@ -1179,6 +1224,7 @@ func (tx *Transaction) Commit() error {
 		return fmt.Errorf("transaction already committed")
 	}
 	tx.committed = true
+	tx.db.versionIndex.ClearSnapshot()
 	tx.db.tx = nil
 	return nil
 }
@@ -1205,6 +1251,13 @@ func (tx *Transaction) Rollback() error {
 	tx.db.pkIndexBTRoot = tx.pkRootSnapshot
 	if bti, ok := tx.db.pkIndex.(*btreeMapIndex); ok {
 		bti.SetRootOffset(tx.pkRootSnapshot)
+	}
+
+	tx.db.versionIndex.Clear()
+	for k, versions := range tx.versionIndexSnapshot {
+		versionsCopy := make([]VersionInfo, len(versions))
+		copy(versionsCopy, versions)
+		tx.db.versionIndex.data[k] = versionsCopy
 	}
 
 	for tableName, delta := range tx.recordCounts {
