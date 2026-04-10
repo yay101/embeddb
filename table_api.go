@@ -911,19 +911,29 @@ func (t *Table[T]) Update(id any, record *T) error {
 		versions := t.db.versionIndex.GetVersions(indexKey)
 		if len(versions) == 0 {
 			t.db.versionIndex.Add(indexKey, 1, oldOffset, time.Now().UnixNano())
+			versions = []VersionInfo{{Version: 1, Offset: oldOffset, CreatedAt: time.Now().UnixNano()}}
 		}
 		newVersion := uint32(1)
-		if len(versions) > 0 {
-			newVersion = versions[len(versions)-1].Version + 1
+		for _, v := range versions {
+			if v.Version >= newVersion {
+				newVersion = v.Version + 1
+			}
 		}
 		t.db.versionIndex.Add(indexKey, newVersion, newOffset, time.Now().UnixNano())
-		versions = t.db.versionIndex.GetVersions(indexKey)
+		versions = append(versions, VersionInfo{Version: newVersion, Offset: newOffset, CreatedAt: time.Now().UnixNano()})
 		maxTotal := int(t.maxVersions) + 1
 		for len(versions) > maxTotal {
-			oldestOffset := versions[0].Offset
-			t.db.file.WriteAt([]byte{0}, int64(oldestOffset+11))
-			t.db.versionIndex.RemoveVersion(indexKey, versions[0].Version)
-			versions = t.db.versionIndex.GetVersions(indexKey)
+			oldestIdx := 0
+			oldestVersion := versions[0].Version
+			for i, v := range versions {
+				if v.Version < versions[oldestIdx].Version {
+					oldestIdx = i
+					oldestVersion = v.Version
+				}
+			}
+			t.db.file.WriteAt([]byte{0}, int64(versions[oldestIdx].Offset+11))
+			t.db.versionIndex.RemoveVersion(indexKey, oldestVersion)
+			versions = append(versions[:oldestIdx], versions[oldestIdx+1:]...)
 		}
 	} else {
 		t.db.file.WriteAt([]byte{0}, int64(oldOffset+11))
@@ -955,6 +965,10 @@ func (t *Table[T]) Delete(id any) error {
 	t.db.file.WriteAt([]byte{0}, int64(offset+11))
 
 	t.db.pkIndex.Delete(indexKey)
+
+	if t.maxVersions > 0 {
+		t.db.versionIndex.RemoveKey(indexKey)
+	}
 
 	if t.db.tx != nil {
 		t.db.tx.recordCounts[t.name]--
@@ -1074,6 +1088,10 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	val := make([]byte, 8)
 	binary.BigEndian.PutUint64(val, offset)
 	t.db.pkIndex.Set(indexKey, val)
+
+	if t.maxVersions > 0 {
+		t.db.versionIndex.Add(indexKey, 1, offset, time.Now().UnixNano())
+	}
 
 	if t.db.tx != nil {
 		t.db.tx.recordCounts[t.name]++

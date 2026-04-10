@@ -303,7 +303,7 @@ func (db *database) encodeVersionCatalog() []byte {
 
 	vi.Range(func(key []byte, versions []VersionInfo) bool {
 		for _, v := range versions {
-			buf = append(buf, byte(len(key)))
+			buf = embedcore.EncodeUvarint(buf, uint64(len(key)))
 			buf = append(buf, key...)
 			buf = binary.LittleEndian.AppendUint32(buf, v.Version)
 			buf = binary.LittleEndian.AppendUint64(buf, v.Offset)
@@ -328,15 +328,18 @@ func decodeVersionCatalog(data []byte, vi *versionIndex) {
 		if offset >= len(data) {
 			break
 		}
-		keyLen := int(data[offset])
-		offset++
-
-		if offset+keyLen > len(data) {
+		keyLen, remaining, err := embedcore.DecodeUvarint(data[offset:])
+		if err != nil {
+			break
+		}
+		consumed := len(data[offset:]) - len(remaining)
+		offset += consumed
+		if offset+int(keyLen) > len(data) {
 			break
 		}
 		key := make([]byte, keyLen)
-		copy(key, data[offset:offset+keyLen])
-		offset += keyLen
+		copy(key, data[offset:offset+int(keyLen)])
+		offset += int(keyLen)
 
 		if offset+20 > len(data) {
 			break
