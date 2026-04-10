@@ -4,17 +4,17 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 
 ## Features
 
-- **Pure Go** - No Cgo, no dependencies outside stdlib
+- **Pure Go** - No Cgo, minimal dependencies
 - **Type-safe** - Full Go generics support
 - **Single file** - Database and indexes in one file
-- **Map-based indexes** - Fast O(1) lookups on indexed fields
+- **B-tree primary index** - Persistent B-tree with Copy-on-Write transactions
 - **Range queries** - Greater than, less than, between (indexed and non-indexed)
 - **Nested structs** - Query fields like `Address.City`
 - **Multiple tables** - Different struct types in one file
 - **Efficient pagination** - Built-in paged queries
 - **Case-insensitive LIKE** - SQL LIKE patterns
 - **Scanner** - Low-lock sequential access with early exit
-- **Transactions** - Commit and rollback support
+- **Transactions** - Full Copy-on-Write commit and rollback support
 - **Vacuum** - File compaction
 - **Auto-indexing** - Automatically creates indexes for `db:"index"` fields
 - **Schema migration** - Automatically migrates records when struct changes
@@ -30,22 +30,24 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 === Benchmarks (300k total records) ===
 
 --- Insert ---
-users.Insert 100k:    290ms  (344,000/sec)
-orders.Insert 100k:   251ms  (397,000/sec)
-products.Insert 100k: 303ms  (329,000/sec)
+users.Insert 100k:    1.3s   (76,000/sec)
+orders.Insert 100k:   1.2s   (81,000/sec)
+products.Insert 100k: 1.5s   (68,000/sec)
 
-Memory: 37 MB
-Sync:   444ms
-Disk:   14.73 MB (51 bytes/record)
+Memory: 85 MB
+Sync:   3.0s
+Disk:   50.85 MB (177 bytes/record)
 
 --- Query (indexed) ---
-Query by Name:    4.9ms  (2,030,000/sec)
-Get by PK:       23ms     (430,000/sec)
-Query by Age:    0.3ms   (3,280,000/sec)
+Query by Name:    4.4ms   (225,000/sec)
+Get by PK:        3.2ms   (312,000/sec)
+Query by Age:     3.1s    (320/sec)
 
 --- Scan ---
-Scan 100k:       252ms  (396,000 records/sec)
+Scan 100k:       186ms  (537,000 records/sec)
 ```
+
+**Note:** B-tree storage trades insert speed for memory efficiency and persistence. The primary key index is stored as a persistent B-tree, providing crash recovery without index rebuild. Use Vacuum() periodically to defragment.
 
 ## Installation
 
@@ -280,6 +282,8 @@ if result.HasMore {
 
 ### Transactions
 
+Transactions use Copy-on-Write semantics for crash safety:
+
 ```go
 // Begin transaction
 db.Begin()
@@ -291,6 +295,8 @@ users.Insert(&User{Name: "Bob", Age: 25})
 err := db.Commit()
 // err := db.Rollback()
 ```
+
+On rollback, both the primary key index (B-tree) and version index are restored to their pre-transaction state.
 
 ### Table & Index Management
 
@@ -371,11 +377,13 @@ results, _ := users.Filter(func(u User) bool {
 
 ## File Format
 
-- Header: 64 bytes (magic, version, catalog offset)
-- Records: stored sequentially after header (4096+)
+- Header: 64 bytes (magic, version, catalog offset, B-tree roots)
+- Records: stored sequentially after header
 - Catalog: table definitions at end of file
-- Indexes: in-memory maps, rebuilt on load with automatic recovery from corruption
-- 51 bytes per record overhead + field data
+- Primary Index: Persistent B-tree with mmap, Copy-on-Write transactions
+- Secondary Indexes: In-memory maps with automatic recovery
+- B-tree nodes: 4096 bytes per node, LRU cache (2048 nodes)
+- 51+ bytes per record overhead + field data
 
 ## Why EmbedDB?
 
