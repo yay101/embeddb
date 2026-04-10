@@ -2,6 +2,4 @@ module github.com/yay101/embeddb
 
 go 1.25.8
 
-require github.com/yay101/embeddbcore v0.1.4
-
-replace github.com/yay101/embeddbcore => ../embeddbcore
+require github.com/yay101/embeddbcore v0.2.0
