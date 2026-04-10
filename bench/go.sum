@@ -1,2 +1,4 @@
+github.com/yay101/embeddb v1.6.2 h1:J22Vqil6IC9/rsYlNytftdl4vbiH4HtwkBhtWPo+SdA=
+github.com/yay101/embeddb v1.6.2/go.mod h1:VBmpOTdyeO+NqxotteLfRCa1kReCm07k2m8KuhEjacM=
 github.com/yay101/embeddbcore v0.1.4 h1:DLhWoJtDMoxx/V5jhFjSUjk+E+sxeKJrSjg6FFi2xmY=
 github.com/yay101/embeddbcore v0.1.4/go.mod h1:lUAbYOm+zaTjhO9ABKoyWpPHE8zsD4sOfaM2noNNs1o=
