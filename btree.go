@@ -166,7 +166,7 @@ func (bt *BTree) writeNode(node *BTreeNode) error {
 	}
 
 	copy(bt.mmap[node.Offset:], buf)
-	return bt.mmap.Flush()
+	return nil
 }
 
 func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
