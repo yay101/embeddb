@@ -100,6 +100,23 @@ func (mi *mapIndex) Size() int {
 	return len(mi.data)
 }
 
+func (mi *mapIndex) RootOffset() uint64 {
+	return 0
+}
+
+func (mi *mapIndex) SetRootOffset(off uint64) {
+}
+
+type pkIndexInterface interface {
+	Set(key []byte, value []byte)
+	Get(key []byte) ([]byte, bool)
+	Delete(key []byte)
+	Range(fn func(k []byte, v []byte) bool)
+	Size() int
+	RootOffset() uint64
+	SetRootOffset(off uint64)
+}
+
 type uint32MapIndex struct {
 	mu   sync.RWMutex
 	data map[string][]uint32
@@ -172,6 +189,16 @@ func (mi *uint32MapIndex) SortedKeys() []string {
 	return keys
 }
 
+type uint32IndexInterface interface {
+	Set(key string, value uint32)
+	Get(key string) (uint32, bool)
+	GetAll(key string) ([]uint32, bool)
+	Delete(key string)
+	Range(fn func(k string, v uint32) bool)
+	SortedKeys() []string
+	Size() int
+}
+
 func lockFile(f *os.File) error {
 	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
@@ -192,6 +219,7 @@ type tableCatalogEntry struct {
 	Dropped      bool
 	RecordCount  uint32
 	MaxVersions  uint8
+	BTreeRoot    uint64
 }
 
 type tableCatalog map[string]*tableCatalogEntry
@@ -381,15 +409,16 @@ func (tc tableCatalog) AddTable(name string, layoutHash string) uint8 {
 }
 
 type database struct {
-	mu           sync.RWMutex
-	file         *os.File
-	filename     string
-	pkIndex      *mapIndex
-	alloc        *allocator
-	tableCat     tableCatalog
-	tx           *Transaction
-	parent       *DB
-	versionIndex *versionIndex
+	mu            sync.RWMutex
+	file          *os.File
+	filename      string
+	pkIndex       pkIndexInterface
+	alloc         *allocator
+	tableCat      tableCatalog
+	tx            *Transaction
+	parent        *DB
+	versionIndex  *versionIndex
+	pkIndexBTRoot uint64
 }
 
 func openDatabase(filename string, migrate bool, parent *DB) (*database, error) {
@@ -403,21 +432,43 @@ func openDatabase(filename string, migrate bool, parent *DB) (*database, error) 
 		return nil, err
 	}
 
-	db := &database{
-		filename:     filename,
-		file:         file,
-		pkIndex:      newMapIndex(),
-		alloc:        &allocator{},
-		tableCat:     make(tableCatalog),
-		tx:           nil,
-		parent:       parent,
-		versionIndex: newVersionIndex(),
-	}
+	alloc := newAllocator(file)
 
 	stat, _ := file.Stat()
+	var pkIndexBTRoot uint64
+	if stat.Size() > 0 {
+		headerBuf := make([]byte, 64)
+		if _, err := file.ReadAt(headerBuf, 0); err == nil {
+			if headerBuf[0] == EcCode && headerBuf[1] == RecordStartMark {
+				pkIndexBTRoot = binary.LittleEndian.Uint64(headerBuf[56:64])
+			}
+		}
+	}
+
+	db := &database{
+		filename:      filename,
+		file:          file,
+		alloc:         alloc,
+		tableCat:      make(tableCatalog),
+		tx:            nil,
+		parent:        parent,
+		versionIndex:  newVersionIndex(),
+		pkIndexBTRoot: pkIndexBTRoot,
+	}
+
 	if stat.Size() == 0 {
 		db.alloc.Reset(4096, nil)
 	}
+
+	var pkIdx pkIndexInterface
+	btIdx, err := newBtreeMapIndex(db, pkIndexBTRoot)
+	if err != nil {
+		unlockFile(file)
+		file.Close()
+		return nil, err
+	}
+	pkIdx = btIdx
+	db.pkIndex = pkIdx
 
 	if err := db.load(); err != nil {
 		if rebuildErr := db.rebuildIndexFromScan(); rebuildErr != nil {
@@ -425,6 +476,10 @@ func openDatabase(filename string, migrate bool, parent *DB) (*database, error) 
 			file.Close()
 			return nil, fmt.Errorf("failed to load index: %w, failed to rebuild: %v", err, rebuildErr)
 		}
+	}
+
+	if bti, ok := db.pkIndex.(*btreeMapIndex); ok {
+		db.pkIndexBTRoot = bti.RootOffset()
 	}
 
 	return db, nil
@@ -456,6 +511,11 @@ func (db *database) load() error {
 	if len(header) >= 56 {
 		versionCatalogOffset = binary.LittleEndian.Uint32(header[48:56])
 	}
+	var pkIndexBTRoot uint64
+	if len(header) >= 64 {
+		pkIndexBTRoot = binary.LittleEndian.Uint64(header[56:64])
+	}
+	db.pkIndexBTRoot = pkIndexBTRoot
 
 	db.alloc.Reset(nextOffset, nil)
 
@@ -803,6 +863,7 @@ func (db *database) flush() error {
 
 	versionCatOffset := catOffset + int64(len(encodedCat))
 	binary.LittleEndian.PutUint32(header[48:56], uint32(versionCatOffset))
+	binary.LittleEndian.PutUint64(header[56:64], db.pkIndexBTRoot)
 
 	if _, err := db.file.WriteAt(encodedVersionCat, versionCatOffset); err != nil {
 		return err
@@ -1047,11 +1108,6 @@ func (db *database) Vacuum() error {
 		return err
 	}
 
-	newPkIndex.Range(func(k []byte, v []byte) bool {
-		db.pkIndex.Set(k, v)
-		return true
-	})
-
 	db.versionIndex = newVersionIndex
 	db.alloc.Reset(uint64(versionCatOffset+int64(len(versionCatData))), nil)
 
@@ -1067,14 +1123,29 @@ func (db *database) Vacuum() error {
 		return err
 	}
 
-	return lockFile(db.file)
+	if err := lockFile(db.file); err != nil {
+		return err
+	}
+
+	db.alloc.SetFile(db.file)
+
+	db.pkIndex = newMapIndex()
+	db.pkIndexBTRoot = 0
+
+	newPkIndex.Range(func(k []byte, v []byte) bool {
+		db.pkIndex.Set(k, v)
+		return true
+	})
+
+	return nil
 }
 
 type Transaction struct {
-	db           *database
-	snapshot     *mapIndex
-	committed    bool
-	recordCounts map[string]uint32
+	db             *database
+	snapshot       *mapIndex
+	pkRootSnapshot uint64
+	committed      bool
+	recordCounts   map[string]uint32
 }
 
 func (db *database) Begin() *Transaction {
@@ -1091,10 +1162,13 @@ func (db *database) Begin() *Transaction {
 		return true
 	})
 
+	pkRootSnapshot := db.pkIndexBTRoot
+
 	tx := &Transaction{
-		db:           db,
-		snapshot:     snapshot,
-		recordCounts: make(map[string]uint32),
+		db:             db,
+		snapshot:       snapshot,
+		pkRootSnapshot: pkRootSnapshot,
+		recordCounts:   make(map[string]uint32),
 	}
 	db.tx = tx
 	return tx
@@ -1127,6 +1201,11 @@ func (tx *Transaction) Rollback() error {
 		tx.db.pkIndex.Set(k, v)
 		return true
 	})
+
+	tx.db.pkIndexBTRoot = tx.pkRootSnapshot
+	if bti, ok := tx.db.pkIndex.(*btreeMapIndex); ok {
+		bti.SetRootOffset(tx.pkRootSnapshot)
+	}
 
 	for tableName, delta := range tx.recordCounts {
 		if entry := tx.db.tableCat[tableName]; entry != nil {

@@ -379,7 +379,7 @@ type Table[T any] struct {
 type indexManager[T any] struct {
 	db         *database
 	layout     *embedcore.StructLayout
-	indexes    map[string]*uint32MapIndex
+	indexes    map[string]uint32IndexInterface
 	fieldCache map[string]embedcore.FieldOffset
 }
 
@@ -391,7 +391,7 @@ func newIndexManager[T any](db *database, layout *embedcore.StructLayout) *index
 	return &indexManager[T]{
 		db:         db,
 		layout:     layout,
-		indexes:    make(map[string]*uint32MapIndex),
+		indexes:    make(map[string]uint32IndexInterface),
 		fieldCache: fieldCache,
 	}
 }

@@ -1,20 +1,43 @@
 package embeddb
 
 import (
+	"os"
 	"sync"
 )
 
 // allocator manages free space in the database file.
 type allocator struct {
+	file       *os.File
 	nextOffset uint64      // next free offset assuming no reuse
 	freeList   []freeBlock // sorted by offset, coalesced
-	mu         sync.Mutex  // protects freeList and nextOffset
+	actualSize uint64      // actual file size on disk
+	mu         sync.Mutex  // protects freeList, nextOffset, and actualSize
 }
 
 // freeBlock represents a free region in the file.
 type freeBlock struct {
 	offset uint64
 	length uint64
+}
+
+// newAllocator creates a new allocator for the given file.
+func newAllocator(file *os.File) *allocator {
+	info, _ := file.Stat()
+	return &allocator{
+		file:       file,
+		nextOffset: 4096,
+		freeList:   nil,
+		actualSize: uint64(info.Size()),
+	}
+}
+
+// SetFile updates the allocator to use a new file handle (after file reopen).
+func (a *allocator) SetFile(file *os.File) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.file = file
+	info, _ := file.Stat()
+	a.actualSize = uint64(info.Size())
 }
 
 // Allocate returns a free region of at least size bytes.
@@ -38,9 +61,12 @@ func (a *allocator) Allocate(size uint64) (offset uint64, length uint64) {
 			return fb.offset, size
 		}
 	}
-	// No suitable free block: extend the file.
-	offset = a.nextOffset
-	a.nextOffset += size
+	// No suitable free block: extend the file using actualSize.
+	offset = a.actualSize
+	a.actualSize += size
+	a.nextOffset = a.actualSize
+	// Extend the file
+	a.file.Truncate(int64(a.actualSize))
 	return offset, size
 }
 
@@ -102,6 +128,10 @@ func (a *allocator) Reset(nextOffset uint64, freeList []freeBlock) {
 	defer a.mu.Unlock()
 	a.nextOffset = nextOffset
 	a.freeList = freeList
+	// Ensure actualSize is at least nextOffset
+	if a.actualSize < nextOffset {
+		a.actualSize = nextOffset
+	}
 }
 
 // CopyFreeList returns a copy of the current free list (for serialization).
