@@ -379,7 +379,7 @@ type Table[T any] struct {
 type indexManager[T any] struct {
 	db         *database
 	layout     *embedcore.StructLayout
-	indexes    map[string]*uint32MapIndex
+	indexes    map[string]uint32IndexInterface
 	fieldCache map[string]embedcore.FieldOffset
 }
 
@@ -391,7 +391,7 @@ func newIndexManager[T any](db *database, layout *embedcore.StructLayout) *index
 	return &indexManager[T]{
 		db:         db,
 		layout:     layout,
-		indexes:    make(map[string]*uint32MapIndex),
+		indexes:    make(map[string]uint32IndexInterface),
 		fieldCache: fieldCache,
 	}
 }
@@ -430,6 +430,10 @@ func (im *indexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 		if !found {
 			continue
 		}
+		if field.IsSlice {
+			im.indexSliceElement(record, field, idx, recordID)
+			continue
+		}
 		key := embedcore.GetFieldAsString(record, field)
 		if key == "" {
 			continue
@@ -439,10 +443,49 @@ func (im *indexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
 	return nil
 }
 
+func (im *indexManager[T]) indexSliceElement(record *T, field embedcore.FieldOffset, idx uint32IndexInterface, recordID uint32) {
+	v := reflect.ValueOf(record).Elem()
+	for _, parentName := range field.Parent {
+		for i := 0; i < v.NumField(); i++ {
+			if v.Type().Field(i).Name == parentName {
+				v = v.Field(i)
+				break
+			}
+		}
+	}
+	v = v.FieldByName(field.Name)
+	if !v.IsValid() || v.Kind() != reflect.Slice {
+		return
+	}
+	for i := 0; i < v.Len(); i++ {
+		elem := v.Index(i)
+		key := ""
+		switch elem.Kind() {
+		case reflect.String:
+			key = elem.String()
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			key = strconv.FormatInt(elem.Int(), 10)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			key = strconv.FormatUint(elem.Uint(), 10)
+		case reflect.Float32:
+			key = strconv.FormatFloat(elem.Float(), 'f', -1, 32)
+		case reflect.Float64:
+			key = strconv.FormatFloat(elem.Float(), 'f', -1, 64)
+		}
+		if key != "" {
+			idx.Set(key, recordID)
+		}
+	}
+}
+
 func (im *indexManager[T]) UpdateIndexes(record *T, recordID uint32) error {
 	for fieldName, idx := range im.indexes {
 		field, found := im.fieldCache[fieldName]
 		if !found {
+			continue
+		}
+		if field.IsSlice {
+			im.indexSliceElement(record, field, idx, recordID)
 			continue
 		}
 		key := embedcore.GetFieldAsString(record, field)
@@ -1723,6 +1766,8 @@ func (s *Scanner[T]) Close() {
 }
 
 func (t *Table[T]) Count() int {
+	t.db.mu.RLock()
+	defer t.db.mu.RUnlock()
 	entry := t.db.tableCat[t.name]
 	if entry != nil && entry.RecordCount > 0 {
 		return int(entry.RecordCount)

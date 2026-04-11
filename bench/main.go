@@ -115,7 +115,12 @@ func main() {
 		count++
 	}
 	scanner.Close()
-	fmt.Printf("Scan (stream): %v (%d records, %d/sec)\n", time.Since(start), count, int(count*1000)/int(time.Since(start).Milliseconds()))
+	elapsed := time.Since(start)
+	ms := int(elapsed.Milliseconds())
+	if ms == 0 {
+		ms = 1
+	}
+	fmt.Printf("Scan (stream): %v (%d records, %d/sec)\n", elapsed, count, int(count*1000)/ms)
 
 	db.Close()
 }
