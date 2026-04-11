@@ -1766,6 +1766,8 @@ func (s *Scanner[T]) Close() {
 }
 
 func (t *Table[T]) Count() int {
+	t.db.mu.RLock()
+	defer t.db.mu.RUnlock()
 	entry := t.db.tableCat[t.name]
 	if entry != nil && entry.RecordCount > 0 {
 		return int(entry.RecordCount)

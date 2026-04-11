@@ -30,21 +30,22 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 === Benchmarks (300k total records) ===
 
 --- Insert ---
-users.Insert 100k:    1.3s   (76,000/sec)
-orders.Insert 100k:   1.2s   (81,000/sec)
-products.Insert 100k: 1.5s   (68,000/sec)
+users.Insert 100k:    951ms   (105,000/sec)
+orders.Insert 100k:   885ms   (113,000/sec)
+products.Insert 100k: 1.03s   (97,000/sec)
 
-Memory: 85 MB
-Sync:   3.0s
-Disk:   50.85 MB (177 bytes/record)
+Memory: 81.6 MB
+Sync:   3.1s
+Disk:   67.85 MB (237 bytes/record)
 
 --- Query (indexed) ---
-Query by Name:    4.4ms   (225,000/sec)
-Get by PK:        3.2ms   (312,000/sec)
-Query by Age:     3.1s    (320/sec)
+Query by Name:     5.8ms   (172,000/sec)
+Get by PK:         2.9ms   (345,000/sec)
+Query by Age:      5.5s    (181/sec)
 
---- Scan ---
-Scan 100k:       186ms  (537,000 records/sec)
+--- Count & Scan ---
+Count 100k:        1.1µs   (O(1) via btree counter)
+Scan 100k:       293ms    (342,000 records/sec)
 ```
 
 **Note:** B-tree storage trades insert speed for memory efficiency and persistence. The primary key index is stored as a persistent B-tree, providing crash recovery without index rebuild. Use Vacuum() periodically to defragment.

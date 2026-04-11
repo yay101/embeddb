@@ -594,56 +594,57 @@ func (db *database) load() error {
 		}
 	}
 
-	db.pkIndex.Range(func(k []byte, v []byte) bool {
-		return true
-	})
+	// If the B-tree has a valid root, trust its contents -- no record scan needed.
+	// Only fall back to scanning when there's no persisted B-tree (e.g. legacy file
+	// format or first open after creation).
+	if pkIndexBTRoot == 0 {
+		recordStart := int64(64)
+		endOffset := int64(tocOffset)
+		if versionCatalogOffset > 0 && int64(versionCatalogOffset) < stat.Size() {
+			endOffset = int64(versionCatalogOffset)
+		}
+		if endOffset == 0 || endOffset > stat.Size() {
+			endOffset = int64(tocOffset)
+		}
+		if endOffset > stat.Size() {
+			endOffset = stat.Size()
+		}
 
-	recordStart := int64(64)
-	endOffset := int64(tocOffset)
-	if versionCatalogOffset > 0 && int64(versionCatalogOffset) < stat.Size() {
-		endOffset = int64(versionCatalogOffset)
-	}
-	if endOffset == 0 || endOffset > stat.Size() {
-		endOffset = int64(tocOffset)
-	}
-	if endOffset > stat.Size() {
-		endOffset = stat.Size()
-	}
+		if stat.Size() > recordStart && endOffset > recordStart {
+			for offset := recordStart; offset < endOffset; offset++ {
+				hdrBuf := make([]byte, 12)
+				_, err := db.file.ReadAt(hdrBuf, offset)
+				if err != nil || hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
+					continue
+				}
 
-	if stat.Size() > recordStart && endOffset > recordStart {
-		for offset := recordStart; offset < endOffset; offset++ {
-			hdrBuf := make([]byte, 12)
-			_, err := db.file.ReadAt(hdrBuf, offset)
-			if err != nil || hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
-				continue
+				recLen := binary.BigEndian.Uint32(hdrBuf[7:11])
+				totalLen := 12 + int(recLen) + 2
+
+				if int64(offset)+int64(totalLen) > endOffset {
+					break
+				}
+
+				recordBuf := make([]byte, totalLen)
+				copy(recordBuf, hdrBuf)
+				_, err = db.file.ReadAt(recordBuf[12:], offset+12)
+				if err != nil {
+					break
+				}
+
+				tableID := recordBuf[2]
+				recordID := binary.BigEndian.Uint32(recordBuf[3:7])
+				active := recordBuf[11]
+
+				if active == 1 {
+					key := encodePKForIndex(tableID, recordID)
+					val := make([]byte, 8)
+					binary.BigEndian.PutUint64(val, uint64(offset))
+					db.pkIndex.Set(key, val)
+				}
+
+				offset += int64(totalLen) - 1
 			}
-
-			recLen := binary.BigEndian.Uint32(hdrBuf[7:11])
-			totalLen := 12 + int(recLen) + 2
-
-			if int64(offset)+int64(totalLen) > endOffset {
-				break
-			}
-
-			recordBuf := make([]byte, totalLen)
-			copy(recordBuf, hdrBuf)
-			_, err = db.file.ReadAt(recordBuf[12:], offset+12)
-			if err != nil {
-				break
-			}
-
-			tableID := recordBuf[2]
-			recordID := binary.BigEndian.Uint32(recordBuf[3:7])
-			active := recordBuf[11]
-
-			if active == 1 {
-				key := encodePKForIndex(tableID, recordID)
-				val := make([]byte, 8)
-				binary.BigEndian.PutUint64(val, uint64(offset))
-				db.pkIndex.Set(key, val)
-			}
-
-			offset += int64(totalLen) - 1
 		}
 	}
 
@@ -1200,15 +1201,35 @@ func (db *database) Vacuum() error {
 
 	db.alloc.SetFile(db.file)
 
-	db.pkIndex = newMapIndex()
-	db.pkIndexBTRoot = 0
+	// Close old B-tree (if any) before rebuilding.
+	if bti, ok := db.pkIndex.(*btreeMapIndex); ok {
+		bti.bt.Close()
+	}
 
+	// Rebuild a persistent B-tree index from the vacuumed records.
+	newBtIdx, err := newBtreeMapIndex(db, 0)
+	if err != nil {
+		return err
+	}
 	newPkIndex.Range(func(k []byte, v []byte) bool {
-		db.pkIndex.Set(k, v)
+		newBtIdx.Set(k, v)
 		return true
 	})
+	newBtIdx.bt.Sync()
+	db.pkIndex = newBtIdx
+	db.pkIndexBTRoot = newBtIdx.RootOffset()
 
-	return nil
+	// Update the header with the B-tree root offset.
+	header = make([]byte, 64)
+	if _, err := db.file.ReadAt(header, 0); err != nil {
+		return err
+	}
+	binary.LittleEndian.PutUint64(header[56:64], db.pkIndexBTRoot)
+	if _, err := db.file.WriteAt(header, 0); err != nil {
+		return err
+	}
+
+	return db.file.Sync()
 }
 
 type Transaction struct {

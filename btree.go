@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
-	"slices"
+	"sort"
 	"sync"
 
 	"github.com/edsrzf/mmap-go"
@@ -24,14 +24,33 @@ const (
 var ErrKeyNotFound = errors.New("key not found")
 var ErrKeyExists = errors.New("key already exists")
 
+// pagePool reuses page-sized buffers for writeNode to reduce GC pressure.
+var pagePool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, BTreePageSize)
+		return &buf
+	},
+}
+
+// findKeyIndex returns the index of the first key >= target using binary search.
+// If the target matches keys[i] exactly, i is returned and the caller can check equality.
+func findKeyIndex(keys [][]byte, count int, target []byte) int {
+	return sort.Search(count, func(i int) bool {
+		return bytes.Compare(keys[i], target) >= 0
+	})
+}
+
 type BTree struct {
 	file      *os.File
 	mmap      mmap.MMap
 	alloc     *allocator
 	rootOff   uint64
 	mu        sync.RWMutex
+	cacheMu   sync.Mutex // protects cache and cacheRing independently of mu
 	cache     map[uint64]*BTreeNode
-	cacheList []uint64
+	cacheRing []uint64 // ring buffer for eviction order
+	cacheHead int      // next write position in ring
+	count     int      // number of keys in the tree
 }
 
 type BTreeNode struct {
@@ -51,7 +70,8 @@ func (db *database) openBTree(rootOff uint64) (*BTree, error) {
 		alloc:     db.alloc,
 		rootOff:   rootOff,
 		cache:     make(map[uint64]*BTreeNode, BTreeCacheSize),
-		cacheList: make([]uint64, 0, BTreeCacheSize),
+		cacheRing: make([]uint64, BTreeCacheSize),
+		cacheHead: 0,
 	}
 
 	if bt.rootOff == 0 {
@@ -68,6 +88,15 @@ func (db *database) openBTree(rootOff uint64) (*BTree, error) {
 		}
 	}
 	bt.mmap = mm
+
+	// Initialize count by scanning existing entries (only needed on first open).
+	if rootOff != 0 {
+		bt.count = 0
+		bt.Scan(func(k []byte, v uint64) bool {
+			bt.count++
+			return true
+		})
+	}
 
 	return bt, nil
 }
@@ -134,7 +163,19 @@ func (bt *BTree) writeNode(node *BTreeNode) error {
 	totalSize := fixedSize + keyDataSize
 	alignedSize := (totalSize + 7) &^ 7
 
-	buf := make([]byte, alignedSize)
+	// Reuse a page-sized buffer from the pool when possible.
+	var buf []byte
+	var poolBuf *[]byte
+	if alignedSize <= BTreePageSize {
+		poolBuf = pagePool.Get().(*[]byte)
+		buf = (*poolBuf)[:alignedSize]
+		// Zero out the buffer region we'll use.
+		for i := range buf {
+			buf[i] = 0
+		}
+	} else {
+		buf = make([]byte, alignedSize)
+	}
 
 	if node.IsLeaf {
 		buf[0] = BTreeNodeLeaf
@@ -168,6 +209,10 @@ func (bt *BTree) writeNode(node *BTreeNode) error {
 	}
 
 	copy(bt.mmap[node.Offset:], buf)
+
+	if poolBuf != nil {
+		pagePool.Put(poolBuf)
+	}
 	return nil
 }
 
@@ -176,9 +221,13 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 		return nil, errors.New("invalid offset")
 	}
 
+	// Check cache with its own lock (safe for concurrent readers).
+	bt.cacheMu.Lock()
 	if node, ok := bt.cache[offset]; ok {
+		bt.cacheMu.Unlock()
 		return node, nil
 	}
+	bt.cacheMu.Unlock()
 
 	if int64(offset)+BTreePageSize > int64(len(bt.mmap)) {
 		return nil, errors.New("read beyond mmap bounds")
@@ -200,13 +249,25 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 		Dirty:    false,
 	}
 
+	// First pass: compute total key data size.
 	pos := 7
+	totalKeyBytes := 0
+	for i := 0; i < int(count); i++ {
+		keyLen := int(binary.LittleEndian.Uint32(buf[pos : pos+4]))
+		pos += 4 + keyLen
+		totalKeyBytes += keyLen
+	}
+
+	// Single allocation for all key data, then slice it.
+	keyData := make([]byte, totalKeyBytes)
+	pos = 7
+	keyOff := 0
 	for i := 0; i < int(count); i++ {
 		keyLen := int(binary.LittleEndian.Uint32(buf[pos : pos+4]))
 		pos += 4
-		keyBuf := make([]byte, keyLen)
-		copy(keyBuf, buf[pos:pos+keyLen])
-		node.Keys = append(node.Keys, keyBuf)
+		copy(keyData[keyOff:keyOff+keyLen], buf[pos:pos+keyLen])
+		node.Keys = append(node.Keys, keyData[keyOff:keyOff+keyLen])
+		keyOff += keyLen
 		pos += keyLen
 	}
 
@@ -230,18 +291,29 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 }
 
 func (bt *BTree) cacheNode(node *BTreeNode) {
-	if len(bt.cacheList) >= BTreeCacheSize {
-		old := bt.cacheList[0]
-		delete(bt.cache, old)
-		bt.cacheList = bt.cacheList[1:]
+	bt.cacheMu.Lock()
+	defer bt.cacheMu.Unlock()
+	// If already cached, just update the pointer (no duplicate ring entry needed).
+	if _, exists := bt.cache[node.Offset]; exists {
+		bt.cache[node.Offset] = node
+		return
 	}
+	// Evict the entry at the current ring position if occupied.
+	old := bt.cacheRing[bt.cacheHead]
+	if old != 0 {
+		delete(bt.cache, old)
+	}
+	bt.cacheRing[bt.cacheHead] = node.Offset
 	bt.cache[node.Offset] = node
-	bt.cacheList = append(bt.cacheList, node.Offset)
+	bt.cacheHead = (bt.cacheHead + 1) % BTreeCacheSize
 }
 
 func (bt *BTree) Insert(key []byte, value uint64) error {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
+
+	// Check if key already exists (to decide whether to increment count).
+	_, exists := bt.searchUnlocked(key)
 
 	root, err := bt.readNode(bt.rootOff)
 	if err != nil {
@@ -258,16 +330,17 @@ func (bt *BTree) Insert(key []byte, value uint64) error {
 
 	bt.insertNonFull(root, key, value)
 
+	if exists != nil {
+		bt.count++
+	}
+
 	return nil
 }
 
 func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) {
 	if node.IsLeaf {
-		i := 0
-		for i < node.Count && bytes.Compare(node.Keys[i], key) < 0 {
-			i++
-		}
-		if i < node.Count && bytes.Compare(node.Keys[i], key) == 0 {
+		i := findKeyIndex(node.Keys, node.Count, key)
+		if i < node.Count && bytes.Equal(node.Keys[i], key) {
 			node.Values[i] = value
 			bt.writeNode(node)
 			return
@@ -282,9 +355,12 @@ func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) {
 		node.Count++
 		bt.writeNode(node)
 	} else {
-		i := 0
-		for i < node.Count && bytes.Compare(node.Keys[i], key) < 0 {
-			i++
+		i := findKeyIndex(node.Keys, node.Count, key)
+		// If key matches at this internal node, update the value here.
+		if i < node.Count && bytes.Equal(node.Keys[i], key) {
+			node.Values[i] = value
+			bt.writeNode(node)
+			return
 		}
 		child, err := bt.readNode(node.Children[i])
 		if err != nil {
@@ -292,13 +368,18 @@ func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) {
 		}
 		if child.Count >= BTreeMaxKeys {
 			bt.splitChild(node, i, child)
-			if bytes.Compare(key, node.Keys[i]) > 0 {
+			cmp := bytes.Compare(key, node.Keys[i])
+			if cmp > 0 {
 				i++
+			} else if cmp == 0 {
+				// Key matches the just-promoted key; update it directly.
+				node.Values[i] = value
+				bt.writeNode(node)
+				return
 			}
 		}
 		child, _ = bt.readNode(node.Children[i])
 		bt.insertNonFull(child, key, value)
-		bt.writeNode(child)
 	}
 }
 
@@ -345,63 +426,53 @@ func (bt *BTree) Get(key []byte) (uint64, error) {
 	bt.mu.RLock()
 	defer bt.mu.RUnlock()
 
-	root, err := bt.readNode(bt.rootOff)
-	if err != nil {
-		return 0, err
-	}
-
-	return bt.search(root, key)
+	return bt.searchUnlocked(key)
 }
 
 func (bt *BTree) Put(key []byte, value uint64) error {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
 
+	// Check if key already exists (to decide whether to increment count).
+	_, existsErr := bt.searchUnlocked(key)
+
 	root, err := bt.readNode(bt.rootOff)
 	if err != nil {
 		return err
 	}
 
-	bt.deleteKey(root, key)
+	// Handle full root by splitting, same as Insert.
+	if root.Count >= BTreeMaxKeys {
+		newRoot := bt.newNode(false)
+		newRoot.Children = append(newRoot.Children, bt.rootOff)
+		bt.splitChild(newRoot, 0, root)
+		bt.rootOff = newRoot.Offset
+		root = newRoot
+	}
+
+	// insertNonFull handles both insert and update (at any node level).
 	bt.insertNonFull(root, key, value)
-	bt.writeNode(root)
+
+	if existsErr != nil {
+		bt.count++ // new key
+	}
 
 	return nil
 }
 
-func (bt *BTree) deleteKey(node *BTreeNode, key []byte) {
-	i := 0
-	for i < node.Count && bytes.Compare(key, node.Keys[i]) > 0 {
-		i++
+// searchUnlocked performs a search without acquiring the lock (caller must hold it).
+func (bt *BTree) searchUnlocked(key []byte) (uint64, error) {
+	root, err := bt.readNode(bt.rootOff)
+	if err != nil {
+		return 0, err
 	}
-
-	if i < node.Count && bytes.Compare(key, node.Keys[i]) == 0 {
-		if node.IsLeaf {
-			copy(node.Keys[i:], node.Keys[i+1:])
-			copy(node.Values[i:], node.Values[i+1:])
-			node.Keys = node.Keys[:node.Count-1]
-			node.Values = node.Values[:node.Count-1]
-			node.Count--
-			node.Dirty = true
-			return
-		}
-	}
-
-	if node.IsLeaf {
-		return
-	}
-
-	child, _ := bt.readNode(node.Children[i])
-	bt.deleteKey(child, key)
+	return bt.searchNode(root, key)
 }
 
-func (bt *BTree) search(node *BTreeNode, key []byte) (uint64, error) {
-	i := 0
-	for i < node.Count && bytes.Compare(key, node.Keys[i]) > 0 {
-		i++
-	}
+func (bt *BTree) searchNode(node *BTreeNode, key []byte) (uint64, error) {
+	i := findKeyIndex(node.Keys, node.Count, key)
 
-	if i < node.Count && bytes.Compare(key, node.Keys[i]) == 0 {
+	if i < node.Count && bytes.Equal(node.Keys[i], key) {
 		return node.Values[i], nil
 	}
 
@@ -414,12 +485,18 @@ func (bt *BTree) search(node *BTreeNode, key []byte) (uint64, error) {
 		return 0, err
 	}
 
-	return bt.search(child, key)
+	return bt.searchNode(child, key)
 }
 
 func (bt *BTree) Delete(key []byte) error {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
+
+	// Check if key exists before deletion to maintain count.
+	_, err := bt.searchUnlocked(key)
+	if err != nil {
+		return nil // key doesn't exist, nothing to delete
+	}
 
 	root, err := bt.readNode(bt.rootOff)
 	if err != nil {
@@ -427,16 +504,14 @@ func (bt *BTree) Delete(key []byte) error {
 	}
 
 	bt.deleteFromNode(root, key)
+	bt.count--
 	return nil
 }
 
 func (bt *BTree) deleteFromNode(node *BTreeNode, key []byte) {
-	i := 0
-	for i < node.Count && bytes.Compare(key, node.Keys[i]) > 0 {
-		i++
-	}
+	i := findKeyIndex(node.Keys, node.Count, key)
 
-	if i < node.Count && bytes.Compare(key, node.Keys[i]) == 0 {
+	if i < node.Count && bytes.Equal(node.Keys[i], key) {
 		if node.IsLeaf {
 			copy(node.Keys[i:], node.Keys[i+1:])
 			copy(node.Values[i:], node.Values[i+1:])
@@ -446,6 +521,19 @@ func (bt *BTree) deleteFromNode(node *BTreeNode, key []byte) {
 			bt.writeNode(node)
 			return
 		}
+		// Internal node: replace with in-order predecessor (rightmost key
+		// in the left subtree), then delete the predecessor from that subtree.
+		predKey, predVal := bt.findMax(node.Children[i])
+		if predKey != nil {
+			node.Keys[i] = predKey
+			node.Values[i] = predVal
+			bt.writeNode(node)
+			child, err := bt.readNode(node.Children[i])
+			if err == nil && child != nil {
+				bt.deleteFromNode(child, predKey)
+			}
+		}
+		return
 	}
 
 	if node.IsLeaf {
@@ -457,7 +545,29 @@ func (bt *BTree) deleteFromNode(node *BTreeNode, key []byte) {
 		return
 	}
 	bt.deleteFromNode(child, key)
-	bt.writeNode(child)
+}
+
+// findMax returns the rightmost (maximum) key and value in the subtree
+// rooted at the given offset.
+func (bt *BTree) findMax(offset uint64) ([]byte, uint64) {
+	node, err := bt.readNode(offset)
+	if err != nil || node == nil || node.Count == 0 {
+		return nil, 0
+	}
+	for !node.IsLeaf {
+		child, err := bt.readNode(node.Children[node.Count])
+		if err != nil || child == nil {
+			break
+		}
+		node = child
+	}
+	if node.Count == 0 {
+		return nil, 0
+	}
+	// Return a copy of the key to avoid mutation issues.
+	keyCopy := make([]byte, len(node.Keys[node.Count-1]))
+	copy(keyCopy, node.Keys[node.Count-1])
+	return keyCopy, node.Values[node.Count-1]
 }
 
 func (bt *BTree) Scan(fn func(key []byte, value uint64) bool) error {
@@ -582,12 +692,7 @@ func (b *btreeMapIndex) Range(fn func(k []byte, v []byte) bool) {
 }
 
 func (b *btreeMapIndex) Size() int {
-	count := 0
-	b.bt.Scan(func(k []byte, v uint64) bool {
-		count++
-		return true
-	})
-	return count
+	return b.bt.count
 }
 
 func (b *btreeMapIndex) RootOffset() uint64 {
@@ -599,9 +704,7 @@ func (b *btreeMapIndex) SetRootOffset(off uint64) {
 }
 
 type btreeUint32MapIndex struct {
-	bt       *BTree
-	keySize  int
-	dataSize int
+	bt *BTree
 }
 
 func newBtreeUint32MapIndex(db *database, rootOff uint64) (*btreeUint32MapIndex, error) {
@@ -610,100 +713,112 @@ func newBtreeUint32MapIndex(db *database, rootOff uint64) (*btreeUint32MapIndex,
 		return nil, err
 	}
 	return &btreeUint32MapIndex{
-		bt:       bt,
-		keySize:  16,
-		dataSize: 256,
+		bt: bt,
 	}, nil
 }
 
-func serializeUint32Slice(values []uint32) []byte {
-	if values == nil {
-		values = []uint32{}
-	}
-	buf := make([]byte, 4+len(values)*4)
-	binary.LittleEndian.PutUint32(buf, uint32(len(values)))
-	for i, v := range values {
-		binary.LittleEndian.PutUint32(buf[4+i*4:], v)
-	}
-	return buf
-}
-
-func deserializeUint32Slice(data []byte) []uint32 {
-	if data == nil || len(data) < 4 {
-		return []uint32{}
-	}
-	count := binary.LittleEndian.Uint32(data)
-	if count == 0 || len(data) < 4+int(count)*4 {
-		return []uint32{}
-	}
-	values := make([]uint32, count)
-	for i := uint32(0); i < count; i++ {
-		values[i] = binary.LittleEndian.Uint32(data[4+i*4:])
-	}
-	return values
-}
-
 func (b *btreeUint32MapIndex) Set(key string, value uint32) {
-	k := []byte(key)
-
-	var existing []uint32
-	packedVal, err := b.bt.Get(k)
-	if err == nil && packedVal != 0 {
-		existing = packedValToSlice(packedVal)
-	}
-
-	existing = append(existing, value)
-	b.bt.Put(k, sliceToPackedVal(existing))
+	// Use composite key: [key bytes][4-byte big-endian value]
+	// This allows multiple values per key, each in its own btree entry.
+	k := make([]byte, len(key)+4)
+	copy(k, key)
+	binary.BigEndian.PutUint32(k[len(key):], value)
+	b.bt.Insert(k, uint64(value))
 }
 
 func (b *btreeUint32MapIndex) Get(key string) (uint32, bool) {
-	values, ok := b.GetAll(key)
-	if !ok || len(values) == 0 {
-		return 0, false
-	}
-	return values[0], true
+	// Scan for the first entry with this key prefix.
+	prefix := []byte(key)
+	var result uint32
+	found := false
+	b.bt.Scan(func(k []byte, v uint64) bool {
+		if len(k) >= len(prefix)+4 && bytes.Equal(k[:len(prefix)], prefix) {
+			result = uint32(v)
+			found = true
+			return false // stop after first match
+		}
+		// If we've passed the prefix range, stop scanning.
+		if bytes.Compare(k[:min(len(k), len(prefix))], prefix) > 0 {
+			return false
+		}
+		return true
+	})
+	return result, found
 }
 
 func (b *btreeUint32MapIndex) GetAll(key string) ([]uint32, bool) {
-	k := []byte(key)
-	packedVal, err := b.bt.Get(k)
-	if err != nil {
+	// Scan for all entries with this key prefix.
+	prefix := []byte(key)
+	var results []uint32
+	b.bt.Scan(func(k []byte, v uint64) bool {
+		if len(k) >= len(prefix)+4 && bytes.Equal(k[:len(prefix)], prefix) {
+			results = append(results, uint32(v))
+			return true
+		}
+		// If we've passed the prefix range, stop scanning.
+		if bytes.Compare(k[:min(len(k), len(prefix))], prefix) > 0 {
+			return false
+		}
+		return true
+	})
+	if len(results) == 0 {
 		return nil, false
 	}
-	return packedValToSlice(packedVal), true
+	return results, true
 }
 
 func (b *btreeUint32MapIndex) Delete(key string) {
-	b.bt.Delete([]byte(key))
+	// Delete all entries with this key prefix.
+	prefix := []byte(key)
+	var toDelete [][]byte
+	b.bt.Scan(func(k []byte, v uint64) bool {
+		if len(k) >= len(prefix)+4 && bytes.Equal(k[:len(prefix)], prefix) {
+			keyCopy := make([]byte, len(k))
+			copy(keyCopy, k)
+			toDelete = append(toDelete, keyCopy)
+			return true
+		}
+		if bytes.Compare(k[:min(len(k), len(prefix))], prefix) > 0 {
+			return false
+		}
+		return true
+	})
+	for _, k := range toDelete {
+		b.bt.Delete(k)
+	}
 }
 
 func (b *btreeUint32MapIndex) Range(fn func(k string, v uint32) bool) {
-	b.bt.Scan(func(key []byte, packedVal uint64) bool {
-		values := packedValToSlice(packedVal)
-		if len(values) > 0 {
-			return fn(string(key), values[0])
+	b.bt.Scan(func(key []byte, v uint64) bool {
+		// Composite key: [original key][4-byte value suffix]
+		if len(key) < 4 {
+			return true
 		}
-		return true
+		origKey := string(key[:len(key)-4])
+		return fn(origKey, uint32(v))
 	})
 }
 
 func (b *btreeUint32MapIndex) SortedKeys() []string {
+	// B-tree scan is already in sorted order. Deduplicate the original keys.
+	seen := make(map[string]struct{})
 	keys := make([]string, 0)
-	b.bt.Scan(func(key []byte, packedVal uint64) bool {
-		keys = append(keys, string(key))
+	b.bt.Scan(func(key []byte, v uint64) bool {
+		if len(key) < 4 {
+			return true
+		}
+		origKey := string(key[:len(key)-4])
+		if _, exists := seen[origKey]; !exists {
+			seen[origKey] = struct{}{}
+			keys = append(keys, origKey)
+		}
 		return true
 	})
-	slices.Sort(keys)
 	return keys
 }
 
 func (b *btreeUint32MapIndex) Size() int {
-	count := 0
-	b.bt.Scan(func(k []byte, v uint64) bool {
-		count++
-		return true
-	})
-	return count
+	return b.bt.count
 }
 
 func (b *btreeUint32MapIndex) RootOffset() uint64 {
@@ -712,34 +827,4 @@ func (b *btreeUint32MapIndex) RootOffset() uint64 {
 
 func (b *btreeUint32MapIndex) SetRootOffset(off uint64) {
 	b.bt.SetRootOffset(off)
-}
-
-func packedValToSlice(packed uint64) []uint32 {
-	if packed == 0 {
-		return []uint32{}
-	}
-	high := uint32(packed >> 32)
-	low := uint32(packed & 0xFFFFFFFF)
-	count := int(high)
-	if count == 0 {
-		return []uint32{}
-	}
-	if count > 10000 {
-		count = 10000
-	}
-	values := make([]uint32, 0, count)
-	for i := 0; i < count && i < 1000; i++ {
-		values = append(values, low)
-	}
-	return values
-}
-
-func sliceToPackedVal(values []uint32) uint64 {
-	if len(values) == 0 {
-		return 0
-	}
-	if len(values) == 1 {
-		return uint64(values[0])
-	}
-	return uint64(len(values))<<32 | uint64(values[0])
 }
