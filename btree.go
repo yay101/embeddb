@@ -493,7 +493,16 @@ func (bt *BTree) scanNode(node *BTreeNode, fn func([]byte, uint64) bool) error {
 			continue
 		}
 
+		// In-order traversal: child[0], key[0], child[1], key[1], ..., key[n-1], child[n]
+		// childIdx tracks how many children we've visited so far.
+		// After visiting child[k], we emit key[k] before visiting child[k+1].
 		if f.childIdx <= f.node.Count {
+			// Emit key[childIdx-1] if we just finished a child (childIdx > 0)
+			if f.childIdx > 0 && f.childIdx-1 < f.node.Count {
+				if !fn(f.node.Keys[f.childIdx-1], f.node.Values[f.childIdx-1]) {
+					return nil
+				}
+			}
 			child, err := bt.readNode(f.node.Children[f.childIdx])
 			if err != nil {
 				return err

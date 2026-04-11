@@ -869,10 +869,6 @@ func (db *database) flush() error {
 		recordDataStart += int64(totalLen)
 	}
 
-	for k, v := range updatedIndex {
-		db.pkIndex.Set([]byte(k), v)
-	}
-
 	for key, versionOffsets := range updatedVersionOffsets {
 		versions := db.versionIndex.GetVersions([]byte(key))
 		for _, v := range versions {
@@ -883,7 +879,37 @@ func (db *database) flush() error {
 		}
 	}
 
-	catOffset := recordDataStart
+	// Rebuild the B-tree from scratch so its nodes are allocated contiguously
+	// after the compacted records.  The old B-tree nodes are scattered
+	// throughout the file and will be discarded by the truncation below.
+	if bti, ok := db.pkIndex.(*btreeMapIndex); ok {
+		bti.bt.Close()
+	}
+
+	// Reset allocator so new B-tree nodes are allocated right after the records.
+	// Ensure a minimum offset so we don't overwrite the file header.
+	btreeStart := uint64(recordDataStart)
+	if btreeStart < 4096 {
+		btreeStart = 4096
+	}
+	db.alloc.Reset(btreeStart, nil)
+	// Force actualSize to match so Allocate extends from the right place.
+	db.file.Truncate(int64(btreeStart))
+	db.alloc.SetFile(db.file)
+
+	newBtIdx, err := newBtreeMapIndex(db, 0)
+	if err != nil {
+		return err
+	}
+	for k, v := range updatedIndex {
+		newBtIdx.Set([]byte(k), v)
+	}
+	newBtIdx.bt.Sync()
+	db.pkIndex = newBtIdx
+	db.pkIndexBTRoot = newBtIdx.RootOffset()
+
+	// The allocator's nextOffset now sits past the last B-tree node.
+	catOffset := int64(db.alloc.nextOffset)
 
 	binary.LittleEndian.PutUint32(header[36:40], uint32(catOffset))
 
@@ -898,6 +924,7 @@ func (db *database) flush() error {
 	versionCatOffset := catOffset + int64(len(encodedCat))
 	binary.LittleEndian.PutUint32(header[48:56], uint32(versionCatOffset))
 	binary.LittleEndian.PutUint64(header[56:64], db.pkIndexBTRoot)
+	binary.LittleEndian.PutUint64(header[40:48], db.alloc.nextOffset)
 
 	if _, err := db.file.WriteAt(encodedVersionCat, versionCatOffset); err != nil {
 		return err
@@ -911,6 +938,16 @@ func (db *database) flush() error {
 	if _, err := db.file.WriteAt(header, 0); err != nil {
 		return err
 	}
+
+	// Re-open the B-tree so it re-mmaps the final file.
+	if bti, ok := db.pkIndex.(*btreeMapIndex); ok {
+		bti.bt.Close()
+	}
+	reopenedBtIdx, err := newBtreeMapIndex(db, db.pkIndexBTRoot)
+	if err != nil {
+		return err
+	}
+	db.pkIndex = reopenedBtIdx
 
 	return db.file.Sync()
 }
