@@ -3,6 +3,7 @@ package embeddb
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 type TestRecord struct {
@@ -766,4 +767,152 @@ func makeString(n int) string {
 		b[i] = byte('a' + (i % 26))
 	}
 	return string(b)
+}
+
+type TimeRecord struct {
+	ID        uint32 `db:"id,primary"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+func TestTimeFieldRoundTrip(t *testing.T) {
+	os.Remove("/tmp/test_time_basic.db")
+	defer os.Remove("/tmp/test_time_basic.db")
+
+	db, err := Open("/tmp/test_time_basic.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[TimeRecord](db, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		ts   time.Time
+	}{
+		{"nanosecond_precision", time.Date(2024, 6, 15, 10, 30, 45, 123456789, time.UTC)},
+		{"microsecond_precision", time.Date(2024, 1, 1, 12, 0, 0, 500000000, time.UTC)},
+		{"millisecond_precision", time.Date(2023, 12, 31, 23, 59, 59, 999000000, time.UTC)},
+		{"zero_nano", time.Date(2024, 3, 15, 8, 30, 0, 0, time.UTC)},
+		{"epoch", time.Unix(0, 0).UTC()},
+		{"pre_epoch", time.Date(1969, 12, 31, 23, 59, 59, 123456789, time.UTC)},
+		{"distant_future", time.Date(2100, 1, 1, 0, 0, 0, 999999999, time.UTC)},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &TimeRecord{CreatedAt: tc.ts, UpdatedAt: tc.ts}
+			id, err := tbl.Insert(rec)
+			if err != nil {
+				t.Fatalf("Insert %s failed: %v", tc.name, err)
+			}
+
+			got, err := tbl.Get(id)
+			if err != nil {
+				t.Fatalf("Get %s failed: %v", tc.name, err)
+			}
+
+			if !got.CreatedAt.Equal(tc.ts) {
+				t.Errorf("case %d %s: CreatedAt mismatch: got %v (nano=%d), want %v (nano=%d)",
+					i, tc.name, got.CreatedAt, got.CreatedAt.Nanosecond(), tc.ts, tc.ts.Nanosecond())
+			}
+			if !got.UpdatedAt.Equal(tc.ts) {
+				t.Errorf("case %d %s: UpdatedAt mismatch: got %v (nano=%d), want %v (nano=%d)",
+					i, tc.name, got.UpdatedAt, got.UpdatedAt.Nanosecond(), tc.ts, tc.ts.Nanosecond())
+			}
+		})
+	}
+}
+
+func TestTimeFieldUpdate(t *testing.T) {
+	os.Remove("/tmp/test_time_update.db")
+	defer os.Remove("/tmp/test_time_update.db")
+
+	db, err := Open("/tmp/test_time_update.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[TimeRecord](db, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts1 := time.Date(2024, 1, 1, 10, 0, 0, 123456789, time.UTC)
+	ts2 := time.Date(2024, 6, 15, 14, 30, 0, 987654321, time.UTC)
+
+	id, err := tbl.Insert(&TimeRecord{CreatedAt: ts1, UpdatedAt: ts1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = tbl.Update(id, &TimeRecord{ID: id, CreatedAt: ts2, UpdatedAt: ts2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := tbl.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !got.CreatedAt.Equal(ts2) {
+		t.Errorf("CreatedAt after update: got %v, want %v", got.CreatedAt, ts2)
+	}
+	if !got.UpdatedAt.Equal(ts2) {
+		t.Errorf("UpdatedAt after update: got %v, want %v", got.UpdatedAt, ts2)
+	}
+}
+
+func TestTimeFieldPersistence(t *testing.T) {
+	os.Remove("/tmp/test_time_persist.db")
+
+	ts := time.Date(2024, 7, 20, 15, 45, 30, 500999999, time.UTC)
+
+	{
+		db, err := Open("/tmp/test_time_persist.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tbl, err := Use[TimeRecord](db, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = tbl.Insert(&TimeRecord{CreatedAt: ts, UpdatedAt: ts})
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+	}
+
+	{
+		db2, err := Open("/tmp/test_time_persist.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db2.Close()
+		tbl2, err := Use[TimeRecord](db2, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := tbl2.Get(uint32(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.CreatedAt.Equal(ts) {
+			t.Errorf("CreatedAt after reopen: got %v (nano=%d), want %v (nano=%d)",
+				got.CreatedAt, got.CreatedAt.Nanosecond(), ts, ts.Nanosecond())
+		}
+		if !got.UpdatedAt.Equal(ts) {
+			t.Errorf("UpdatedAt after reopen: got %v (nano=%d), want %v (nano=%d)",
+				got.UpdatedAt, got.UpdatedAt.Nanosecond(), ts, ts.Nanosecond())
+		}
+	}
+
+	os.Remove("/tmp/test_time_persist.db")
 }

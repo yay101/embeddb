@@ -502,7 +502,12 @@ func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint32,
 	if !ok {
 		return nil, fmt.Errorf("no index for field %s", fieldName)
 	}
-	key := fmt.Sprintf("%v", value)
+	var key string
+	if t, ok := value.(time.Time); ok {
+		key = strconv.FormatInt(t.UnixNano(), 10)
+	} else {
+		key = fmt.Sprintf("%v", value)
+	}
 	ids, ok := idx.GetAll(key)
 	if !ok {
 		return []uint32{}, nil
@@ -530,12 +535,18 @@ func parseIndexKey(key string, fieldKind reflect.Kind) interface{} {
 		if v, err := strconv.ParseBool(key); err == nil {
 			return v
 		}
+	case reflect.Struct:
+		if v, err := strconv.ParseInt(key, 10, 64); err == nil {
+			return time.Unix(0, v).UTC()
+		}
 	}
 	return key
 }
 
 func valueToIndexKey(val any, fieldKind reflect.Kind) string {
 	switch v := val.(type) {
+	case time.Time:
+		return strconv.FormatInt(v.UnixNano(), 10)
 	case int:
 		return strconv.FormatInt(int64(v), 10)
 	case int8:
@@ -1500,6 +1511,19 @@ func (t *Table[T]) findField(fieldName string) (embedcore.FieldOffset, error) {
 }
 
 func compareValues(a, b interface{}) int {
+	if aTime, ok := a.(time.Time); ok {
+		bTime, ok := b.(time.Time)
+		if !ok {
+			return 0
+		}
+		if aTime.Before(bTime) {
+			return -1
+		} else if aTime.After(bTime) {
+			return 1
+		}
+		return 0
+	}
+
 	aVal := reflect.ValueOf(a)
 
 	switch aVal.Kind() {
@@ -2047,10 +2071,10 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 			}
 		case reflect.Struct:
 			if fieldOffset.IsTime {
-				var unixVal int64
-				unixVal, data, err = embedcore.DecodeVarint(data)
+				var nanoVal int64
+				nanoVal, data, err = embedcore.DecodeVarint(data)
 				if err == nil {
-					val = time.Unix(unixVal, 0).UTC()
+					val = time.Unix(0, nanoVal).UTC()
 				}
 			} else {
 				endIdx := bytes.IndexByte(data, valueEndMarker)
@@ -2153,7 +2177,7 @@ func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
 			buf = embedcore.EncodeFloat64(buf, float64(embedcore.GetFloat32Field(record, field)))
 		case reflect.Struct:
 			if field.IsTime {
-				buf = embedcore.EncodeVarint(buf, embedcore.GetTimeField(record, field).Unix())
+				buf = embedcore.EncodeVarint(buf, embedcore.GetTimeField(record, field).UnixNano())
 			}
 		case reflect.Slice:
 			if field.IsBytes {
@@ -2331,7 +2355,7 @@ func (t *Table[T]) encodeSliceOfStructs(record *T, field embedcore.FieldOffset, 
 		elemPtr := elem.Addr().Interface()
 
 		for key, f := range elemLayout.FieldOffsets {
-			if f.Type == reflect.Struct {
+			if f.IsStruct && !f.IsTime {
 				continue
 			}
 
@@ -2367,6 +2391,10 @@ func (t *Table[T]) encodeSliceOfStructs(record *T, field embedcore.FieldOffset, 
 				buf = embedcore.EncodeFloat64(buf, embedcore.GetFloat64Field(elemPtr, f))
 			case reflect.Float32:
 				buf = embedcore.EncodeFloat64(buf, float64(embedcore.GetFloat32Field(elemPtr, f)))
+			case reflect.Struct:
+				if f.IsTime {
+					buf = embedcore.EncodeVarint(buf, embedcore.GetTimeField(elemPtr, f).UnixNano())
+				}
 			default:
 				buf = buf[:len(buf)-2]
 				continue
@@ -2452,6 +2480,24 @@ func (t *Table[T]) decodeSliceOfStructs(data []byte, fieldOffset embedcore.Field
 				v, data, decodeErr = embedcore.DecodeFloat64(data)
 				if decodeErr == nil {
 					val = float32(v)
+				}
+			case reflect.Struct:
+				if f.IsTime {
+					var nanoVal int64
+					nanoVal, data, decodeErr = embedcore.DecodeVarint(data)
+					if decodeErr == nil {
+						val = time.Unix(0, nanoVal).UTC()
+					}
+				} else {
+					endIdx := bytes.IndexByte(data, valueEndMarker)
+					if endIdx == -1 {
+						endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
+					}
+					if endIdx == -1 {
+						break
+					}
+					data = data[endIdx+1:]
+					continue
 				}
 			default:
 				endIdx := bytes.IndexByte(data, valueEndMarker)
