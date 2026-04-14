@@ -9,6 +9,5 @@ require (
 
 require golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e // indirect
 
-// v1.7.3 - Fix Upsert not setting primary key before insert
-// - Fix Upsert not setting pk value in record before Insert
-// - Add setPKValue call to ensure record has correct ID before saving
+// v1.7.4 - Add TestUpsertWithIntPK test
+// - Test Upsert with int primary key to verify provided ID is used
