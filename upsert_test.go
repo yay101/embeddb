@@ -1,7 +1,11 @@
 package embeddb
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"math/rand"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -460,9 +464,19 @@ func makeLargeString(n int) string {
 	return string(b)
 }
 
+func fetchURL(url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	buf, err := io.ReadAll(resp.Body)
+	return buf, err
+}
+
 type CityInspection struct {
 	ID                string `db:"id,primary"`
-	CertificateNumber int    `db:"index"`
+	CertificateNumber any    `db:"index"`
 	BusinessName      string `db:"index"`
 	Date              string
 	Result            string `db:"index"`
@@ -471,10 +485,117 @@ type CityInspection struct {
 }
 
 type InspectionAddress struct {
-	City   string
+	City   interface{}
 	Zip    interface{}
-	Street string
+	Street interface{}
 	Number interface{}
+}
+
+func TestCityInspectionsFull(t *testing.T) {
+	os.Remove("/tmp/city_inspections_full.db")
+	defer os.Remove("/tmp/city_inspections_full.db")
+
+	jsonData, err := fetchURL("https://raw.githubusercontent.com/ozlerhakan/mongodb-json-files/master/datasets/city_inspections.json")
+	if err != nil {
+		t.Skipf("skipping: failed to fetch JSON: %v", err)
+	}
+
+	records := make([]CityInspection, 0, 100000)
+	dec := json.NewDecoder(bytes.NewReader(jsonData))
+	for dec.More() {
+		var rec CityInspection
+		if err := dec.Decode(&rec); err != nil {
+			t.Fatalf("decode error at %d: %v", len(records), err)
+		}
+		records = append(records, rec)
+	}
+
+	total := len(records)
+	if total < 1000 {
+		t.Skipf("skipping: not enough records (%d)", total)
+	}
+
+	t.Logf("Fetched %d records", total)
+
+	db, err := Open("/tmp/city_inspections_full.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tbl, err := Use[CityInspection](db, "inspections")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seen := make(map[string]bool)
+	duplicates := 0
+	uniqueRecords := make([]CityInspection, 0, len(records))
+	for i, rec := range records {
+		if seen[rec.ID] {
+			duplicates++
+			continue
+		}
+		seen[rec.ID] = true
+		uniqueRecords = append(uniqueRecords, rec)
+		_, _, err := tbl.Upsert(rec.ID, &rec)
+		if err != nil {
+			t.Fatalf("upsert failed at %d: %v", i, err)
+		}
+	}
+	t.Logf("Inserted %d unique records, %d duplicates in JSON", len(uniqueRecords), duplicates)
+
+	db.Close()
+
+	db2, err := Open("/tmp/city_inspections_full.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	tbl2, err := Use[CityInspection](db2, "inspections")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count := tbl2.Count()
+	t.Logf("After reopen: Count()=%d", count)
+	if count != len(uniqueRecords) {
+		t.Errorf("Count() = %d, want %d", count, len(uniqueRecords))
+	}
+
+	rand.Seed(12345)
+	failed := 0
+	for i := 0; i < 1000; i++ {
+		randIdx := rand.Intn(len(uniqueRecords))
+		original := uniqueRecords[randIdx]
+
+		got, err := tbl2.Get(original.ID)
+		if err != nil {
+			t.Errorf("Get(%s) failed: %v", original.ID, err)
+			failed++
+			continue
+		}
+
+		if got.BusinessName != original.BusinessName {
+			t.Errorf("record %s: BusinessName mismatch: got %q, want %q",
+				original.ID, got.BusinessName, original.BusinessName)
+			failed++
+		}
+		if got.CertificateNumber != original.CertificateNumber {
+			t.Errorf("record %s: CertificateNumber mismatch: got %d, want %d",
+				original.ID, got.CertificateNumber, original.CertificateNumber)
+			failed++
+		}
+		if got.Result != original.Result {
+			t.Errorf("record %s: Result mismatch: got %q, want %q",
+				original.ID, got.Result, original.Result)
+			failed++
+		}
+	}
+
+	if failed > 0 {
+		t.Errorf("%d / 1000 random records failed verification", failed)
+	}
 }
 
 func TestCityInspections(t *testing.T) {
