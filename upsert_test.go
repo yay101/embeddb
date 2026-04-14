@@ -1,6 +1,7 @@
 package embeddb
 
 import (
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -457,4 +458,99 @@ func makeLargeString(n int) string {
 		b[i] = byte('a' + (i % 26))
 	}
 	return string(b)
+}
+
+type CityInspection struct {
+	ID                string `db:"id,primary"`
+	CertificateNumber int    `db:"index"`
+	BusinessName      string `db:"index"`
+	Date              string
+	Result            string `db:"index"`
+	Sector            string
+	Address           InspectionAddress
+}
+
+type InspectionAddress struct {
+	City   string
+	Zip    interface{}
+	Street string
+	Number interface{}
+}
+
+func TestCityInspections(t *testing.T) {
+	os.Remove("/tmp/city_inspections.db")
+	defer os.Remove("/tmp/city_inspections.db")
+
+	db, err := Open("/tmp/city_inspections.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[CityInspection](db, "inspections")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jsonData := `[
+{"_id":{"$oid":"56d61033a378eccde8a8354f"},"id":"10021-2015-ENFO","certificate_number":9278806,"business_name":"ATLIXCO DELI GROCERY INC.","date":"Feb 20 2015","result":"No Violation Issued","sector":"Cigarette Retail Dealer - 127","address":{"city":"RIDGEWOOD","zip":11385,"street":"MENAHAN ST","number":1712}},
+{"_id":{"$oid":"56d61033a378eccde8a83550"},"id":"10057-2015-ENFO","certificate_number":6007104,"business_name":"LD BUSINESS SOLUTIONS","date":"Feb 25 2015","result":"Violation Issued","sector":"Tax Preparers - 891","address":{"city":"NEW YORK","zip":10030,"street":"FREDERICK DOUGLASS BLVD","number":2655}},
+{"_id":{"$oid":"56d61033a378eccde8a83551"},"id":"10084-2015-ENFO","certificate_number":9278914,"business_name":"MICHAEL GOMEZ RANGHALL","date":"Feb 10 2015","result":"No Violation Issued","sector":"Locksmith - 062","address":{"city":"QUEENS VLG","zip":11427,"street":"214TH ST","number":8823}},
+{"_id":{"$oid":"56d61033a378eccde8a83552"},"id":"1012-2015-CMPL","certificate_number":5346909,"business_name":"A&C CHIMNEY CORP.","date":"Apr 22 2015","result":"Violation Issued","sector":"Home Improvement Contractor - 100","address":{"city":"QUEENS VLG","zip":11428,"street":"210TH ST","number":9440}},
+{"_id":{"$oid":"56d61033a378eccde8a83553"},"id":"10127-2015-CMPL","certificate_number":5381180,"business_name":"ERIC CONSTRUCTION AND DECORATING INC.","date":"Sep  8 2015","result":"Violation Issued","sector":"Home Improvement Contractor - 100","address":{"city":"STATEN ISLAND","zip":10304,"street":"TODT HILL RD","number":1233}},
+{"_id":{"$oid":"56d61033a378eccde8a83554"},"id":"10172-2015-CMPL","certificate_number":9304489,"business_name":"UNNAMED HOT DOG VENDOR LICENSE NUMBER TA01158","date":"Aug 21 2015","result":"No Violation Issued","sector":"Mobile Food Vendor - 881","address":{"city":"","zip":"","street":"","number":0}},
+{"_id":{"$oid":"56d61033a378eccde8a83555"},"id":"102-2015-UNIT","certificate_number":10003479,"business_name":"SOUTH BRONX AUTOMOTIVE CORP","date":"May 28 2015","result":"Pass","sector":"Tow Truck Company - 124","address":{"city":"","zip":"","street":"","number":0}},
+{"_id":{"$oid":"56d61033a378eccde8a83556"},"id":"10268-2015-CMPL","certificate_number":9304816,"business_name":"UNNAMED HOT DOG VENDOR NO LICENSE NUMBER PROVIDED","date":"Aug 19 2015","result":"No Violation Issued","sector":"Mobile Food Vendor - 881","address":{"city":"","zip":"","street":"","number":0}},
+{"_id":{"$oid":"56d61033a378eccde8a83557"},"id":"10284-2015-ENFO","certificate_number":9287088,"business_name":"VYACHESLAV KANDZHANOV","date":"Feb 25 2015","result":"No Violation Issued","sector":"Misc Non-Food Retail - 817","address":{"city":"NEW YORK","zip":10030,"street":"TONNELE AVE","number":70}},
+{"_id":{"$oid":"56d61033a378eccde8a83558"},"id":"10312-2015-ENFO","certificate_number":9287090,"business_name":"GRICEYDA M VILLAR","date":"Feb 25 2015","result":"No Violation Issued","sector":"Salons And Barbershop - 841","address":{"city":"NEW YORK","zip":10030,"street":"FREDRCK D BLVD","number":2645}},
+{"_id":{"$oid":"56d61033a378eccde8a83559"},"id":"10302-2015-ENFO","certificate_number":9287089,"business_name":"NYC CANDY STORE SHOP CORP","date":"Feb 25 2015","result":"No Violation Issued","sector":"Cigarette Retail Dealer - 127","address":{"city":"NEW YORK","zip":10030,"street":"FREDRCK D BLVD","number":2653}},
+{"_id":{"$oid":"56d61033a378eccde8a8355a"},"id":"10290-2015-CMPL","certificate_number":9305498,"business_name":"AYAD YOUSSEF","date":"Jul 23 2015","result":"No Violation Issued","sector":"Mobile Food Vendor - 881","address":{"city":"JERSEY CITY","zip":7306,"street":"TONNELE AVE","number":70}},
+{"_id":{"$oid":"56d61033a378eccde8a8355b"},"id":"10318-2015-ENFO","certificate_number":9287092,"business_name":"BISHWANATH BISWAS","date":"Feb 25 2015","result":"No Violation Issued","sector":"Mobile Food Vendor - 881","address":{"city":"ELMHURST","zip":11373,"street":"75TH ST","number":4157}},
+{"_id":{"$oid":"56d61033a378eccde8a8355c"},"id":"1033-2015-CMPL","certificate_number":5347333,"business_name":"A&H FURNITURE","date":"Apr 29 2015","result":"Violation Issued","sector":"Home Improvement Contractor - 100","address":{"city":"S RICHMOND HL","zip":11419,"street":"101ST AVE","number":11420}},
+{"_id":{"$oid":"56d61033a378eccde8a8355d"},"id":"10351-2015-CMPL","certificate_number":5381196,"business_name":"NEW FINEST BUILDERS INC","date":"Dec  1 2015","result":"Violation Issued","sector":"Home Improvement Contractor - 100","address":{"city":"BROOKLYN","zip":11234,"street":"E 55TH ST","number":1320}},
+{"_id":{"$oid":"56d61033a378eccde8a8355e"},"id":"10391-2015-ENFO","certificate_number":3019415,"business_name":"WILFREDO DELIVERY SERVICE INC","date":"Feb 26 2015","result":"Fail","sector":"Fuel Oil Dealer - 814","address":{"city":"WADING RIVER","zip":11792,"street":"WADING RIVER MANOR RD","number":1607}},
+{"_id":{"$oid":"56d61033a378eccde8a8355f"},"id":"10423-2015-CMPL","certificate_number":9304139,"business_name":"LISANDRO CABRE","date":"Jul  1 2015","result":"Violation Issued","sector":"Mobile Food Vendor - 881","address":{"city":"BROOKLYN","zip":11223,"street":"KINGS HWY","number":2822}},
+{"_id":{"$oid":"56d61033a378eccde8a83560"},"id":"10458-2015-ENFO","certificate_number":9287087,"business_name":"HAPPY GROCERY","date":"Feb 25 2015","result":"No Violation Issued","sector":"Misc Non-Food Retail - 817","address":{"city":"NEW YORK","zip":10030,"street":"FREDRCK D BLVD","number":2650}},
+{"_id":{"$oid":"56d61033a378eccde8a83561"},"id":"10530-2015-ENFO","certificate_number":10592661,"business_name":"JAMES GONSALVES","date":"Mar  4 2015","result":"No Violation Issued","sector":"Mobile Food Vendor - 881","address":{"city":"BROOKLYN","zip":11211,"street":"LORIMER ST","number":244}},
+{"_id":{"$oid":"56d61033a378eccde8a83562"},"id":"10579-2015-ENFO","certificate_number":9287091,"business_name":"WILFREDO DELIVERY SERVICE INC","date":"Feb 26 2015","result":"Fail","sector":"Fuel Oil Dealer - 814","address":{"city":"BROOKLYN","zip":11249,"street":"LORIMER ST","number":244}},
+{"_id":{"$oid":"56d61033a378eccde8a83563"},"id":"10611-2015-CMPL","certificate_number":10916289,"business_name":"ALEX CONSTRUCTION & DESIGN INC","date":"Jan  5 2015","result":"Violation Issued","sector":"Home Improvement Contractor - 100","address":{"city":"JAMAICA","zip":11432,"street":"HILLSIDE AVE","number":17576}},
+{"_id":{"$oid":"56d61033a378eccde8a83564"},"id":"10617-2015-ENFO","certificate_number":10593208,"business_name":"CHINATOWN GROCERY INC","date":"Mar  9 2015","result":"No Violation Issued","sector":"Misc Non-Food Retail - 817","address":{"city":"NEW YORK","zip":10002,"street":"CANAL ST","number":70}},
+{"_id":{"$oid":"56d61033a378eccde8a83565"},"id":"10628-2015-CMPL","certificate_number":12077082,"business_name":"GEORGES HOME IMPROVEMENT CORP","date":"Jan 21 2015","result":"Violation Issued","sector":"Home Improvement Contractor - 100","address":{"city":"BROOKLYN","zip":11204,"street":"BAY PKWY","number":6804}},
+{"_id":{"$oid":"56d61033a378eccde8a83566"},"id":"10647-2015-ENFO","certificate_number":10593206,"business_name":"NEW YORK GROCERY CORP","date":"Mar  9 2015","result":"No Violation Issued","sector":"Misc Non-Food Retail - 817","address":{"city":"NEW YORK","zip":10002,"street":"CANAL ST","number":70}},
+{"_id":{"$oid":"56d61033a378eccde8a83567"},"id":"10662-2015-CMPL","certificate_number":10916290,"business_name":"APEX BUILDERS NY INC","date":"Jan  5 2015","result":"Violation Issued","sector":"Home Improvement Contractor - 100","address":{"city":"JAMAICA","zip":11432,"street":"HILLSIDE AVE","number":17576}},
+{"_id":{"$oid":"56d61033a378eccde8a83568"},"id":"10674-2015-ENFO","certificate_number":10593205,"business_name":"BEST GROCERY INC","date":"Mar  9 2015","result":"No Violation Issued","sector":"Misc Non-Food Retail - 817","address":{"city":"NEW YORK","zip":10002,"street":"CANAL ST","number":70}},
+{"_id":{"$oid":"56d61033a378eccde8a83569"},"id":"10702-2015-CMPL","certificate_number":9278807,"business_name":"ATLIXCO DELI GROCERY INC.","date":"Feb 20 2015","result":"No Violation Issued","sector":"Cigarette Retail Dealer - 127","address":{"city":"RIDGEWOOD","zip":11385,"street":"MENAHAN ST","number":1712}},
+{"_id":{"$oid":"56d61033a378eccde8a8356a"},"id":"10716-2015-ENFO","certificate_number":10593204,"business_name":"LUCKY GROCERY CORP","date":"Mar  9 2015","result":"No Violation Issued","sector":"Misc Non-Food Retail - 817","address":{"city":"NEW YORK","zip":10002,"street":"CANAL ST","number":70}},
+{"_id":{"$oid":"56d61033a378eccde8a8356b"},"id":"10758-2015-CMPL","certificate_number":12077084,"business_name":"S BROTHERS CONSTRUCTION CORP","date":"Jan 21 2015","result":"Violation Issued","sector":"Home Improvement Contractor - 100","address":{"city":"BROOKLYN","zip":11204,"street":"BAY PKWY","number":6804}},
+{"_id":{"$oid":"56d61033a378eccde8a8356c"},"id":"10805-2015-ENFO","certificate_number":10593203,"business_name":"GOLDEN DRAGON CORP","date":"Mar  9 2015","result":"No Violation Issued","sector":"Misc Non-Food Retail - 817","address":{"city":"NEW YORK","zip":10002,"street":"CANAL ST","number":70}}
+]`
+
+	var records []CityInspection
+	if err := json.Unmarshal([]byte(jsonData), &records); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	inserted := 0
+	for _, rec := range records {
+		_, err := tbl.Insert(&rec)
+		if err != nil {
+			t.Fatalf("insert failed for %s: %v", rec.ID, err)
+		}
+		inserted++
+	}
+
+	count := tbl.Count()
+	if count != inserted {
+		t.Errorf("Count() = %d, want %d", count, inserted)
+	}
+
+	all, err := tbl.All()
+	if err != nil {
+		t.Fatalf("All() failed: %v", err)
+	}
+	if len(all) != inserted {
+		t.Errorf("All() returned %d, want %d", len(all), inserted)
+	}
+
+	t.Logf("Inserted %d records, Count()=%d, All()=%d", inserted, count, len(all))
 }
