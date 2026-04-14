@@ -18,6 +18,68 @@ type LargeDocument struct {
 	Tags      []string
 }
 
+type IntPKRecord struct {
+	ID   int    `db:"id,primary"`
+	Name string `db:"index"`
+	Data string
+}
+
+func TestUpsertWithIntPK(t *testing.T) {
+	os.Remove("/tmp/upsert_int_pk.db")
+	defer os.Remove("/tmp/upsert_int_pk.db")
+
+	db, err := Open("/tmp/upsert_int_pk.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[IntPKRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, inserted, err := tbl.Upsert(25235, &IntPKRecord{ID: 25235, Name: "Test Account", Data: "some data"})
+	if err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+	if !inserted {
+		t.Error("expected inserted=true for new record")
+	}
+
+	rec, err := tbl.Get(25235)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if rec.ID != 25235 {
+		t.Errorf("expected ID 25235, got %d", rec.ID)
+	}
+	if rec.Name != "Test Account" {
+		t.Errorf("expected Name 'Test Account', got %s", rec.Name)
+	}
+
+	_, inserted, err = tbl.Upsert(25235, &IntPKRecord{ID: 25235, Name: "Updated Name", Data: "updated data"})
+	if err != nil {
+		t.Fatalf("Upsert update failed: %v", err)
+	}
+	if inserted {
+		t.Error("expected inserted=false for existing record")
+	}
+
+	rec, err = tbl.Get(25235)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Name != "Updated Name" {
+		t.Errorf("expected updated name, got %s", rec.Name)
+	}
+
+	count := tbl.Count()
+	if count != 1 {
+		t.Errorf("expected 1 record, got %d", count)
+	}
+}
+
 func TestUpsertLargeStruct(t *testing.T) {
 	os.Remove("/tmp/upsert_large.db")
 	defer os.Remove("/tmp/upsert_large.db")
