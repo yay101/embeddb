@@ -1866,7 +1866,7 @@ func (s *Scanner[T]) Next() bool {
 		pkVal, _, _ = embedcore.DecodeString(encodedPK)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		val, _, _ := embedcore.DecodeVarint(encodedPK)
-		pkVal = int64(val)
+		pkVal = int(val)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		val, _, _ := embedcore.DecodeUvarint(encodedPK)
 		pkVal = uint64(val)
@@ -1878,7 +1878,10 @@ func (s *Scanner[T]) Next() bool {
 	record, err := s.table.Get(pkVal)
 	if err != nil {
 		s.pos++
-		return s.Next()
+		if s.pos < len(s.indexKeys) {
+			return s.Next()
+		}
+		return false
 	}
 
 	s.current = record
