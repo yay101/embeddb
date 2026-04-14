@@ -1362,6 +1362,7 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 		return 0, false, nil
 	}
 
+	t.setPKValue(record, id)
 	insertID, err := t.Insert(record)
 	if err != nil {
 		return 0, true, err
