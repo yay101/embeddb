@@ -29,6 +29,43 @@ type IntPKRecord struct {
 	Data string
 }
 
+type AccountRecord struct {
+	ID                       int            `db:"accountId,primary" json:"accountId"`
+	VendorAccountID          string         `db:"vendorAccountId,index" json:"vendorAccountId"`
+	CloudCustomerCompanyName string         `db:"cloudCustomerCompanyName,index" json:"cloudCustomerCompanyName"`
+	Subscriptions            []Subscription `json:"subscriptions,omitempty"`
+	ServiceDetails           ServiceDetail  `json:"serviceDetails,omitempty"`
+}
+
+type Subscription struct {
+	ID                 string          `json:"id"`
+	Name               string          `json:"name"`
+	Status             string          `json:"status"`
+	StartDate          string          `json:"startDate"`
+	EndDate            string          `json:"endDate"`
+	RenewalDate        string          `json:"renewalDate"`
+	LastRenewalDate    string          `json:"lastRenewalDate"`
+	LicenseAutoRenewal bool            `json:"licenseAutoRenewal"`
+	Count              int             `json:"count"`
+	Total              int             `json:"total"`
+	Trial              bool            `json:"trial"`
+	Charged            string          `json:"charged"`
+	Term               string          `json:"term"`
+	Type               string          `json:"type"`
+	NCEPlan            bool            `json:"ncePlan"`
+	ScheduledChange    ScheduledChange `json:"scheduledChange"`
+}
+
+type ScheduledChange struct {
+	Change   int    `json:"change"`
+	Schedule string `json:"schedule"`
+	CancelBy string `json:"cancelby"`
+}
+
+type ServiceDetail struct {
+	ServiceID int `json:"serviceId"`
+}
+
 func TestUpsertWithIntPK(t *testing.T) {
 	os.Remove("/tmp/upsert_int_pk.db")
 	defer os.Remove("/tmp/upsert_int_pk.db")
@@ -674,4 +711,98 @@ func TestCityInspections(t *testing.T) {
 	}
 
 	t.Logf("Inserted %d records, Count()=%d, All()=%d", inserted, count, len(all))
+}
+
+func TestAccountRecordsDebug(t *testing.T) {
+	os.Remove("/tmp/account_debug.db")
+	defer os.Remove("/tmp/account_debug.db")
+
+	db, err := Open("/tmp/account_debug.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[AccountRecord](db, "accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := AccountRecord{
+		ID:                       12345,
+		VendorAccountID:          "test-vendor-123",
+		CloudCustomerCompanyName: "Test Company",
+	}
+
+	_, _, err = tbl.Upsert(12345, &rec)
+	if err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+
+	count := tbl.Count()
+	t.Logf("Count() = %d", count)
+
+	all, err := tbl.All()
+	t.Logf("All() returned %d records", len(all))
+
+	if count != len(all) {
+		t.Errorf("Count() = %d, All() = %d", count, len(all))
+	}
+}
+
+func TestAccountRecordsFromFile(t *testing.T) {
+	os.Remove("/tmp/account_records.db")
+	defer os.Remove("/tmp/account_records.db")
+
+	db, err := Open("/tmp/account_records.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[AccountRecord](db, "accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jsonData, err := os.ReadFile("datatest.json")
+	if err != nil {
+		t.Fatalf("failed to read file: %v", err)
+	}
+
+	var records []AccountRecord
+	if err := json.Unmarshal(jsonData, &records); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	t.Logf("Loaded %d records from file", len(records))
+
+	seen := make(map[int]bool)
+	unique := 0
+	for _, rec := range records {
+		if !seen[rec.ID] {
+			seen[rec.ID] = true
+			unique++
+			_, _, err := tbl.Upsert(rec.ID, &rec)
+			if err != nil {
+				t.Fatalf("Upsert failed for accountId %d: %v", rec.ID, err)
+			}
+		}
+	}
+	t.Logf("Upserted %d unique records", unique)
+
+	count := tbl.Count()
+	t.Logf("Count() = %d", count)
+	if count != unique {
+		t.Errorf("Count() = %d, want %d", count, unique)
+	}
+
+	all, err := tbl.All()
+	if err != nil {
+		t.Fatalf("All() failed: %v", err)
+	}
+	t.Logf("All() returned %d records", len(all))
+	if len(all) != unique {
+		t.Errorf("All() returned %d, want %d", len(all), unique)
+	}
 }

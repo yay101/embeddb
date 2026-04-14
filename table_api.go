@@ -1865,8 +1865,8 @@ func (s *Scanner[T]) Next() bool {
 	case reflect.String:
 		pkVal, _, _ = embedcore.DecodeString(encodedPK)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		val, _, _ := embedcore.DecodeVarint(encodedPK)
-		pkVal = int(val)
+		val, _, _ := embedcore.DecodeUvarint(encodedPK)
+		pkVal = int(int64(val))
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		val, _, _ := embedcore.DecodeUvarint(encodedPK)
 		pkVal = uint64(val)
@@ -1946,7 +1946,7 @@ func (t *Table[T]) rebuildSecondaryIndexes() {
 				recordID = binary.BigEndian.Uint32(idStr[:4])
 			}
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			val, _, _ := embedcore.DecodeVarint(k[1:])
+			val, _, _ := embedcore.DecodeUvarint(k[1:])
 			recordID = uint32(int64(val))
 		default:
 			val, _, _ := embedcore.DecodeUvarint(k[1:])
