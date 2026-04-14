@@ -9,5 +9,5 @@ require (
 
 require golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e // indirect
 
-// v1.7.6 - Add TestCityInspections with nested structs
-// - Test nested struct with mixed types (string, int, interface{})
+// v1.7.7 - Add TestCityInspectionsFull with 80k real records
+// - Test full cycle: download JSON, insert, close, reopen, verify random records
