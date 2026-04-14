@@ -497,6 +497,60 @@ func (im *indexManager[T]) UpdateIndexes(record *T, recordID uint32) error {
 	return nil
 }
 
+func (im *indexManager[T]) DeleteFromIndexes(record *T, recordID uint32) error {
+	for fieldName, idx := range im.indexes {
+		field, found := im.fieldCache[fieldName]
+		if !found {
+			continue
+		}
+		if field.IsSlice {
+			im.indexSliceElementDelete(record, field, idx, recordID)
+			continue
+		}
+		key := embedcore.GetFieldAsString(record, field)
+		if key == "" {
+			continue
+		}
+		idx.Delete(key)
+	}
+	return nil
+}
+
+func (im *indexManager[T]) indexSliceElementDelete(record *T, field embedcore.FieldOffset, idx uint32IndexInterface, recordID uint32) {
+	v := reflect.ValueOf(record).Elem()
+	for _, parentName := range field.Parent {
+		for i := 0; i < v.NumField(); i++ {
+			if v.Type().Field(i).Name == parentName {
+				v = v.Field(i)
+				break
+			}
+		}
+	}
+	v = v.FieldByName(field.Name)
+	if !v.IsValid() || v.Kind() != reflect.Slice {
+		return
+	}
+	for i := 0; i < v.Len(); i++ {
+		elem := v.Index(i)
+		key := ""
+		switch elem.Kind() {
+		case reflect.String:
+			key = elem.String()
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			key = strconv.FormatInt(elem.Int(), 10)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			key = strconv.FormatUint(elem.Uint(), 10)
+		case reflect.Float32:
+			key = strconv.FormatFloat(elem.Float(), 'f', -1, 32)
+		case reflect.Float64:
+			key = strconv.FormatFloat(elem.Float(), 'f', -1, 64)
+		}
+		if key != "" {
+			idx.Delete(key)
+		}
+	}
+}
+
 func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint32, error) {
 	idx, ok := im.indexes[fieldName]
 	if !ok {
@@ -938,6 +992,20 @@ func (t *Table[T]) Update(id any, record *T) error {
 
 	recordID := binary.BigEndian.Uint32(recordBuf[3:7])
 
+	recLen := binary.BigEndian.Uint32(recordBuf[7:11])
+	totalLen := 12 + int(recLen) + 2
+
+	oldRecordBuf := make([]byte, totalLen)
+	copy(oldRecordBuf, recordBuf)
+	t.db.file.ReadAt(oldRecordBuf[12:], int64(oldOffset)+12)
+
+	var oldRecord T
+	t.decodeRecord(oldRecordBuf, &oldRecord)
+
+	if t.idxMgr != nil {
+		t.idxMgr.DeleteFromIndexes(&oldRecord, recordID)
+	}
+
 	encoded, err := t.encodeRecord(record)
 	if err != nil {
 		return fmt.Errorf("failed to encode record: %v", err)
@@ -997,6 +1065,10 @@ func (t *Table[T]) Update(id any, record *T) error {
 	binary.BigEndian.PutUint64(newVal, newOffset)
 	t.db.pkIndex.Set(indexKey, newVal)
 
+	if t.idxMgr != nil {
+		t.idxMgr.UpdateIndexes(record, recordID)
+	}
+
 	t.db.autoSync()
 
 	return nil
@@ -1015,6 +1087,24 @@ func (t *Table[T]) Delete(id any) error {
 	}
 
 	offset := binary.BigEndian.Uint64(val)
+
+	recordBuf := make([]byte, 12)
+	t.db.file.ReadAt(recordBuf, int64(offset))
+	if recordBuf[0] == EcCode && recordBuf[1] == RecordStartMark && recordBuf[11] == 1 {
+		recLen := binary.BigEndian.Uint32(recordBuf[7:11])
+		totalLen := 12 + int(recLen) + 2
+		oldRecordBuf := make([]byte, totalLen)
+		copy(oldRecordBuf, recordBuf)
+		t.db.file.ReadAt(oldRecordBuf[12:], int64(offset)+12)
+
+		var oldRecord T
+		t.decodeRecord(oldRecordBuf, &oldRecord)
+		recordID := binary.BigEndian.Uint32(recordBuf[3:7])
+
+		if t.idxMgr != nil {
+			t.idxMgr.DeleteFromIndexes(&oldRecord, recordID)
+		}
+	}
 
 	t.db.file.WriteAt([]byte{0}, int64(offset+11))
 
@@ -1048,6 +1138,25 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 		}
 
 		offset := binary.BigEndian.Uint64(val)
+
+		recordBuf := make([]byte, 12)
+		t.db.file.ReadAt(recordBuf, int64(offset))
+		if recordBuf[0] == EcCode && recordBuf[1] == RecordStartMark && recordBuf[11] == 1 {
+			recLen := binary.BigEndian.Uint32(recordBuf[7:11])
+			totalLen := 12 + int(recLen) + 2
+			oldRecordBuf := make([]byte, totalLen)
+			copy(oldRecordBuf, recordBuf)
+			t.db.file.ReadAt(oldRecordBuf[12:], int64(offset)+12)
+
+			var oldRecord T
+			t.decodeRecord(oldRecordBuf, &oldRecord)
+			recordID := binary.BigEndian.Uint32(recordBuf[3:7])
+
+			if t.idxMgr != nil {
+				t.idxMgr.DeleteFromIndexes(&oldRecord, recordID)
+			}
+		}
+
 		t.db.file.WriteAt([]byte{0}, int64(offset+11))
 		t.db.pkIndex.Delete(indexKey)
 		deleted++
@@ -1211,7 +1320,9 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 
 	offset := binary.BigEndian.Uint64(val)
 
-	recID := binary.BigEndian.Uint32(val)
+	headerBuf := make([]byte, 12)
+	t.db.file.ReadAt(headerBuf, int64(offset))
+	recID := binary.BigEndian.Uint32(headerBuf[3:7])
 
 	encoded, err := t.encodeRecord(record)
 	if err != nil {

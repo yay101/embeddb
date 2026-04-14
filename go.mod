@@ -8,3 +8,10 @@ require (
 )
 
 require golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e // indirect
+
+// v1.7.2 - Fix secondary index updates on Update/Delete/Upsert
+// - Fix Update not removing old index entries
+// - Fix Delete/DeleteMany not cleaning up indexes  
+// - Fix updateLocked reading recordID from wrong location
+// - Add DeleteFromIndexes method to indexManager
+// - Add tests for large structs with upserts
