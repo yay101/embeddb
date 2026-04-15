@@ -3,11 +3,19 @@ package embeddb
 import (
 	"os"
 	"sync"
+
+	"github.com/yay101/embeddbmmap"
 )
+
+func pageAlign(n int64) int64 {
+	ps := int64(embeddbmmap.PageSize())
+	return ((n + ps - 1) / ps) * ps
+}
 
 // allocator manages free space in the database file.
 type allocator struct {
 	file       *os.File
+	region     *embeddbmmap.MappedRegion
 	nextOffset uint64      // next free offset assuming no reuse
 	freeList   []freeBlock // sorted by offset, coalesced
 	actualSize uint64      // actual file size on disk
@@ -45,28 +53,27 @@ func (a *allocator) SetFile(file *os.File) {
 func (a *allocator) Allocate(size uint64) (offset uint64, length uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	// Find the first free block that fits.
 	for i, fb := range a.freeList {
 		if fb.length >= size {
-			// Use this block.
 			if fb.length == size {
-				// Exact fit: remove the block.
 				a.freeList = append(a.freeList[:i], a.freeList[i+1:]...)
 			} else {
-				// Split: use the front part, keep the remainder.
 				a.freeList[i].offset += size
 				a.freeList[i].length -= size
-				// Keep the block at i with updated offset and length.
 			}
 			return fb.offset, size
 		}
 	}
-	// No suitable free block: extend the file using actualSize.
 	offset = a.actualSize
 	a.actualSize += size
 	a.nextOffset = a.actualSize
-	// Extend the file
 	a.file.Truncate(int64(a.actualSize))
+	if a.region != nil {
+		alignedSize := pageAlign(int64(a.actualSize))
+		if alignedSize > a.region.Size() {
+			a.region.Resize(alignedSize)
+		}
+	}
 	return offset, size
 }
 

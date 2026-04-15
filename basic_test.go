@@ -214,8 +214,8 @@ func TestMapIndex(t *testing.T) {
 	}
 }
 
-func TestUint32MapIndex(t *testing.T) {
-	mi := newUint32MapIndex()
+func TestOffsetMapIndex(t *testing.T) {
+	mi := newOffsetMapIndex()
 
 	mi.Set("key1", 100)
 	mi.Set("key2", 200)
@@ -229,7 +229,7 @@ func TestUint32MapIndex(t *testing.T) {
 	}
 
 	count := 0
-	mi.Range(func(k string, v uint32) bool {
+	mi.Range(func(k string, v uint64) bool {
 		count++
 		return true
 	})

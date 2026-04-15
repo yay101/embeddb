@@ -32,6 +32,14 @@ type Product struct {
 
 var memStats runtime.MemStats
 
+func throughput(n int, d time.Duration) int {
+	ms := int(d.Milliseconds())
+	if ms == 0 {
+		ms = 1
+	}
+	return (n * 1000) / ms
+}
+
 func getMemMB() float64 {
 	runtime.ReadMemStats(&memStats)
 	return float64(memStats.Alloc) / 1024 / 1024
@@ -57,19 +65,19 @@ func main() {
 	for i := 0; i < 100000; i++ {
 		users.Insert(&User{Name: fmt.Sprintf("User%d", i), Email: fmt.Sprintf("user%d@example.com", i), Age: 20 + i%50})
 	}
-	fmt.Printf("users.Insert 100k: %v (%d/sec)\n", time.Since(start), int(100000*1000)/int(time.Since(start).Milliseconds()))
+	fmt.Printf("users.Insert 100k: %v (%d/sec)\n", time.Since(start), throughput(100000, time.Since(start)))
 
 	start = time.Now()
 	for i := 0; i < 100000; i++ {
 		orders.Insert(&Order{CustomerID: uint32(i % 10000), Total: float64(i) * 1.99, Status: "pending"})
 	}
-	fmt.Printf("orders.Insert 100k: %v (%d/sec)\n", time.Since(start), int(100000*1000)/int(time.Since(start).Milliseconds()))
+	fmt.Printf("orders.Insert 100k: %v (%d/sec)\n", time.Since(start), throughput(100000, time.Since(start)))
 
 	start = time.Now()
 	for i := 0; i < 100000; i++ {
 		products.Insert(&Product{Name: fmt.Sprintf("Product%d", i), Price: float64(i) * 0.99, SKU: fmt.Sprintf("SKU%05d", i)})
 	}
-	fmt.Printf("products.Insert 100k: %v (%d/sec)\n", time.Since(start), int(100000*1000)/int(time.Since(start).Milliseconds()))
+	fmt.Printf("products.Insert 100k: %v (%d/sec)\n", time.Since(start), throughput(100000, time.Since(start)))
 
 	fmt.Printf("\nMemory after inserts: %.2f MB\n", getMemMB())
 
@@ -87,19 +95,19 @@ func main() {
 	for i := 0; i < 1000; i++ {
 		users.Query("Name", fmt.Sprintf("User%d", i%10000))
 	}
-	fmt.Printf("Query Name (index): %v (%d/sec)\n", time.Since(start), int(1000*1000)/int(time.Since(start).Milliseconds()))
+	fmt.Printf("Query Name (index): %v (%d/sec)\n", time.Since(start), throughput(1000, time.Since(start)))
 
 	start = time.Now()
 	for i := 0; i < 1000; i++ {
 		users.Get(uint32(i % 100000))
 	}
-	fmt.Printf("Get by PK: %v (%d/sec)\n", time.Since(start), int(1000*1000)/int(time.Since(start).Milliseconds()))
+	fmt.Printf("Get by PK: %v (%d/sec)\n", time.Since(start), throughput(1000, time.Since(start)))
 
 	start = time.Now()
 	for i := 0; i < 1000; i++ {
 		users.Query("Age", 30)
 	}
-	fmt.Printf("Query Age (index): %v (%d/sec)\n", time.Since(start), int(1000*1000)/int(time.Since(start).Milliseconds()))
+	fmt.Printf("Query Age (index): %v (%d/sec)\n", time.Since(start), throughput(1000, time.Since(start)))
 
 	fmt.Println()
 	fmt.Println("--- Count & Scan ---")

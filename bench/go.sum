@@ -1,8 +1,6 @@
-github.com/edsrzf/mmap-go v1.2.0 h1:hXLYlkbaPzt1SaQk+anYwKSRNhufIDCchSPkUD6dD84=
-github.com/edsrzf/mmap-go v1.2.0/go.mod h1:19H/e8pUPLicwkyNgOykDXkJ9F0MHE+Z52B8EIth78Q=
-github.com/yay101/embeddb v1.7.0 h1:fXmf6ENpC0qEzcg1tKlXWm/JeOMiPCAgWxsHlDjJByQ=
-github.com/yay101/embeddb v1.7.0/go.mod h1:1XL8muJ3oMApQ1MOf578LBc2so+H5KljD5xOSmjyoLc=
-github.com/yay101/embeddbcore v0.2.0 h1:O1qT0J8DtvTRthJ50e2HvVywlWf095ftAMi/BPKAeIE=
-github.com/yay101/embeddbcore v0.2.0/go.mod h1:lUAbYOm+zaTjhO9ABKoyWpPHE8zsD4sOfaM2noNNs1o=
-golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e h1:fLOSk5Q00efkSvAm+4xcoXD+RRmLmmulPn5I3Y9F2EM=
-golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+github.com/yay101/embeddbcore v0.3.0 h1:/vFgjLuHxZQHX61jgPM0rvbQL4qo/8qUyT9vIPXSHSk=
+github.com/yay101/embeddbcore v0.3.0/go.mod h1:lUAbYOm+zaTjhO9ABKoyWpPHE8zsD4sOfaM2noNNs1o=
+github.com/yay101/embeddbmmap v0.1.0 h1:/3kjTLBc8iddTy5WNGGxPz/iwdc0sYRLDkW6YyYY48I=
+github.com/yay101/embeddbmmap v0.1.0/go.mod h1:rEypeVToP1O8XqD/WEw438T9z19Hi9bdnpSnR4hOpNk=
+golang.org/x/sys v0.43.0 h1:Rlag2XtaFTxp19wS8MXlJwTvoh8ArU6ezoyFsMyCTNI=
+golang.org/x/sys v0.43.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbmmap"
 )
 
 func encodePKForIndex(tableID uint8, pkValue any) []byte {
@@ -71,7 +72,6 @@ type DB struct {
 	idleThreshold time.Duration
 	writeCount    uint64
 	lastSync      time.Time
-	idleTimer     *time.Timer
 	lock          sync.Mutex
 	closed        bool
 	database      *database
@@ -216,6 +216,7 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 	}
 
 	if db.autoIndex {
+		typedDB.mu.RLock()
 		typedTable.idxMgr = newIndexManager[T](typedDB, layout)
 		for _, field := range layout.FieldOffsets {
 			if field.Name != "" && !field.Primary && field.Offset > 0 {
@@ -223,6 +224,7 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 			}
 		}
 		typedTable.rebuildSecondaryIndexes()
+		typedDB.mu.RUnlock()
 	}
 
 	db.tables[tableName] = typedDB
@@ -294,10 +296,13 @@ func (db *DB) Sync() error {
 		return fmt.Errorf("database is closed")
 	}
 
+	var firstErr error
 	for _, t := range db.tables {
-		return t.flush()
+		if err := t.flush(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+	return firstErr
 }
 
 func (db *DB) FastSync() error {
@@ -313,8 +318,10 @@ func (db *DB) FastSync() error {
 	}
 
 	for _, t := range db.tables {
-		if err := t.file.Sync(); err != nil {
-			return err
+		if t.region != nil {
+			if err := t.region.Sync(embeddbmmap.SyncSync); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -336,10 +343,13 @@ func (db *DB) Vacuum() error {
 		return fmt.Errorf("database is closed")
 	}
 
+	var firstErr error
 	for _, t := range db.tables {
-		return t.Vacuum()
+		if err := t.Vacuum(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+	return firstErr
 }
 
 func resolveTableName[T any](name ...string) string {
@@ -379,7 +389,7 @@ type Table[T any] struct {
 type indexManager[T any] struct {
 	db         *database
 	layout     *embedcore.StructLayout
-	indexes    map[string]uint32IndexInterface
+	indexes    map[string]offsetIndexInterface
 	fieldCache map[string]embedcore.FieldOffset
 }
 
@@ -391,7 +401,7 @@ func newIndexManager[T any](db *database, layout *embedcore.StructLayout) *index
 	return &indexManager[T]{
 		db:         db,
 		layout:     layout,
-		indexes:    make(map[string]uint32IndexInterface),
+		indexes:    make(map[string]offsetIndexInterface),
 		fieldCache: fieldCache,
 	}
 }
@@ -399,7 +409,7 @@ func newIndexManager[T any](db *database, layout *embedcore.StructLayout) *index
 func (im *indexManager[T]) CreateIndex(fieldName string) error {
 	for _, field := range im.layout.FieldOffsets {
 		if field.Name == fieldName {
-			im.indexes[fieldName] = newUint32MapIndex()
+			im.indexes[fieldName] = newOffsetMapIndex()
 			return nil
 		}
 	}
@@ -424,26 +434,26 @@ func (im *indexManager[T]) GetIndexedFields() []string {
 	return fields
 }
 
-func (im *indexManager[T]) InsertIntoIndexes(record *T, recordID uint32) error {
+func (im *indexManager[T]) InsertIntoIndexes(record *T, offset uint64) error {
 	for fieldName, idx := range im.indexes {
 		field, found := im.fieldCache[fieldName]
 		if !found {
 			continue
 		}
 		if field.IsSlice {
-			im.indexSliceElement(record, field, idx, recordID)
+			im.indexSliceElement(record, field, idx, offset)
 			continue
 		}
 		key := embedcore.GetFieldAsString(record, field)
 		if key == "" {
 			continue
 		}
-		idx.Set(key, recordID)
+		idx.Set(key, offset)
 	}
 	return nil
 }
 
-func (im *indexManager[T]) indexSliceElement(record *T, field embedcore.FieldOffset, idx uint32IndexInterface, recordID uint32) {
+func (im *indexManager[T]) indexSliceElement(record *T, field embedcore.FieldOffset, idx offsetIndexInterface, offset uint64) {
 	v := reflect.ValueOf(record).Elem()
 	for _, parentName := range field.Parent {
 		for i := 0; i < v.NumField(); i++ {
@@ -473,38 +483,38 @@ func (im *indexManager[T]) indexSliceElement(record *T, field embedcore.FieldOff
 			key = strconv.FormatFloat(elem.Float(), 'f', -1, 64)
 		}
 		if key != "" {
-			idx.Set(key, recordID)
+			idx.Set(key, offset)
 		}
 	}
 }
 
-func (im *indexManager[T]) UpdateIndexes(record *T, recordID uint32) error {
+func (im *indexManager[T]) UpdateIndexes(record *T, offset uint64) error {
 	for fieldName, idx := range im.indexes {
 		field, found := im.fieldCache[fieldName]
 		if !found {
 			continue
 		}
 		if field.IsSlice {
-			im.indexSliceElement(record, field, idx, recordID)
+			im.indexSliceElement(record, field, idx, offset)
 			continue
 		}
 		key := embedcore.GetFieldAsString(record, field)
 		if key == "" {
 			continue
 		}
-		idx.Set(key, recordID)
+		idx.Set(key, offset)
 	}
 	return nil
 }
 
-func (im *indexManager[T]) DeleteFromIndexes(record *T, recordID uint32) error {
+func (im *indexManager[T]) DeleteFromIndexes(record *T, offset uint64) error {
 	for fieldName, idx := range im.indexes {
 		field, found := im.fieldCache[fieldName]
 		if !found {
 			continue
 		}
 		if field.IsSlice {
-			im.indexSliceElementDelete(record, field, idx, recordID)
+			im.indexSliceElementDelete(record, field, idx, offset)
 			continue
 		}
 		key := embedcore.GetFieldAsString(record, field)
@@ -516,7 +526,7 @@ func (im *indexManager[T]) DeleteFromIndexes(record *T, recordID uint32) error {
 	return nil
 }
 
-func (im *indexManager[T]) indexSliceElementDelete(record *T, field embedcore.FieldOffset, idx uint32IndexInterface, recordID uint32) {
+func (im *indexManager[T]) indexSliceElementDelete(record *T, field embedcore.FieldOffset, idx offsetIndexInterface, offset uint64) {
 	v := reflect.ValueOf(record).Elem()
 	for _, parentName := range field.Parent {
 		for i := 0; i < v.NumField(); i++ {
@@ -551,7 +561,7 @@ func (im *indexManager[T]) indexSliceElementDelete(record *T, field embedcore.Fi
 	}
 }
 
-func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint32, error) {
+func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint64, error) {
 	idx, ok := im.indexes[fieldName]
 	if !ok {
 		return nil, fmt.Errorf("no index for field %s", fieldName)
@@ -564,7 +574,7 @@ func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint32,
 	}
 	ids, ok := idx.GetAll(key)
 	if !ok {
-		return []uint32{}, nil
+		return []uint64{}, nil
 	}
 	return ids, nil
 }
@@ -640,7 +650,7 @@ func (im *indexManager[T]) getFieldType(fieldName string) reflect.Kind {
 	return reflect.Invalid
 }
 
-func (im *indexManager[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]uint32, error) {
+func (im *indexManager[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]uint64, error) {
 	idx, ok := im.indexes[fieldName]
 	if !ok {
 		return nil, fmt.Errorf("no index for field %s", fieldName)
@@ -649,7 +659,7 @@ func (im *indexManager[T]) QueryRangeGreaterThan(fieldName string, value interfa
 	fieldType := im.getFieldType(fieldName)
 	keys := idx.SortedKeys()
 
-	var results []uint32
+	var results []uint64
 	for _, k := range keys {
 		parsedVal := parseIndexKey(k, fieldType)
 		cmp := compareValues(parsedVal, value)
@@ -660,12 +670,12 @@ func (im *indexManager[T]) QueryRangeGreaterThan(fieldName string, value interfa
 		}
 	}
 	if results == nil {
-		return []uint32{}, nil
+		return []uint64{}, nil
 	}
 	return results, nil
 }
 
-func (im *indexManager[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]uint32, error) {
+func (im *indexManager[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]uint64, error) {
 	idx, ok := im.indexes[fieldName]
 	if !ok {
 		return nil, fmt.Errorf("no index for field %s", fieldName)
@@ -674,7 +684,7 @@ func (im *indexManager[T]) QueryRangeLessThan(fieldName string, value interface{
 	fieldType := im.getFieldType(fieldName)
 	keys := idx.SortedKeys()
 
-	var results []uint32
+	var results []uint64
 	for _, k := range keys {
 		parsedVal := parseIndexKey(k, fieldType)
 		cmp := compareValues(parsedVal, value)
@@ -685,12 +695,12 @@ func (im *indexManager[T]) QueryRangeLessThan(fieldName string, value interface{
 		}
 	}
 	if results == nil {
-		return []uint32{}, nil
+		return []uint64{}, nil
 	}
 	return results, nil
 }
 
-func (im *indexManager[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
+func (im *indexManager[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint64, error) {
 	idx, ok := im.indexes[fieldName]
 	if !ok {
 		return nil, fmt.Errorf("no index for field %s", fieldName)
@@ -699,7 +709,7 @@ func (im *indexManager[T]) QueryRangeBetween(fieldName string, min, max interfac
 	fieldType := im.getFieldType(fieldName)
 	keys := idx.SortedKeys()
 
-	var results []uint32
+	var results []uint64
 	for _, k := range keys {
 		parsedVal := parseIndexKey(k, fieldType)
 		cMin := compareValues(parsedVal, min)
@@ -713,7 +723,7 @@ func (im *indexManager[T]) QueryRangeBetween(fieldName string, min, max interfac
 		}
 	}
 	if results == nil {
-		return []uint32{}, nil
+		return []uint64{}, nil
 	}
 	return results, nil
 }
@@ -762,7 +772,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	recordBuf = append(recordBuf, footerBytes...)
 
 	offset, _ := t.db.alloc.Allocate(uint64(len(recordBuf)))
-	t.db.file.WriteAt(recordBuf, int64(offset))
+	t.db.writeAt(recordBuf, int64(offset))
 
 	indexKey := encodePKForIndex(t.tableID, pkVal)
 	val := make([]byte, 8)
@@ -780,7 +790,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	}
 
 	if t.idxMgr != nil {
-		t.idxMgr.InsertIntoIndexes(record, recordID)
+		t.idxMgr.InsertIntoIndexes(record, offset)
 	}
 
 	t.db.autoSync()
@@ -855,10 +865,7 @@ func (t *Table[T]) Get(id any) (*T, error) {
 	offset := binary.BigEndian.Uint64(val)
 
 	headerBuf := make([]byte, 12)
-	_, err := t.db.file.ReadAt(headerBuf, int64(offset))
-	if err != nil {
-		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
-	}
+	t.db.readAt(headerBuf, int64(offset))
 
 	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return nil, fmt.Errorf("invalid record header")
@@ -874,10 +881,7 @@ func (t *Table[T]) Get(id any) (*T, error) {
 
 	recordBuf := make([]byte, totalLen)
 	copy(recordBuf, headerBuf)
-	n, err := t.db.file.ReadAt(recordBuf[12:], int64(offset)+12)
-	if err != nil || n < int(totalLen-12) {
-		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
-	}
+	t.db.readAt(recordBuf[12:], int64(offset)+12)
 
 	var result T
 	if err := t.decodeRecord(recordBuf, &result); err != nil {
@@ -887,7 +891,35 @@ func (t *Table[T]) Get(id any) (*T, error) {
 	return &result, nil
 }
 
-func (t *Table[T]) queryByPK(pkValue string) (uint32, bool) {
+func (t *Table[T]) getByOffset(offset uint64) (*T, error) {
+	headerBuf := make([]byte, 12)
+	t.db.readAt(headerBuf, int64(offset))
+
+	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
+		return nil, fmt.Errorf("invalid record header at offset %d", offset)
+	}
+
+	active := headerBuf[11]
+	if active != 1 {
+		return nil, fmt.Errorf("record is deleted")
+	}
+
+	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
+	totalLen := 12 + int(recLen) + 2
+
+	recordBuf := make([]byte, totalLen)
+	copy(recordBuf, headerBuf)
+	t.db.readAt(recordBuf[12:], int64(offset)+12)
+
+	var result T
+	if err := t.decodeRecord(recordBuf, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func (t *Table[T]) queryByPK(pkValue string) (uint64, bool) {
 	if t.idxMgr == nil {
 		return 0, false
 	}
@@ -895,8 +927,8 @@ func (t *Table[T]) queryByPK(pkValue string) (uint32, bool) {
 		if f, ok := t.idxMgr.fieldCache[fieldName]; !ok || !f.Primary {
 			continue
 		}
-		id, ok := idx.Get(pkValue)
-		return id, ok
+		offset, ok := idx.Get(pkValue)
+		return offset, ok
 	}
 	return 0, false
 }
@@ -918,10 +950,7 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 	offset := versionInfo.Offset
 
 	headerBuf := make([]byte, 12)
-	_, err := t.db.file.ReadAt(headerBuf, int64(offset))
-	if err != nil {
-		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
-	}
+	t.db.readAt(headerBuf, int64(offset))
 
 	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return nil, fmt.Errorf("invalid record header")
@@ -937,10 +966,7 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 
 	recordBuf := make([]byte, totalLen)
 	copy(recordBuf, headerBuf)
-	n, err := t.db.file.ReadAt(recordBuf[12:], int64(offset)+12)
-	if err != nil || n < int(totalLen-12) {
-		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
-	}
+	t.db.readAt(recordBuf[12:], int64(offset)+12)
 
 	var result T
 	if err := t.decodeRecord(recordBuf, &result); err != nil {
@@ -985,7 +1011,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 	oldOffset := binary.BigEndian.Uint64(val)
 
 	recordBuf := make([]byte, 12)
-	t.db.file.ReadAt(recordBuf, int64(oldOffset))
+	t.db.readAt(recordBuf, int64(oldOffset))
 	if recordBuf[0] != EcCode || recordBuf[1] != RecordStartMark {
 		return fmt.Errorf("invalid record at offset %d", oldOffset)
 	}
@@ -997,13 +1023,13 @@ func (t *Table[T]) Update(id any, record *T) error {
 
 	oldRecordBuf := make([]byte, totalLen)
 	copy(oldRecordBuf, recordBuf)
-	t.db.file.ReadAt(oldRecordBuf[12:], int64(oldOffset)+12)
+	t.db.readAt(oldRecordBuf[12:], int64(oldOffset)+12)
 
 	var oldRecord T
 	t.decodeRecord(oldRecordBuf, &oldRecord)
 
 	if t.idxMgr != nil {
-		t.idxMgr.DeleteFromIndexes(&oldRecord, recordID)
+		t.idxMgr.DeleteFromIndexes(&oldRecord, oldOffset)
 	}
 
 	encoded, err := t.encodeRecord(record)
@@ -1027,7 +1053,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 	newRecordBuf = append(newRecordBuf, footerBytes...)
 
 	newOffset, _ := t.db.alloc.Allocate(uint64(len(newRecordBuf)))
-	t.db.file.WriteAt(newRecordBuf, int64(newOffset))
+	t.db.writeAt(newRecordBuf, int64(newOffset))
 
 	if t.maxVersions > 0 {
 		versions := t.db.versionIndex.GetVersions(indexKey)
@@ -1053,12 +1079,12 @@ func (t *Table[T]) Update(id any, record *T) error {
 					oldestVersion = v.Version
 				}
 			}
-			t.db.file.WriteAt([]byte{0}, int64(versions[oldestIdx].Offset+11))
+			t.db.writeAt([]byte{0}, int64(versions[oldestIdx].Offset+11))
 			t.db.versionIndex.RemoveVersion(indexKey, oldestVersion)
 			versions = append(versions[:oldestIdx], versions[oldestIdx+1:]...)
 		}
 	} else {
-		t.db.file.WriteAt([]byte{0}, int64(oldOffset+11))
+		t.db.writeAt([]byte{0}, int64(oldOffset+11))
 	}
 
 	newVal := make([]byte, 8)
@@ -1066,7 +1092,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 	t.db.pkIndex.Set(indexKey, newVal)
 
 	if t.idxMgr != nil {
-		t.idxMgr.UpdateIndexes(record, recordID)
+		t.idxMgr.UpdateIndexes(record, newOffset)
 	}
 
 	t.db.autoSync()
@@ -1089,24 +1115,23 @@ func (t *Table[T]) Delete(id any) error {
 	offset := binary.BigEndian.Uint64(val)
 
 	recordBuf := make([]byte, 12)
-	t.db.file.ReadAt(recordBuf, int64(offset))
+	t.db.readAt(recordBuf, int64(offset))
 	if recordBuf[0] == EcCode && recordBuf[1] == RecordStartMark && recordBuf[11] == 1 {
 		recLen := binary.BigEndian.Uint32(recordBuf[7:11])
 		totalLen := 12 + int(recLen) + 2
 		oldRecordBuf := make([]byte, totalLen)
 		copy(oldRecordBuf, recordBuf)
-		t.db.file.ReadAt(oldRecordBuf[12:], int64(offset)+12)
+		t.db.readAt(oldRecordBuf[12:], int64(offset)+12)
 
 		var oldRecord T
 		t.decodeRecord(oldRecordBuf, &oldRecord)
-		recordID := binary.BigEndian.Uint32(recordBuf[3:7])
 
 		if t.idxMgr != nil {
-			t.idxMgr.DeleteFromIndexes(&oldRecord, recordID)
+			t.idxMgr.DeleteFromIndexes(&oldRecord, offset)
 		}
 	}
 
-	t.db.file.WriteAt([]byte{0}, int64(offset+11))
+	t.db.writeAt([]byte{0}, int64(offset+11))
 
 	t.db.pkIndex.Delete(indexKey)
 
@@ -1116,7 +1141,7 @@ func (t *Table[T]) Delete(id any) error {
 
 	if t.db.tx != nil {
 		t.db.tx.recordCounts[t.name]--
-	} else {
+	} else if entry.RecordCount > 0 {
 		entry.RecordCount--
 	}
 
@@ -1140,27 +1165,30 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 		offset := binary.BigEndian.Uint64(val)
 
 		recordBuf := make([]byte, 12)
-		t.db.file.ReadAt(recordBuf, int64(offset))
+		t.db.readAt(recordBuf, int64(offset))
 		if recordBuf[0] == EcCode && recordBuf[1] == RecordStartMark && recordBuf[11] == 1 {
 			recLen := binary.BigEndian.Uint32(recordBuf[7:11])
 			totalLen := 12 + int(recLen) + 2
 			oldRecordBuf := make([]byte, totalLen)
 			copy(oldRecordBuf, recordBuf)
-			t.db.file.ReadAt(oldRecordBuf[12:], int64(offset)+12)
+			t.db.readAt(oldRecordBuf[12:], int64(offset)+12)
 
 			var oldRecord T
 			t.decodeRecord(oldRecordBuf, &oldRecord)
-			recordID := binary.BigEndian.Uint32(recordBuf[3:7])
 
 			if t.idxMgr != nil {
-				t.idxMgr.DeleteFromIndexes(&oldRecord, recordID)
+				t.idxMgr.DeleteFromIndexes(&oldRecord, offset)
 			}
 		}
 
-		t.db.file.WriteAt([]byte{0}, int64(offset+11))
+		t.db.writeAt([]byte{0}, int64(offset+11))
 		t.db.pkIndex.Delete(indexKey)
 		deleted++
-		entry.RecordCount--
+		if t.db.tx != nil {
+			t.db.tx.recordCounts[t.name]--
+		} else if entry.RecordCount > 0 {
+			entry.RecordCount--
+		}
 	}
 	return deleted, nil
 }
@@ -1245,7 +1273,7 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	recordBuf = append(recordBuf, footerBytes...)
 
 	offset, _ := t.db.alloc.Allocate(uint64(len(recordBuf)))
-	t.db.file.WriteAt(recordBuf, int64(offset))
+	t.db.writeAt(recordBuf, int64(offset))
 
 	indexKey := encodePKForIndex(t.tableID, pkVal)
 	val := make([]byte, 8)
@@ -1263,7 +1291,7 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	}
 
 	if t.idxMgr != nil {
-		t.idxMgr.InsertIntoIndexes(record, recordID)
+		t.idxMgr.InsertIntoIndexes(record, offset)
 	}
 
 	return recordID, nil
@@ -1279,10 +1307,7 @@ func (t *Table[T]) getLocked(id any) (*T, error) {
 	offset := binary.BigEndian.Uint64(val)
 
 	headerBuf := make([]byte, 12)
-	_, err := t.db.file.ReadAt(headerBuf, int64(offset))
-	if err != nil {
-		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
-	}
+	t.db.readAt(headerBuf, int64(offset))
 
 	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return nil, fmt.Errorf("invalid record header")
@@ -1298,10 +1323,7 @@ func (t *Table[T]) getLocked(id any) (*T, error) {
 
 	recordBuf := make([]byte, totalLen)
 	copy(recordBuf, headerBuf)
-	n, err := t.db.file.ReadAt(recordBuf[12:], int64(offset)+12)
-	if err != nil || n < int(totalLen-12) {
-		return nil, fmt.Errorf("read error at offset %d: %v", offset, err)
-	}
+	t.db.readAt(recordBuf[12:], int64(offset)+12)
 
 	var result T
 	if err := t.decodeRecord(recordBuf, &result); err != nil {
@@ -1318,11 +1340,28 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 		return fmt.Errorf("record not found")
 	}
 
-	offset := binary.BigEndian.Uint64(val)
+	oldOffset := binary.BigEndian.Uint64(val)
 
 	headerBuf := make([]byte, 12)
-	t.db.file.ReadAt(headerBuf, int64(offset))
-	recID := binary.BigEndian.Uint32(headerBuf[3:7])
+	t.db.readAt(headerBuf, int64(oldOffset))
+	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
+		return fmt.Errorf("invalid record at offset %d", oldOffset)
+	}
+
+	recordID := binary.BigEndian.Uint32(headerBuf[3:7])
+	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
+	totalLen := 12 + int(recLen) + 2
+
+	oldRecordBuf := make([]byte, totalLen)
+	copy(oldRecordBuf, headerBuf)
+	t.db.readAt(oldRecordBuf[12:], int64(oldOffset)+12)
+
+	var oldRecord T
+	t.decodeRecord(oldRecordBuf, &oldRecord)
+
+	if t.idxMgr != nil {
+		t.idxMgr.DeleteFromIndexes(&oldRecord, oldOffset)
+	}
 
 	encoded, err := t.encodeRecord(record)
 	if err != nil {
@@ -1333,7 +1372,81 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	headerBytes[0] = EcCode
 	headerBytes[1] = RecordStartMark
 	headerBytes[2] = t.tableID
-	binary.BigEndian.PutUint32(headerBytes[3:7], recID)
+	binary.BigEndian.PutUint32(headerBytes[3:7], recordID)
+	binary.BigEndian.PutUint32(headerBytes[7:11], uint32(len(encoded)))
+	headerBytes[11] = 1
+
+	footerBytes := []byte{EcCode, RecordEndMark}
+
+	newRecordBuf := make([]byte, 0, len(headerBytes)+len(encoded)+len(footerBytes))
+	newRecordBuf = append(newRecordBuf, headerBytes...)
+	newRecordBuf = append(newRecordBuf, encoded...)
+	newRecordBuf = append(newRecordBuf, footerBytes...)
+
+	newOffset, _ := t.db.alloc.Allocate(uint64(len(newRecordBuf)))
+	t.db.writeAt(newRecordBuf, int64(newOffset))
+
+	if t.maxVersions > 0 {
+		versions := t.db.versionIndex.GetVersions(indexKey)
+		if len(versions) == 0 {
+			t.db.versionIndex.Add(indexKey, 1, oldOffset, time.Now().UnixNano())
+		}
+		newVersion := uint32(1)
+		for _, v := range versions {
+			if v.Version >= newVersion {
+				newVersion = v.Version + 1
+			}
+		}
+		t.db.versionIndex.Add(indexKey, newVersion, newOffset, time.Now().UnixNano())
+	} else {
+		t.db.writeAt([]byte{0}, int64(oldOffset+11))
+	}
+
+	newVal := make([]byte, 8)
+	binary.BigEndian.PutUint64(newVal, newOffset)
+	t.db.pkIndex.Set(indexKey, newVal)
+
+	if t.idxMgr != nil {
+		t.idxMgr.UpdateIndexes(record, newOffset)
+	}
+
+	return nil
+}
+
+func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
+	t.db.mu.Lock()
+	defer t.db.mu.Unlock()
+
+	indexKey := encodePKForIndex(t.tableID, id)
+	_, exists := t.db.pkIndex.Get(indexKey)
+
+	if exists {
+		if err := t.updateLocked(id, record); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+
+	entry := t.db.tableCat[t.name]
+	if entry == nil {
+		return 0, false, fmt.Errorf("table not found")
+	}
+
+	recordID := entry.NextRecordID
+	entry.NextRecordID++
+
+	t.setPKValue(record, id)
+
+	encoded, err := t.encodeRecord(record)
+	if err != nil {
+		return 0, true, fmt.Errorf("failed to encode record: %v", err)
+	}
+
+	headerBytes := make([]byte, 12)
+	headerBytes[0] = EcCode
+	headerBytes[1] = RecordStartMark
+	headerBytes[2] = t.tableID
+	binary.BigEndian.PutUint32(headerBytes[3:7], recordID)
 	binary.BigEndian.PutUint32(headerBytes[7:11], uint32(len(encoded)))
 	headerBytes[11] = 1
 
@@ -1344,48 +1457,48 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	recordBuf = append(recordBuf, encoded...)
 	recordBuf = append(recordBuf, footerBytes...)
 
-	t.db.file.WriteAt(recordBuf, int64(offset))
+	offset, _ := t.db.alloc.Allocate(uint64(len(recordBuf)))
+	t.db.writeAt(recordBuf, int64(offset))
+
+	pkVal, _ := t.getPKValue(record)
+	pkIndexKey := encodePKForIndex(t.tableID, pkVal)
+	val := make([]byte, 8)
+	binary.BigEndian.PutUint64(val, offset)
+	t.db.pkIndex.Set(pkIndexKey, val)
 
 	if t.idxMgr != nil {
-		t.idxMgr.UpdateIndexes(record, recID)
+		t.idxMgr.InsertIntoIndexes(record, offset)
 	}
 
-	return nil
-}
-
-func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
-	existing, err := t.Get(id)
-	if err == nil && existing != nil {
-		if updateErr := t.Update(id, record); updateErr != nil {
-			return 0, false, updateErr
-		}
-		return 0, false, nil
+	if t.db.tx != nil {
+		t.db.tx.recordCounts[t.name]++
+	} else {
+		entry.RecordCount++
 	}
 
-	t.setPKValue(record, id)
-	insertID, err := t.Insert(record)
-	if err != nil {
-		return 0, true, err
-	}
-	return insertID, true, nil
+	t.db.autoSync()
+
+	return recordID, true, nil
 }
 
 func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
-		recordIDs, err := t.idxMgr.Query(fieldName, value)
+		offsets, err := t.idxMgr.Query(fieldName, value)
 		if err != nil {
 			return nil, err
 		}
 
-		slices.Sort(recordIDs)
-		results := make([]T, 0, len(recordIDs))
+		slices.Sort(offsets)
+		results := make([]T, 0, len(offsets))
 
-		for _, id := range recordIDs {
-			record, err := t.Get(id)
+		t.db.mu.RLock()
+		for _, off := range offsets {
+			record, err := t.getByOffset(off)
 			if err == nil && record != nil {
 				results = append(results, *record)
 			}
 		}
+		t.db.mu.RUnlock()
 
 		return results, nil
 	}
@@ -1402,20 +1515,22 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 
 func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
 	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
-		recordIDs, err := t.idxMgr.QueryRangeGreaterThan(fieldName, value, inclusive)
+		offsets, err := t.idxMgr.QueryRangeGreaterThan(fieldName, value, inclusive)
 		if err != nil {
 			return nil, err
 		}
 
-		slices.Sort(recordIDs)
-		results := make([]T, 0, len(recordIDs))
+		slices.Sort(offsets)
+		results := make([]T, 0, len(offsets))
 
-		for _, id := range recordIDs {
-			record, err := t.Get(id)
+		t.db.mu.RLock()
+		for _, off := range offsets {
+			record, err := t.getByOffset(off)
 			if err == nil && record != nil {
 				results = append(results, *record)
 			}
 		}
+		t.db.mu.RUnlock()
 
 		return results, nil
 	}
@@ -1428,20 +1543,22 @@ func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, in
 
 func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
 	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
-		recordIDs, err := t.idxMgr.QueryRangeLessThan(fieldName, value, inclusive)
+		offsets, err := t.idxMgr.QueryRangeLessThan(fieldName, value, inclusive)
 		if err != nil {
 			return nil, err
 		}
 
-		slices.Sort(recordIDs)
-		results := make([]T, 0, len(recordIDs))
+		slices.Sort(offsets)
+		results := make([]T, 0, len(offsets))
 
-		for _, id := range recordIDs {
-			record, err := t.Get(id)
+		t.db.mu.RLock()
+		for _, off := range offsets {
+			record, err := t.getByOffset(off)
 			if err == nil && record != nil {
 				results = append(results, *record)
 			}
 		}
+		t.db.mu.RUnlock()
 
 		return results, nil
 	}
@@ -1454,20 +1571,22 @@ func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclu
 
 func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
 	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
-		recordIDs, err := t.idxMgr.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
+		offsets, err := t.idxMgr.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
 		if err != nil {
 			return nil, err
 		}
 
-		slices.Sort(recordIDs)
-		results := make([]T, 0, len(recordIDs))
+		slices.Sort(offsets)
+		results := make([]T, 0, len(offsets))
 
-		for _, id := range recordIDs {
-			record, err := t.Get(id)
+		t.db.mu.RLock()
+		for _, off := range offsets {
+			record, err := t.getByOffset(off)
 			if err == nil && record != nil {
 				results = append(results, *record)
 			}
 		}
+		t.db.mu.RUnlock()
 
 		return results, nil
 	}
@@ -1855,38 +1974,37 @@ func (t *Table[T]) ScanRecords() *Scanner[T] {
 }
 
 func (s *Scanner[T]) Next() bool {
-	if s.err != nil || s.pos >= len(s.indexKeys) {
-		return false
-	}
-
-	encodedPK := s.indexKeys[s.pos][1:]
-	var pkVal any
-	switch s.table.layout.PKType {
-	case reflect.String:
-		pkVal, _, _ = embedcore.DecodeString(encodedPK)
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		val, _, _ := embedcore.DecodeUvarint(encodedPK)
-		pkVal = int(int64(val))
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		val, _, _ := embedcore.DecodeUvarint(encodedPK)
-		pkVal = uint64(val)
-	default:
-		val, _, _ := embedcore.DecodeUvarint(encodedPK)
-		pkVal = uint64(val)
-	}
-
-	record, err := s.table.Get(pkVal)
-	if err != nil {
-		s.pos++
-		if s.pos < len(s.indexKeys) {
-			return s.Next()
+	for {
+		if s.err != nil || s.pos >= len(s.indexKeys) {
+			return false
 		}
-		return false
-	}
 
-	s.current = record
-	s.pos++
-	return true
+		encodedPK := s.indexKeys[s.pos][1:]
+		var pkVal any
+		switch s.table.layout.PKType {
+		case reflect.String:
+			pkVal, _, _ = embedcore.DecodeString(encodedPK)
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			val, _, _ := embedcore.DecodeUvarint(encodedPK)
+			pkVal = int(int64(val))
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			val, _, _ := embedcore.DecodeUvarint(encodedPK)
+			pkVal = uint64(val)
+		default:
+			val, _, _ := embedcore.DecodeUvarint(encodedPK)
+			pkVal = uint64(val)
+		}
+
+		record, err := s.table.Get(pkVal)
+		if err != nil {
+			s.pos++
+			continue
+		}
+
+		s.current = record
+		s.pos++
+		return true
+	}
 }
 
 func (s *Scanner[T]) Record() (*T, error) {
@@ -1938,31 +2056,14 @@ func (t *Table[T]) rebuildSecondaryIndexes() {
 			return true
 		}
 
-		var recordID uint32
-		switch t.layout.PKType {
-		case reflect.String:
-			_, idStr, _ := embedcore.DecodeString(k[1:])
-			if len(idStr) >= 4 {
-				recordID = binary.BigEndian.Uint32(idStr[:4])
-			}
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			val, _, _ := embedcore.DecodeUvarint(k[1:])
-			recordID = uint32(int64(val))
-		default:
-			val, _, _ := embedcore.DecodeUvarint(k[1:])
-			recordID = uint32(val)
-		}
+		offset := binary.BigEndian.Uint64(v)
 
-		if recordID == 0 {
-			return true
-		}
-
-		record, err := t.Get(recordID)
+		record, err := t.getByOffset(offset)
 		if err != nil {
 			return true
 		}
 
-		t.idxMgr.InsertIntoIndexes(record, recordID)
+		t.idxMgr.InsertIntoIndexes(record, offset)
 		return true
 	})
 }

@@ -9,8 +9,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbmmap"
 )
 
 const (
@@ -117,24 +119,24 @@ type pkIndexInterface interface {
 	SetRootOffset(off uint64)
 }
 
-type uint32MapIndex struct {
+type offsetMapIndex struct {
 	mu   sync.RWMutex
-	data map[string][]uint32
+	data map[string][]uint64
 }
 
-func newUint32MapIndex() *uint32MapIndex {
-	return &uint32MapIndex{
-		data: make(map[string][]uint32),
+func newOffsetMapIndex() *offsetMapIndex {
+	return &offsetMapIndex{
+		data: make(map[string][]uint64),
 	}
 }
 
-func (mi *uint32MapIndex) Set(key string, value uint32) {
+func (mi *offsetMapIndex) Set(key string, value uint64) {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
 	mi.data[key] = append(mi.data[key], value)
 }
 
-func (mi *uint32MapIndex) Get(key string) (uint32, bool) {
+func (mi *offsetMapIndex) Get(key string) (uint64, bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	vals, ok := mi.data[key]
@@ -144,23 +146,25 @@ func (mi *uint32MapIndex) Get(key string) (uint32, bool) {
 	return vals[0], true
 }
 
-func (mi *uint32MapIndex) GetAll(key string) ([]uint32, bool) {
+func (mi *offsetMapIndex) GetAll(key string) ([]uint64, bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	vals, ok := mi.data[key]
 	if !ok || len(vals) == 0 {
 		return nil, false
 	}
-	return vals, true
+	result := make([]uint64, len(vals))
+	copy(result, vals)
+	return result, true
 }
 
-func (mi *uint32MapIndex) Delete(key string) {
+func (mi *offsetMapIndex) Delete(key string) {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
 	delete(mi.data, key)
 }
 
-func (mi *uint32MapIndex) Range(fn func(k string, v uint32) bool) {
+func (mi *offsetMapIndex) Range(fn func(k string, v uint64) bool) {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	for k, v := range mi.data {
@@ -172,13 +176,13 @@ func (mi *uint32MapIndex) Range(fn func(k string, v uint32) bool) {
 	}
 }
 
-func (mi *uint32MapIndex) Size() int {
+func (mi *offsetMapIndex) Size() int {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	return len(mi.data)
 }
 
-func (mi *uint32MapIndex) SortedKeys() []string {
+func (mi *offsetMapIndex) SortedKeys() []string {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 	keys := make([]string, 0, len(mi.data))
@@ -189,12 +193,12 @@ func (mi *uint32MapIndex) SortedKeys() []string {
 	return keys
 }
 
-type uint32IndexInterface interface {
-	Set(key string, value uint32)
-	Get(key string) (uint32, bool)
-	GetAll(key string) ([]uint32, bool)
+type offsetIndexInterface interface {
+	Set(key string, value uint64)
+	Get(key string) (uint64, bool)
+	GetAll(key string) ([]uint64, bool)
 	Delete(key string)
-	Range(fn func(k string, v uint32) bool)
+	Range(fn func(k string, v uint64) bool)
 	SortedKeys() []string
 	Size() int
 }
@@ -219,7 +223,6 @@ type tableCatalogEntry struct {
 	Dropped      bool
 	RecordCount  uint32
 	MaxVersions  uint8
-	BTreeRoot    uint64
 }
 
 type tableCatalog map[string]*tableCatalogEntry
@@ -339,7 +342,12 @@ func (vi *versionIndex) RestoreSnapshot() {
 	vi.mu.Lock()
 	defer vi.mu.Unlock()
 	if vi.snapshot != nil {
-		vi.data = vi.snapshot
+		vi.data = make(map[string][]VersionInfo, len(vi.snapshot))
+		for k, versions := range vi.snapshot {
+			versionsCopy := make([]VersionInfo, len(versions))
+			copy(versionsCopy, versions)
+			vi.data[k] = versionsCopy
+		}
 		vi.snapshot = nil
 	}
 }
@@ -353,26 +361,28 @@ func (vi *versionIndex) ClearSnapshot() {
 func (db *database) encodeVersionCatalog() []byte {
 	var buf []byte
 
-	count := uint32(0)
 	vi := db.versionIndex
 	vi.mu.RLock()
+
+	count := uint32(0)
 	for _, versions := range vi.data {
 		count += uint32(len(versions))
 	}
-	vi.mu.RUnlock()
 
 	buf = binary.LittleEndian.AppendUint32(buf, count)
 
-	vi.Range(func(key []byte, versions []VersionInfo) bool {
+	for key, versions := range vi.data {
+		keyBytes := []byte(key)
 		for _, v := range versions {
-			buf = embedcore.EncodeUvarint(buf, uint64(len(key)))
-			buf = append(buf, key...)
+			buf = embedcore.EncodeUvarint(buf, uint64(len(keyBytes)))
+			buf = append(buf, keyBytes...)
 			buf = binary.LittleEndian.AppendUint32(buf, v.Version)
 			buf = binary.LittleEndian.AppendUint64(buf, v.Offset)
 			buf = binary.LittleEndian.AppendUint64(buf, uint64(v.CreatedAt))
 		}
-		return true
-	})
+	}
+
+	vi.mu.RUnlock()
 
 	return buf
 }
@@ -446,6 +456,7 @@ type database struct {
 	mu            sync.RWMutex
 	file          *os.File
 	filename      string
+	region        *embeddbmmap.MappedRegion
 	pkIndex       pkIndexInterface
 	alloc         *allocator
 	tableCat      tableCatalog
@@ -453,6 +464,97 @@ type database struct {
 	parent        *DB
 	versionIndex  *versionIndex
 	pkIndexBTRoot uint64
+}
+
+func (db *database) ensureRegion(size int64) error {
+	if db.region == nil {
+		alignedSize := pageAlign(size)
+		if stat, err := db.file.Stat(); err == nil {
+			if stat.Size() > alignedSize {
+				alignedSize = pageAlign(stat.Size())
+			}
+		}
+		if err := db.file.Truncate(alignedSize); err != nil {
+			return err
+		}
+		region, err := embeddbmmap.Map(int(db.file.Fd()), 0, alignedSize, embeddbmmap.ProtRead|embeddbmmap.ProtWrite, embeddbmmap.MapShared)
+		if err != nil {
+			region, err = embeddbmmap.Map(int(db.file.Fd()), 0, alignedSize, embeddbmmap.ProtRead, embeddbmmap.MapShared)
+			if err != nil {
+				return err
+			}
+		}
+		db.region = region
+		db.region.Advise(embeddbmmap.AdviceRandom)
+		return nil
+	}
+	alignedSize := pageAlign(size)
+	if stat, err := db.file.Stat(); err == nil {
+		if stat.Size() > alignedSize {
+			alignedSize = pageAlign(stat.Size())
+		}
+	}
+	if alignedSize <= db.region.Size() {
+		return nil
+	}
+	if err := db.file.Truncate(alignedSize); err != nil {
+		return err
+	}
+	relocated, err := db.region.Resize(alignedSize)
+	if err != nil {
+		return err
+	}
+	_ = relocated
+	return nil
+}
+
+func (db *database) shrinkRegion(size int64) error {
+	if db.region == nil {
+		return nil
+	}
+	alignedSize := pageAlign(size)
+	if alignedSize < db.region.Size() {
+		_, err := db.region.Resize(alignedSize)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *database) readAt(buf []byte, offset int64) {
+	if db.region != nil {
+		needed := offset + int64(len(buf))
+		if needed > db.region.Size() {
+			db.ensureRegion(needed)
+		}
+		copy(buf, unsafe.Slice((*byte)(unsafe.Add(db.region.Pointer(), offset)), len(buf)))
+		return
+	}
+	db.file.ReadAt(buf, offset)
+}
+
+func (db *database) writeAt(buf []byte, offset int64) {
+	if db.region != nil {
+		needed := offset + int64(len(buf))
+		if needed > db.region.Size() {
+			db.ensureRegion(needed)
+		}
+		copy(unsafe.Slice((*byte)(unsafe.Add(db.region.Pointer(), offset)), len(buf)), buf)
+		return
+	}
+	db.file.WriteAt(buf, offset)
+}
+
+func (db *database) readAtFn() func([]byte, int64) {
+	if db.region != nil {
+		return func(buf []byte, offset int64) {
+			copy(buf, unsafe.Slice((*byte)(unsafe.Add(db.region.Pointer(), offset)), len(buf)))
+		}
+	}
+	return func(buf []byte, offset int64) {
+		db.file.ReadAt(buf, offset)
+	}
 }
 
 func openDatabase(filename string, migrate bool, parent *DB) (*database, error) {
@@ -468,7 +570,11 @@ func openDatabase(filename string, migrate bool, parent *DB) (*database, error) 
 
 	alloc := newAllocator(file)
 
-	stat, _ := file.Stat()
+	stat, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to stat file: %v", err)
+	}
 	var pkIndexBTRoot uint64
 	if stat.Size() > 0 {
 		headerBuf := make([]byte, 64)
@@ -493,6 +599,18 @@ func openDatabase(filename string, migrate bool, parent *DB) (*database, error) 
 	if stat.Size() == 0 {
 		db.alloc.Reset(4096, nil)
 	}
+
+	mmapSize := pageAlign(4096)
+	if stat.Size() > mmapSize {
+		mmapSize = pageAlign(stat.Size())
+	}
+	file.Truncate(mmapSize)
+	if err := db.ensureRegion(mmapSize); err != nil {
+		unlockFile(file)
+		file.Close()
+		return nil, err
+	}
+	db.alloc.region = db.region
 
 	var pkIdx pkIndexInterface
 	btIdx, err := newBtreeMapIndex(db, pkIndexBTRoot)
@@ -530,10 +648,7 @@ func (db *database) load() error {
 	}
 
 	var header [64]byte
-	if _, err := db.file.ReadAt(header[:], 0); err != nil {
-		return err
-	}
-
+	db.readAt(header[:], 0)
 	if header[0] != EcCode || header[1] != RecordStartMark {
 		return fmt.Errorf("invalid database header")
 	}
@@ -561,27 +676,18 @@ func (db *database) load() error {
 			tocLen := int(versionCatalogOffset) - int(tocOffset)
 			if tocLen > 0 && tocLen < 1024*1024 {
 				tocData = make([]byte, tocLen)
-				_, err = db.file.ReadAt(tocData, int64(tocOffset))
-				if err != nil {
-					return err
-				}
+				db.readAt(tocData, int64(tocOffset))
 			}
 			versionLen := int(stat.Size()) - int(versionCatalogOffset)
 			if versionLen > 0 && versionLen < 10*1024*1024 {
 				versionCatalogData = make([]byte, versionLen)
-				_, err = db.file.ReadAt(versionCatalogData, int64(versionCatalogOffset))
-				if err != nil {
-					return err
-				}
+				db.readAt(versionCatalogData, int64(versionCatalogOffset))
 			}
 		} else if int(tocOffset) < int(stat.Size()) {
 			tocLen := int(stat.Size()) - int(tocOffset)
 			if tocLen > 0 && tocLen < 1024*1024 {
 				tocData = make([]byte, tocLen)
-				_, err = db.file.ReadAt(tocData, int64(tocOffset))
-				if err != nil {
-					return err
-				}
+				db.readAt(tocData, int64(tocOffset))
 			}
 		}
 
@@ -613,8 +719,9 @@ func (db *database) load() error {
 		if stat.Size() > recordStart && endOffset > recordStart {
 			for offset := recordStart; offset < endOffset; offset++ {
 				hdrBuf := make([]byte, 12)
-				_, err := db.file.ReadAt(hdrBuf, offset)
-				if err != nil || hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
+				db.readAt(hdrBuf, offset)
+
+				if hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
 					continue
 				}
 
@@ -627,10 +734,7 @@ func (db *database) load() error {
 
 				recordBuf := make([]byte, totalLen)
 				copy(recordBuf, hdrBuf)
-				_, err = db.file.ReadAt(recordBuf[12:], offset+12)
-				if err != nil {
-					break
-				}
+				db.readAt(recordBuf[12:], offset+12)
 
 				tableID := recordBuf[2]
 				recordID := binary.BigEndian.Uint32(recordBuf[3:7])
@@ -689,11 +793,7 @@ func (db *database) rebuildIndexFromScan() error {
 
 		recordBuf := make([]byte, totalLen)
 		copy(recordBuf, hdrBuf)
-		_, err = db.file.ReadAt(recordBuf[12:], offset+12)
-		if err != nil {
-			offset++
-			continue
-		}
+		db.readAt(recordBuf[12:], offset+12)
 
 		if recordBuf[totalLen-2] == EcCode && recordBuf[totalLen-1] == RecordEndMark {
 			tableID := recordBuf[2]
@@ -829,10 +929,7 @@ func (db *database) flush() error {
 
 	for _, rec := range records {
 		hdrBuf := make([]byte, 12)
-		_, err := db.file.ReadAt(hdrBuf, int64(rec.offset))
-		if err != nil {
-			continue
-		}
+		db.readAt(hdrBuf, int64(rec.offset))
 		if hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
 			continue
 		}
@@ -843,13 +940,12 @@ func (db *database) flush() error {
 		copy(recData, hdrBuf)
 
 		if totalLen > 12 {
-			n, err := db.file.ReadAt(recData[12:], int64(rec.offset)+12)
-			if err != nil || n < totalLen-12 {
-				continue
-			}
+			db.readAt(recData[12:], int64(rec.offset)+12)
 		}
 
-		db.file.WriteAt(recData, recordDataStart)
+		if _, err := db.file.WriteAt(recData, recordDataStart); err != nil {
+			return err
+		}
 
 		newVal := make([]byte, 8)
 		binary.BigEndian.PutUint64(newVal, uint64(recordDataStart))
@@ -880,23 +976,26 @@ func (db *database) flush() error {
 		}
 	}
 
-	// Rebuild the B-tree from scratch so its nodes are allocated contiguously
-	// after the compacted records.  The old B-tree nodes are scattered
-	// throughout the file and will be discarded by the truncation below.
 	if bti, ok := db.pkIndex.(*btreeMapIndex); ok {
 		bti.bt.Close()
 	}
 
-	// Reset allocator so new B-tree nodes are allocated right after the records.
-	// Ensure a minimum offset so we don't overwrite the file header.
 	btreeStart := uint64(recordDataStart)
 	if btreeStart < 4096 {
 		btreeStart = 4096
 	}
+
+	db.file.Sync()
+
 	db.alloc.Reset(btreeStart, nil)
-	// Force actualSize to match so Allocate extends from the right place.
 	db.file.Truncate(int64(btreeStart))
+	if db.region != nil {
+		db.region.Unmap()
+		db.region = nil
+	}
+	db.ensureRegion(pageAlign(int64(btreeStart)))
 	db.alloc.SetFile(db.file)
+	db.alloc.region = db.region
 
 	newBtIdx, err := newBtreeMapIndex(db, 0)
 	if err != nil {
@@ -909,38 +1008,32 @@ func (db *database) flush() error {
 	db.pkIndex = newBtIdx
 	db.pkIndexBTRoot = newBtIdx.RootOffset()
 
-	// The allocator's nextOffset now sits past the last B-tree node.
 	catOffset := int64(db.alloc.nextOffset)
 
 	binary.LittleEndian.PutUint32(header[36:40], uint32(catOffset))
 
-	if _, err := db.file.WriteAt(header, 0); err != nil {
-		return err
-	}
+	db.writeAt(header, 0)
 
-	if _, err := db.file.WriteAt(encodedCat, catOffset); err != nil {
-		return err
-	}
+	db.writeAt(encodedCat, catOffset)
 
 	versionCatOffset := catOffset + int64(len(encodedCat))
 	binary.LittleEndian.PutUint32(header[48:56], uint32(versionCatOffset))
 	binary.LittleEndian.PutUint64(header[56:64], db.pkIndexBTRoot)
 	binary.LittleEndian.PutUint64(header[40:48], db.alloc.nextOffset)
 
-	if _, err := db.file.WriteAt(encodedVersionCat, versionCatOffset); err != nil {
-		return err
-	}
+	db.writeAt(encodedVersionCat, versionCatOffset)
 
 	newSize := versionCatOffset + int64(len(encodedVersionCat))
-	if err := db.file.Truncate(newSize); err != nil {
-		return err
+	db.file.Truncate(newSize)
+	db.file.Sync()
+	if db.region != nil {
+		db.region.Unmap()
+		db.region = nil
 	}
+	db.ensureRegion(pageAlign(newSize))
 
-	if _, err := db.file.WriteAt(header, 0); err != nil {
-		return err
-	}
+	db.writeAt(header, 0)
 
-	// Re-open the B-tree so it re-mmaps the final file.
 	if bti, ok := db.pkIndex.(*btreeMapIndex); ok {
 		bti.bt.Close()
 	}
@@ -950,7 +1043,7 @@ func (db *database) flush() error {
 	}
 	db.pkIndex = reopenedBtIdx
 
-	return db.file.Sync()
+	return db.region.Sync(embeddbmmap.SyncSync)
 }
 
 func (db *database) encodeTableCatalog() []byte {
@@ -989,6 +1082,10 @@ func (db *database) Close() error {
 		return err
 	}
 
+	if db.region != nil {
+		db.region.Unmap()
+		db.region = nil
+	}
 	unlockFile(db.file)
 	return db.file.Close()
 }
@@ -1016,7 +1113,9 @@ func (db *database) autoSync() {
 
 	if syncNeeded {
 		for _, t := range db.parent.tables {
-			t.file.Sync()
+			if t.region != nil {
+				t.region.Sync(embeddbmmap.SyncAsync)
+			}
 		}
 		db.parent.writeCount = 0
 		db.parent.lastSync = time.Now()
@@ -1094,10 +1193,7 @@ func (db *database) Vacuum() error {
 
 			offset := binary.BigEndian.Uint64(val)
 			recordBuf := make([]byte, 4096)
-			n, _ := db.file.ReadAt(recordBuf, int64(offset))
-			if n < 14 {
-				continue
-			}
+			db.readAt(recordBuf, int64(offset))
 
 			if recordBuf[0] != EcCode || recordBuf[1] != RecordStartMark {
 				continue
@@ -1111,7 +1207,7 @@ func (db *database) Vacuum() error {
 			recLen := binary.BigEndian.Uint32(recordBuf[7:11])
 			totalLen := 12 + int(recLen) + 2
 
-			if totalLen <= n && totalLen >= 14 {
+			if totalLen >= 14 && totalLen <= 4096 {
 				record := recordBuf[:totalLen]
 				if _, err := newFile.Write(record); err != nil {
 					newFile.Close()
@@ -1184,6 +1280,11 @@ func (db *database) Vacuum() error {
 	db.alloc.Reset(uint64(versionCatOffset+int64(len(versionCatData))), nil)
 
 	newFile.Close()
+
+	if db.region != nil {
+		db.region.Unmap()
+		db.region = nil
+	}
 	db.file.Close()
 
 	if err := os.Rename(db.filename+".vacuum", db.filename); err != nil {
@@ -1199,7 +1300,13 @@ func (db *database) Vacuum() error {
 		return err
 	}
 
+	vacSize := int64(0)
+	if stat, err := db.file.Stat(); err == nil {
+		vacSize = stat.Size()
+	}
+	db.ensureRegion(pageAlign(vacSize))
 	db.alloc.SetFile(db.file)
+	db.alloc.region = db.region
 
 	// Close old B-tree (if any) before rebuilding.
 	if bti, ok := db.pkIndex.(*btreeMapIndex); ok {
@@ -1221,15 +1328,11 @@ func (db *database) Vacuum() error {
 
 	// Update the header with the B-tree root offset.
 	header = make([]byte, 64)
-	if _, err := db.file.ReadAt(header, 0); err != nil {
-		return err
-	}
+	db.readAt(header, 0)
 	binary.LittleEndian.PutUint64(header[56:64], db.pkIndexBTRoot)
-	if _, err := db.file.WriteAt(header, 0); err != nil {
-		return err
-	}
+	db.writeAt(header, 0)
 
-	return db.file.Sync()
+	return db.region.Sync(embeddbmmap.SyncSync)
 }
 
 type Transaction struct {
@@ -1311,12 +1414,14 @@ func (tx *Transaction) Rollback() error {
 		bti.SetRootOffset(tx.pkRootSnapshot)
 	}
 
-	tx.db.versionIndex.Clear()
+	tx.db.versionIndex.mu.Lock()
+	tx.db.versionIndex.data = make(map[string][]VersionInfo)
 	for k, versions := range tx.versionIndexSnapshot {
 		versionsCopy := make([]VersionInfo, len(versions))
 		copy(versionsCopy, versions)
 		tx.db.versionIndex.data[k] = versionsCopy
 	}
+	tx.db.versionIndex.mu.Unlock()
 
 	for tableName, delta := range tx.recordCounts {
 		if entry := tx.db.tableCat[tableName]; entry != nil {
@@ -1357,8 +1462,8 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 
 	for _, rec := range records {
 		hdrBuf := make([]byte, 12)
-		_, err := db.file.ReadAt(hdrBuf, int64(rec.offset))
-		if err != nil || hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
+		db.readAt(hdrBuf, int64(rec.offset))
+		if hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
 			continue
 		}
 
@@ -1367,10 +1472,7 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 
 		recordBuf := make([]byte, totalLen)
 		copy(recordBuf, hdrBuf)
-		_, err = db.file.ReadAt(recordBuf[12:], int64(rec.offset)+12)
-		if err != nil {
-			continue
-		}
+		db.readAt(recordBuf[12:], int64(rec.offset)+12)
 
 		recordID := binary.BigEndian.Uint32(recordBuf[3:7])
 		active := recordBuf[11]
@@ -1427,7 +1529,7 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 		newRecord = append(newRecord, newFooter...)
 
 		newOffset, _ := db.alloc.Allocate(uint64(len(newRecord)))
-		db.file.WriteAt(newRecord, int64(newOffset))
+		db.writeAt(newRecord, int64(newOffset))
 
 		newVal := make([]byte, 8)
 		binary.BigEndian.PutUint64(newVal, newOffset)
