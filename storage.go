@@ -67,10 +67,10 @@ func (a *allocator) Allocate(size uint64) (offset uint64, length uint64) {
 	offset = a.actualSize
 	a.actualSize += size
 	a.nextOffset = a.actualSize
-	a.file.Truncate(int64(a.actualSize))
 	if a.region != nil {
 		alignedSize := pageAlign(int64(a.actualSize))
 		if alignedSize > a.region.Size() {
+			a.file.Truncate(alignedSize)
 			a.region.Resize(alignedSize)
 		}
 	}
