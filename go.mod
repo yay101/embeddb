@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	github.com/yay101/embeddbcore v0.3.0
-	github.com/yay101/embeddbmmap v0.1.0
+	github.com/yay101/embeddbmmap v0.1.1
 )
 
 require golang.org/x/sys v0.43.0 // indirect
