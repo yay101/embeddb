@@ -989,11 +989,7 @@ func (db *database) flush() error {
 
 	db.alloc.Reset(btreeStart, nil)
 	db.file.Truncate(int64(btreeStart))
-	if db.region != nil {
-		db.region.Unmap()
-		db.region = nil
-	}
-	db.ensureRegion(pageAlign(int64(btreeStart)))
+	db.shrinkRegion(int64(btreeStart))
 	db.alloc.SetFile(db.file)
 	db.alloc.region = db.region
 
@@ -1026,11 +1022,7 @@ func (db *database) flush() error {
 	newSize := versionCatOffset + int64(len(encodedVersionCat))
 	db.file.Truncate(newSize)
 	db.file.Sync()
-	if db.region != nil {
-		db.region.Unmap()
-		db.region = nil
-	}
-	db.ensureRegion(pageAlign(newSize))
+	db.shrinkRegion(newSize)
 
 	db.writeAt(header, 0)
 
