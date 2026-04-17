@@ -1453,6 +1453,13 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 		offset uint64
 	}
 
+	type migratedRow struct {
+		key       []byte
+		oldOffset uint64
+		newOffset uint64
+		versions  []VersionInfo
+	}
+
 	var records []migrateRecord
 
 	db.pkIndex.Range(func(k []byte, v []byte) bool {
@@ -1470,6 +1477,15 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 		return nil
 	}
 
+	type pendingWrite struct {
+		newRecord []byte
+		newOffset uint64
+		oldOffset uint64
+		key       []byte
+		versions  []VersionInfo
+	}
+
+	var pending []pendingWrite
 	var maxOffset uint64 = 64
 
 	for _, rec := range records {
@@ -1548,26 +1564,42 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 		if err != nil {
 			return fmt.Errorf("migration allocate failed: %w", err)
 		}
-		db.writeAt(newRecord, int64(newOffset))
-
-		_ = db.writeAt([]byte{0}, int64(rec.offset+11))
-
-		newVal := make([]byte, 8)
-		binary.BigEndian.PutUint64(newVal, newOffset)
-		db.pkIndex.Set(rec.key, newVal)
 
 		versions := db.versionIndex.GetVersions(rec.key)
-		for _, v := range versions {
-			if v.Offset == rec.offset {
-				db.versionIndex.RemoveVersion(rec.key, v.Version)
-				db.versionIndex.Add(rec.key, v.Version, newOffset, v.CreatedAt)
-				break
-			}
-		}
+
+		pending = append(pending, pendingWrite{
+			newRecord: newRecord,
+			newOffset: newOffset,
+			oldOffset: rec.offset,
+			key:       rec.key,
+			versions:  versions,
+		})
 
 		endOffset := newOffset + uint64(len(newRecord))
 		if endOffset > maxOffset {
 			maxOffset = endOffset
+		}
+	}
+
+	for _, pw := range pending {
+		if err := db.writeAt(pw.newRecord, int64(pw.newOffset)); err != nil {
+			return fmt.Errorf("migration write failed: %w", err)
+		}
+	}
+
+	for _, pw := range pending {
+		_ = db.writeAt([]byte{0}, int64(pw.oldOffset+11))
+
+		newVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(newVal, pw.newOffset)
+		db.pkIndex.Set(pw.key, newVal)
+
+		for _, v := range pw.versions {
+			if v.Offset == pw.oldOffset {
+				db.versionIndex.RemoveVersion(pw.key, v.Version)
+				db.versionIndex.Add(pw.key, v.Version, pw.newOffset, v.CreatedAt)
+				break
+			}
 		}
 	}
 

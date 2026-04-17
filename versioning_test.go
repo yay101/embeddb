@@ -267,11 +267,11 @@ func TestVersioningPersistence(t *testing.T) {
 
 	versionsAfterReopen, err := docs2.ListVersions(id)
 	if err != nil {
-		t.Logf("warning: list versions after reopen failed: %v", err)
+		t.Fatalf("list versions after reopen failed: %v", err)
 	}
 
-	if versionsAfterReopen != nil && len(versionsAfterReopen) != numVersionsBefore {
-		t.Logf("warning: version count changed after reopen (before: %d, after: %d)", numVersionsBefore, len(versionsAfterReopen))
+	if len(versionsAfterReopen) != numVersionsBefore {
+		t.Errorf("version count changed after reopen (before: %d, after: %d)", numVersionsBefore, len(versionsAfterReopen))
 	}
 }
 

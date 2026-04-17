@@ -112,39 +112,27 @@
 - **Files**: `main.go`, `table_api.go`
 - **Impact**: Failed mmap resize causes reads/writes via invalid pointer → segfault
 - **Fix**: Changed `readAt`/`writeAt` signatures to return `error`. Propagated errors in all user-facing API methods (Get, Update, Delete, Insert, Upsert, etc.) and critical paths (load headers, migration). Internal scan/best-effort paths explicitly discard errors with `_ =`.
-- **Status**: Completed
+- **Status**: Completed (v1.8.3)
 
 #### 27. `readAtFn` captures stale `db.region` by value ✅
 - **File**: `main.go:549-558`
 - **Impact**: Use-after-free if `db.region` changes after Close/Vacuum
 - **Fix**: Closure now dereferences `db.region` at call time with a nil guard
-- **Status**: Completed
+- **Status**: Completed (v1.8.3)
 
 #### 28. Migration data loss when `newEncoded` is empty ✅
 - **File**: `main.go:1528-1530`
 - **Impact**: Records whose fields are all new in the new schema were silently dropped (`continue`)
 - **Fix**: Changed `continue` to write an empty-encoded record (just header+footer), preserving the record's identity and count
-- **Status**: Completed
-
-#### 27. `readAtFn` captures stale `db.region` by value
-- **File**: `main.go:549-558`
-- **Impact**: Use-after-free if `db.region` changes (after Close/Vacuum), leads to segfault
-- **Fix**: Dereference `db.region` inside the closure at call time, not capture time
-- **Status**: Pending
+- **Status**: Completed (v1.8.3)
 
 ### High Bugs
 
-#### 28. Migration data loss when `newEncoded` is empty
-- **File**: `main.go:1503-1507`
-- **Impact**: Records whose fields are all new in the new schema are silently dropped (record skipped with `continue`)
-- **Fix**: Write a record with zero-value encoded fields even when no old data matches
-- **Status**: Pending
-
-#### 29. Partial migration failure leaves DB inconsistent
-- **File**: `main.go:1523`
+#### 29. Partial migration failure leaves DB inconsistent ✅
+- **File**: `main.go`
 - **Impact**: If migration fails partway, some old records are already deactivated but their pkIndex entries still point to the old (inactive) offsets → data loss
-- **Fix**: Deactivate old records only after successfully writing all migrated records, or implement rollback
-- **Status**: Pending
+- **Fix**: Two-phase migration: (1) allocate + prepare all new records, (2) write all new records, (3) then deactivate old records + update indexes. If allocation fails in phase 1, no old records are harmed.
+- **Status**: Completed (v1.8.4)
 
 #### 30. Transaction rollback doesn't restore B-tree disk state
 - **File**: `main.go:1385-1428`
@@ -152,31 +140,31 @@
 - **Fix**: Complex — would need copy-on-write B-tree pages or WAL. Out of scope for now, document as known limitation
 - **Status**: Pending (document)
 
-#### 31. `InsertMany`/`UpdateMany` silently swallow errors
-- **File**: `table_api.go:1199-1236`
-- **Impact**: Callers get no indication that some records failed; returned error is always nil
-- **Fix**: Return a multi-error or partial-results struct; or at minimum return the first error
-- **Status**: Pending
+#### 31. `InsertMany`/`UpdateMany` silently swallow errors ✅
+- **File**: `table_api.go`
+- **Impact**: Callers get no indication that some records failed; returned error was always nil
+- **Fix**: Both methods now collect and return the first error encountered, while still processing remaining records. Callers can check the error to know if some records failed.
+- **Status**: Completed (v1.8.4)
 
-#### 32. `Drop()` doesn't clean version index entries
-- **File**: `table_api.go:2081-2106`
+#### 32. `Drop()` doesn't clean version index entries ✅
+- **File**: `table_api.go:2143-2168`
 - **Impact**: Orphaned version entries consume memory; stale data if table ID is reused
-- **Fix**: Remove version index entries for the dropped table's records
-- **Status**: Pending
+- **Fix**: Added `versionIndex.RemoveKey(k)` call for each key when dropping a table
+- **Status**: Completed (v1.8.4)
 
 #### 33. Concurrent allocate races with mmap resize
 - **File**: `storage.go:70-76`
 - **Impact**: Another goroutine reading from mmap during resize could crash
-- **Fix**: Hold database-level lock during file.Truncate + region.Resize
+- **Fix**: The allocator already holds `a.mu` during resize. The race is with readers using `db.region` directly via `readAt`/`writeAt`. With the new error-returning `readAt`/`writeAt`, `ensureRegion` is now called which acquires no lock — need to verify the allocator's `a.mu` protects the critical section or add coordination.
 - **Status**: Pending
 
 ### High Test Gaps
 
-#### 34. Version persistence not verified after reopen
-- **File**: `versioning_test.go:269-275`
-- **Impact**: `TestVersioningPersistence` uses `t.Logf` instead of assertions
-- **Fix**: Add proper assertions for version count and data after reopen
-- **Status**: Pending
+#### 34. Version persistence not verified after reopen ✅
+- **File**: `versioning_test.go:268-275`
+- **Impact**: `TestVersioningPersistence` used `t.Logf` instead of assertions — version persistence was never actually verified
+- **Fix**: Changed to `t.Fatalf`/`t.Errorf` so the test properly asserts version count after reopen
+- **Status**: Completed (v1.8.4)
 
 #### 35. No tests for `FastSync`
 - **File**: `table_api.go:311-335`

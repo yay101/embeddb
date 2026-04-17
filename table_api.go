@@ -1202,6 +1202,7 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 			oldRecordBuf := make([]byte, totalLen)
 			copy(oldRecordBuf, recordBuf)
 			if err := t.db.readAt(oldRecordBuf[12:], int64(offset)+12); err != nil {
+				continue
 			}
 
 			var oldRecord T
@@ -1228,10 +1229,14 @@ func (t *Table[T]) InsertMany(records []*T) ([]uint32, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
+	var firstErr error
 	ids := make([]uint32, 0, len(records))
 	for _, record := range records {
 		id, err := t.insertLocked(record)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		ids = append(ids, id)
@@ -1239,28 +1244,38 @@ func (t *Table[T]) InsertMany(records []*T) ([]uint32, error) {
 
 	t.db.autoSync()
 
-	return ids, nil
+	return ids, firstErr
 }
 
 func (t *Table[T]) UpdateMany(ids []any, updater func(*T) error) (int, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
+	var firstErr error
 	updated := 0
 	for _, id := range ids {
 		record, err := t.getLocked(id)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		if err := updater(record); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		if err := t.updateLocked(id, record); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		updated++
 	}
-	return updated, nil
+	return updated, firstErr
 }
 
 func (t *Table[T]) insertLocked(record *T) (uint32, error) {
@@ -2145,6 +2160,7 @@ func (t *Table[T]) Drop() error {
 	})
 	for _, k := range keys {
 		t.db.pkIndex.Delete(k)
+		t.db.versionIndex.RemoveKey(k)
 	}
 
 	entry.RecordCount = 0
