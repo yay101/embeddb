@@ -1520,12 +1520,23 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 		newRecord = append(newRecord, newEncoded...)
 		newRecord = append(newRecord, newFooter...)
 
+		db.writeAt([]byte{0}, int64(rec.offset+11))
+
 		newOffset, _ := db.alloc.Allocate(uint64(len(newRecord)))
 		db.writeAt(newRecord, int64(newOffset))
 
 		newVal := make([]byte, 8)
 		binary.BigEndian.PutUint64(newVal, newOffset)
 		db.pkIndex.Set(rec.key, newVal)
+
+		versions := db.versionIndex.GetVersions(rec.key)
+		for _, v := range versions {
+			if v.Offset == rec.offset {
+				db.versionIndex.RemoveVersion(rec.key, v.Version)
+				db.versionIndex.Add(rec.key, v.Version, newOffset, v.CreatedAt)
+				break
+			}
+		}
 
 		endOffset := newOffset + uint64(len(newRecord))
 		if endOffset > maxOffset {

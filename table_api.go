@@ -202,8 +202,11 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 				typedDB.mu.Unlock()
 				return nil, fmt.Errorf("migration failed: %w", err)
 			}
+			table.LayoutHash = layout.Hash
+		} else {
+			typedDB.mu.Unlock()
+			return nil, fmt.Errorf("schema mismatch for table %q: migration is disabled but struct layout has changed", tableName)
 		}
-		table.LayoutHash = layout.Hash
 	}
 	typedDB.mu.Unlock()
 
