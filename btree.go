@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"unsafe"
@@ -74,7 +75,10 @@ func (db *database) openBTree(rootOff uint64) (*BTree, error) {
 	}
 
 	if bt.rootOff == 0 {
-		root := bt.newNode(true)
+		root, err := bt.newNode(true)
+		if err != nil {
+			return nil, err
+		}
 		bt.rootOff = root.Offset
 		bt.writeNode(root)
 	}
@@ -90,7 +94,7 @@ func (db *database) openBTree(rootOff uint64) (*BTree, error) {
 	return bt, nil
 }
 
-func (bt *BTree) newNode(isLeaf bool) *BTreeNode {
+func (bt *BTree) newNode(isLeaf bool) (*BTreeNode, error) {
 	node := &BTreeNode{
 		IsLeaf:   isLeaf,
 		Count:    0,
@@ -101,17 +105,23 @@ func (bt *BTree) newNode(isLeaf bool) *BTreeNode {
 		Dirty:    true,
 	}
 
-	off, _ := bt.alloc.Allocate(BTreePageSize)
+	off, _, err := bt.alloc.Allocate(BTreePageSize)
+	if err != nil {
+		return nil, fmt.Errorf("btree new node allocate: %w", err)
+	}
 	node.Offset = off
 	bt.db.ensureRegion(int64(off) + BTreePageSize)
-	return node
+	return node, nil
 }
 
 const BTreeNodeSize = BTreePageSize
 
 func (bt *BTree) writeNode(node *BTreeNode) error {
 	if node.Offset == 0 {
-		off, _ := bt.alloc.Allocate(BTreePageSize)
+		off, _, err := bt.alloc.Allocate(BTreePageSize)
+		if err != nil {
+			return fmt.Errorf("btree write node allocate: %w", err)
+		}
 		node.Offset = off
 	}
 
@@ -276,14 +286,21 @@ func (bt *BTree) Insert(key []byte, value uint64) error {
 	}
 
 	if root.Count >= BTreeMaxKeys {
-		newRoot := bt.newNode(false)
+		newRoot, err := bt.newNode(false)
+		if err != nil {
+			return err
+		}
 		newRoot.Children = append(newRoot.Children, bt.rootOff)
-		bt.splitChild(newRoot, 0, root)
+		if err := bt.splitChild(newRoot, 0, root); err != nil {
+			return err
+		}
 		bt.rootOff = newRoot.Offset
 		root = newRoot
 	}
 
-	bt.insertNonFull(root, key, value)
+	if err := bt.insertNonFull(root, key, value); err != nil {
+		return err
+	}
 
 	if searchErr != nil {
 		bt.count++
@@ -292,13 +309,13 @@ func (bt *BTree) Insert(key []byte, value uint64) error {
 	return nil
 }
 
-func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) {
+func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) error {
 	if node.IsLeaf {
 		i := findKeyIndex(node.Keys, node.Count, key)
 		if i < node.Count && bytes.Equal(node.Keys[i], key) {
 			node.Values[i] = value
 			bt.writeNode(node)
-			return
+			return nil
 		}
 		node.Keys = append(node.Keys, nil)
 		node.Values = append(node.Values, 0)
@@ -309,39 +326,46 @@ func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) {
 		node.Values[i] = value
 		node.Count++
 		bt.writeNode(node)
-	} else {
-		i := findKeyIndex(node.Keys, node.Count, key)
-		// If key matches at this internal node, update the value here.
-		if i < node.Count && bytes.Equal(node.Keys[i], key) {
+		return nil
+	}
+
+	i := findKeyIndex(node.Keys, node.Count, key)
+	if i < node.Count && bytes.Equal(node.Keys[i], key) {
+		node.Values[i] = value
+		bt.writeNode(node)
+		return nil
+	}
+	child, err := bt.readNode(node.Children[i])
+	if err != nil {
+		return err
+	}
+	if child.Count >= BTreeMaxKeys {
+		if err := bt.splitChild(node, i, child); err != nil {
+			return err
+		}
+		cmp := bytes.Compare(key, node.Keys[i])
+		if cmp > 0 {
+			i++
+		} else if cmp == 0 {
 			node.Values[i] = value
 			bt.writeNode(node)
-			return
+			return nil
 		}
-		child, err := bt.readNode(node.Children[i])
-		if err != nil {
-			return
-		}
-		if child.Count >= BTreeMaxKeys {
-			bt.splitChild(node, i, child)
-			cmp := bytes.Compare(key, node.Keys[i])
-			if cmp > 0 {
-				i++
-			} else if cmp == 0 {
-				// Key matches the just-promoted key; update it directly.
-				node.Values[i] = value
-				bt.writeNode(node)
-				return
-			}
-		}
-		child, _ = bt.readNode(node.Children[i])
-		bt.insertNonFull(child, key, value)
 	}
+	child, err = bt.readNode(node.Children[i])
+	if err != nil {
+		return err
+	}
+	return bt.insertNonFull(child, key, value)
 }
 
-func (bt *BTree) splitChild(parent *BTreeNode, i int, child *BTreeNode) {
+func (bt *BTree) splitChild(parent *BTreeNode, i int, child *BTreeNode) error {
 	mid := child.Count / 2
 
-	newNode := bt.newNode(child.IsLeaf)
+	newNode, err := bt.newNode(child.IsLeaf)
+	if err != nil {
+		return err
+	}
 	newNode.Count = child.Count - mid - 1
 
 	for j := 0; j < newNode.Count; j++ {
@@ -375,6 +399,7 @@ func (bt *BTree) splitChild(parent *BTreeNode, i int, child *BTreeNode) {
 	bt.writeNode(child)
 	bt.writeNode(newNode)
 	bt.writeNode(parent)
+	return nil
 }
 
 func (bt *BTree) Get(key []byte) (uint64, error) {
@@ -398,15 +423,22 @@ func (bt *BTree) Put(key []byte, value uint64) error {
 
 	// Handle full root by splitting, same as Insert.
 	if root.Count >= BTreeMaxKeys {
-		newRoot := bt.newNode(false)
+		newRoot, err := bt.newNode(false)
+		if err != nil {
+			return err
+		}
 		newRoot.Children = append(newRoot.Children, bt.rootOff)
-		bt.splitChild(newRoot, 0, root)
+		if err := bt.splitChild(newRoot, 0, root); err != nil {
+			return err
+		}
 		bt.rootOff = newRoot.Offset
 		root = newRoot
 	}
 
 	// insertNonFull handles both insert and update (at any node level).
-	bt.insertNonFull(root, key, value)
+	if err := bt.insertNonFull(root, key, value); err != nil {
+		return err
+	}
 
 	if existsErr != nil {
 		bt.count++ // new key

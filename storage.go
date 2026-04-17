@@ -1,6 +1,7 @@
 package embeddb
 
 import (
+	"fmt"
 	"os"
 	"sync"
 
@@ -50,7 +51,7 @@ func (a *allocator) SetFile(file *os.File) {
 
 // Allocate returns a free region of at least size bytes.
 // It prefers to reuse a free block; if none is large enough, it extends the file.
-func (a *allocator) Allocate(size uint64) (offset uint64, length uint64) {
+func (a *allocator) Allocate(size uint64) (offset uint64, length uint64, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for i, fb := range a.freeList {
@@ -61,7 +62,7 @@ func (a *allocator) Allocate(size uint64) (offset uint64, length uint64) {
 				a.freeList[i].offset += size
 				a.freeList[i].length -= size
 			}
-			return fb.offset, size
+			return fb.offset, size, nil
 		}
 	}
 	offset = a.actualSize
@@ -70,11 +71,19 @@ func (a *allocator) Allocate(size uint64) (offset uint64, length uint64) {
 	if a.region != nil {
 		alignedSize := pageAlign(int64(a.actualSize))
 		if alignedSize > a.region.Size() {
-			a.file.Truncate(alignedSize)
-			a.region.Resize(alignedSize)
+			if err := a.file.Truncate(alignedSize); err != nil {
+				a.actualSize = offset
+				a.nextOffset = offset
+				return 0, 0, fmt.Errorf("allocate: truncate failed: %w", err)
+			}
+			if _, err := a.region.Resize(alignedSize); err != nil {
+				a.actualSize = offset
+				a.nextOffset = offset
+				return 0, 0, fmt.Errorf("allocate: mmap resize failed: %w", err)
+			}
 		}
 	}
-	return offset, size
+	return offset, size, nil
 }
 
 // Free releases the region [offset, offset+length) back to the free list.

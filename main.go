@@ -1520,10 +1520,13 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 		newRecord = append(newRecord, newEncoded...)
 		newRecord = append(newRecord, newFooter...)
 
-		db.writeAt([]byte{0}, int64(rec.offset+11))
-
-		newOffset, _ := db.alloc.Allocate(uint64(len(newRecord)))
+		newOffset, _, err := db.alloc.Allocate(uint64(len(newRecord)))
+		if err != nil {
+			return fmt.Errorf("migration allocate failed: %w", err)
+		}
 		db.writeAt(newRecord, int64(newOffset))
+
+		db.writeAt([]byte{0}, int64(rec.offset+11))
 
 		newVal := make([]byte, 8)
 		binary.BigEndian.PutUint64(newVal, newOffset)

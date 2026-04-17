@@ -774,7 +774,10 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	recordBuf = append(recordBuf, encoded...)
 	recordBuf = append(recordBuf, footerBytes...)
 
-	offset, _ := t.db.alloc.Allocate(uint64(len(recordBuf)))
+	offset, _, err := t.db.alloc.Allocate(uint64(len(recordBuf)))
+	if err != nil {
+		return 0, fmt.Errorf("failed to allocate space: %w", err)
+	}
 	t.db.writeAt(recordBuf, int64(offset))
 
 	indexKey := encodePKForIndex(t.tableID, pkVal)
@@ -1055,7 +1058,10 @@ func (t *Table[T]) Update(id any, record *T) error {
 	newRecordBuf = append(newRecordBuf, encoded...)
 	newRecordBuf = append(newRecordBuf, footerBytes...)
 
-	newOffset, _ := t.db.alloc.Allocate(uint64(len(newRecordBuf)))
+	newOffset, _, err := t.db.alloc.Allocate(uint64(len(newRecordBuf)))
+	if err != nil {
+		return fmt.Errorf("failed to allocate space: %w", err)
+	}
 	t.db.writeAt(newRecordBuf, int64(newOffset))
 
 	if t.maxVersions > 0 {
@@ -1075,15 +1081,13 @@ func (t *Table[T]) Update(id any, record *T) error {
 		maxTotal := int(t.maxVersions) + 1
 		for len(versions) > maxTotal {
 			oldestIdx := 0
-			oldestVersion := versions[0].Version
 			for i, v := range versions {
 				if v.Version < versions[oldestIdx].Version {
 					oldestIdx = i
-					oldestVersion = v.Version
 				}
 			}
 			t.db.writeAt([]byte{0}, int64(versions[oldestIdx].Offset+11))
-			t.db.versionIndex.RemoveVersion(indexKey, oldestVersion)
+			t.db.versionIndex.RemoveVersion(indexKey, versions[oldestIdx].Version)
 			versions = append(versions[:oldestIdx], versions[oldestIdx+1:]...)
 		}
 	} else {
@@ -1275,7 +1279,10 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	recordBuf = append(recordBuf, encoded...)
 	recordBuf = append(recordBuf, footerBytes...)
 
-	offset, _ := t.db.alloc.Allocate(uint64(len(recordBuf)))
+	offset, _, err := t.db.alloc.Allocate(uint64(len(recordBuf)))
+	if err != nil {
+		return 0, fmt.Errorf("failed to allocate space: %w", err)
+	}
 	t.db.writeAt(recordBuf, int64(offset))
 
 	indexKey := encodePKForIndex(t.tableID, pkVal)
@@ -1386,7 +1393,10 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	newRecordBuf = append(newRecordBuf, encoded...)
 	newRecordBuf = append(newRecordBuf, footerBytes...)
 
-	newOffset, _ := t.db.alloc.Allocate(uint64(len(newRecordBuf)))
+	newOffset, _, err := t.db.alloc.Allocate(uint64(len(newRecordBuf)))
+	if err != nil {
+		return fmt.Errorf("failed to allocate space: %w", err)
+	}
 	t.db.writeAt(newRecordBuf, int64(newOffset))
 
 	if t.maxVersions > 0 {
@@ -1460,7 +1470,10 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	recordBuf = append(recordBuf, encoded...)
 	recordBuf = append(recordBuf, footerBytes...)
 
-	offset, _ := t.db.alloc.Allocate(uint64(len(recordBuf)))
+	offset, _, err := t.db.alloc.Allocate(uint64(len(recordBuf)))
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to allocate space: %w", err)
+	}
 	t.db.writeAt(recordBuf, int64(offset))
 
 	pkVal, _ := t.getPKValue(record)
