@@ -108,12 +108,23 @@
   - Fixed migration order: allocate new space before deactivating old record to prevent data loss on allocation failure
 - **Status**: Completed
 
-#### 26. `readAt`/`writeAt` ignore I/O and `ensureRegion` errors
-- **File**: `main.go:525-547`
+#### 26. `readAt`/`writeAt` ignore I/O and `ensureRegion` errors ✅
+- **Files**: `main.go`, `table_api.go`
 - **Impact**: Failed mmap resize causes reads/writes via invalid pointer → segfault
-- **Fix**: Propagate errors from `ensureRegion`, `file.ReadAt`, `file.WriteAt`
-- **Dependencies**: Requires updating all callers of `readAt`/`writeAt` to handle errors
-- **Status**: Pending
+- **Fix**: Changed `readAt`/`writeAt` signatures to return `error`. Propagated errors in all user-facing API methods (Get, Update, Delete, Insert, Upsert, etc.) and critical paths (load headers, migration). Internal scan/best-effort paths explicitly discard errors with `_ =`.
+- **Status**: Completed
+
+#### 27. `readAtFn` captures stale `db.region` by value ✅
+- **File**: `main.go:549-558`
+- **Impact**: Use-after-free if `db.region` changes after Close/Vacuum
+- **Fix**: Closure now dereferences `db.region` at call time with a nil guard
+- **Status**: Completed
+
+#### 28. Migration data loss when `newEncoded` is empty ✅
+- **File**: `main.go:1528-1530`
+- **Impact**: Records whose fields are all new in the new schema were silently dropped (`continue`)
+- **Fix**: Changed `continue` to write an empty-encoded record (just header+footer), preserving the record's identity and count
+- **Status**: Completed
 
 #### 27. `readAtFn` captures stale `db.region` by value
 - **File**: `main.go:549-558`

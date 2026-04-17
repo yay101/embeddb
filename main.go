@@ -522,34 +522,46 @@ func (db *database) shrinkRegion(size int64) error {
 	return nil
 }
 
-func (db *database) readAt(buf []byte, offset int64) {
+func (db *database) readAt(buf []byte, offset int64) error {
 	if db.region != nil {
 		needed := offset + int64(len(buf))
 		if needed > db.region.Size() {
-			db.ensureRegion(needed)
+			if err := db.ensureRegion(needed); err != nil {
+				return fmt.Errorf("readAt ensureRegion: %w", err)
+			}
 		}
 		copy(buf, unsafe.Slice((*byte)(unsafe.Add(db.region.Pointer(), offset)), len(buf)))
-		return
+		return nil
 	}
-	db.file.ReadAt(buf, offset)
+	if _, err := db.file.ReadAt(buf, offset); err != nil {
+		return fmt.Errorf("readAt: %w", err)
+	}
+	return nil
 }
 
-func (db *database) writeAt(buf []byte, offset int64) {
+func (db *database) writeAt(buf []byte, offset int64) error {
 	if db.region != nil {
 		needed := offset + int64(len(buf))
 		if needed > db.region.Size() {
-			db.ensureRegion(needed)
+			if err := db.ensureRegion(needed); err != nil {
+				return fmt.Errorf("writeAt ensureRegion: %w", err)
+			}
 		}
 		copy(unsafe.Slice((*byte)(unsafe.Add(db.region.Pointer(), offset)), len(buf)), buf)
-		return
+		return nil
 	}
-	db.file.WriteAt(buf, offset)
+	if _, err := db.file.WriteAt(buf, offset); err != nil {
+		return fmt.Errorf("writeAt: %w", err)
+	}
+	return nil
 }
 
 func (db *database) readAtFn() func([]byte, int64) {
 	if db.region != nil {
 		return func(buf []byte, offset int64) {
-			copy(buf, unsafe.Slice((*byte)(unsafe.Add(db.region.Pointer(), offset)), len(buf)))
+			if db.region != nil {
+				copy(buf, unsafe.Slice((*byte)(unsafe.Add(db.region.Pointer(), offset)), len(buf)))
+			}
 		}
 	}
 	return func(buf []byte, offset int64) {
@@ -648,7 +660,9 @@ func (db *database) load() error {
 	}
 
 	var header [64]byte
-	db.readAt(header[:], 0)
+	if err := db.readAt(header[:], 0); err != nil {
+		return fmt.Errorf("failed to read database header: %w", err)
+	}
 	if header[0] != EcCode || header[1] != RecordStartMark {
 		return fmt.Errorf("invalid database header")
 	}
@@ -676,18 +690,24 @@ func (db *database) load() error {
 			tocLen := int(versionCatalogOffset) - int(tocOffset)
 			if tocLen > 0 && tocLen < 1024*1024 {
 				tocData = make([]byte, tocLen)
-				db.readAt(tocData, int64(tocOffset))
+				if err := db.readAt(tocData, int64(tocOffset)); err != nil {
+					return fmt.Errorf("failed to read table catalog: %w", err)
+				}
 			}
 			versionLen := int(stat.Size()) - int(versionCatalogOffset)
 			if versionLen > 0 && versionLen < 10*1024*1024 {
 				versionCatalogData = make([]byte, versionLen)
-				db.readAt(versionCatalogData, int64(versionCatalogOffset))
+				if err := db.readAt(versionCatalogData, int64(versionCatalogOffset)); err != nil {
+					return fmt.Errorf("failed to read version catalog: %w", err)
+				}
 			}
 		} else if int(tocOffset) < int(stat.Size()) {
 			tocLen := int(stat.Size()) - int(tocOffset)
 			if tocLen > 0 && tocLen < 1024*1024 {
 				tocData = make([]byte, tocLen)
-				db.readAt(tocData, int64(tocOffset))
+				if err := db.readAt(tocData, int64(tocOffset)); err != nil {
+					return fmt.Errorf("failed to read table catalog: %w", err)
+				}
 			}
 		}
 
@@ -1454,7 +1474,9 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 
 	for _, rec := range records {
 		hdrBuf := make([]byte, 12)
-		db.readAt(hdrBuf, int64(rec.offset))
+		if err := db.readAt(hdrBuf, int64(rec.offset)); err != nil {
+			continue
+		}
 		if hdrBuf[0] != EcCode || hdrBuf[1] != RecordStartMark {
 			continue
 		}
@@ -1464,7 +1486,9 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 
 		recordBuf := make([]byte, totalLen)
 		copy(recordBuf, hdrBuf)
-		db.readAt(recordBuf[12:], int64(rec.offset)+12)
+		if err := db.readAt(recordBuf[12:], int64(rec.offset)+12); err != nil {
+			continue
+		}
 
 		recordID := binary.BigEndian.Uint32(recordBuf[3:7])
 		active := recordBuf[11]
@@ -1502,7 +1526,7 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 		}
 
 		if len(newEncoded) == 0 {
-			continue
+			newEncoded = []byte{}
 		}
 
 		newHeader := make([]byte, 12)
@@ -1526,7 +1550,7 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 		}
 		db.writeAt(newRecord, int64(newOffset))
 
-		db.writeAt([]byte{0}, int64(rec.offset+11))
+		_ = db.writeAt([]byte{0}, int64(rec.offset+11))
 
 		newVal := make([]byte, 8)
 		binary.BigEndian.PutUint64(newVal, newOffset)

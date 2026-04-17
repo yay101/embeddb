@@ -778,7 +778,9 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate space: %w", err)
 	}
-	t.db.writeAt(recordBuf, int64(offset))
+	if err := t.db.writeAt(recordBuf, int64(offset)); err != nil {
+		return 0, fmt.Errorf("failed to write record: %w", err)
+	}
 
 	indexKey := encodePKForIndex(t.tableID, pkVal)
 	val := make([]byte, 8)
@@ -871,7 +873,9 @@ func (t *Table[T]) Get(id any) (*T, error) {
 	offset := binary.BigEndian.Uint64(val)
 
 	headerBuf := make([]byte, 12)
-	t.db.readAt(headerBuf, int64(offset))
+	if err := t.db.readAt(headerBuf, int64(offset)); err != nil {
+		return nil, fmt.Errorf("failed to read record: %w", err)
+	}
 
 	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return nil, fmt.Errorf("invalid record header")
@@ -887,7 +891,9 @@ func (t *Table[T]) Get(id any) (*T, error) {
 
 	recordBuf := make([]byte, totalLen)
 	copy(recordBuf, headerBuf)
-	t.db.readAt(recordBuf[12:], int64(offset)+12)
+	if err := t.db.readAt(recordBuf[12:], int64(offset)+12); err != nil {
+		return nil, fmt.Errorf("failed to read record data: %w", err)
+	}
 
 	var result T
 	if err := t.decodeRecord(recordBuf, &result); err != nil {
@@ -899,7 +905,9 @@ func (t *Table[T]) Get(id any) (*T, error) {
 
 func (t *Table[T]) getByOffset(offset uint64) (*T, error) {
 	headerBuf := make([]byte, 12)
-	t.db.readAt(headerBuf, int64(offset))
+	if err := t.db.readAt(headerBuf, int64(offset)); err != nil {
+		return nil, fmt.Errorf("failed to read record at offset %d: %w", offset, err)
+	}
 
 	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return nil, fmt.Errorf("invalid record header at offset %d", offset)
@@ -915,7 +923,9 @@ func (t *Table[T]) getByOffset(offset uint64) (*T, error) {
 
 	recordBuf := make([]byte, totalLen)
 	copy(recordBuf, headerBuf)
-	t.db.readAt(recordBuf[12:], int64(offset)+12)
+	if err := t.db.readAt(recordBuf[12:], int64(offset)+12); err != nil {
+		return nil, fmt.Errorf("failed to read record data at offset %d: %w", offset, err)
+	}
 
 	var result T
 	if err := t.decodeRecord(recordBuf, &result); err != nil {
@@ -956,7 +966,9 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 	offset := versionInfo.Offset
 
 	headerBuf := make([]byte, 12)
-	t.db.readAt(headerBuf, int64(offset))
+	if err := t.db.readAt(headerBuf, int64(offset)); err != nil {
+		return nil, fmt.Errorf("failed to read version record: %w", err)
+	}
 
 	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return nil, fmt.Errorf("invalid record header")
@@ -972,7 +984,9 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 
 	recordBuf := make([]byte, totalLen)
 	copy(recordBuf, headerBuf)
-	t.db.readAt(recordBuf[12:], int64(offset)+12)
+	if err := t.db.readAt(recordBuf[12:], int64(offset)+12); err != nil {
+		return nil, fmt.Errorf("failed to read version record data: %w", err)
+	}
 
 	var result T
 	if err := t.decodeRecord(recordBuf, &result); err != nil {
@@ -1017,7 +1031,9 @@ func (t *Table[T]) Update(id any, record *T) error {
 	oldOffset := binary.BigEndian.Uint64(val)
 
 	recordBuf := make([]byte, 12)
-	t.db.readAt(recordBuf, int64(oldOffset))
+	if err := t.db.readAt(recordBuf, int64(oldOffset)); err != nil {
+		return fmt.Errorf("failed to read record for update: %w", err)
+	}
 	if recordBuf[0] != EcCode || recordBuf[1] != RecordStartMark {
 		return fmt.Errorf("invalid record at offset %d", oldOffset)
 	}
@@ -1029,7 +1045,9 @@ func (t *Table[T]) Update(id any, record *T) error {
 
 	oldRecordBuf := make([]byte, totalLen)
 	copy(oldRecordBuf, recordBuf)
-	t.db.readAt(oldRecordBuf[12:], int64(oldOffset)+12)
+	if err := t.db.readAt(oldRecordBuf[12:], int64(oldOffset)+12); err != nil {
+		return fmt.Errorf("failed to read old record data: %w", err)
+	}
 
 	var oldRecord T
 	t.decodeRecord(oldRecordBuf, &oldRecord)
@@ -1062,7 +1080,9 @@ func (t *Table[T]) Update(id any, record *T) error {
 	if err != nil {
 		return fmt.Errorf("failed to allocate space: %w", err)
 	}
-	t.db.writeAt(newRecordBuf, int64(newOffset))
+	if err := t.db.writeAt(newRecordBuf, int64(newOffset)); err != nil {
+		return fmt.Errorf("failed to write record: %w", err)
+	}
 
 	if t.maxVersions > 0 {
 		versions := t.db.versionIndex.GetVersions(indexKey)
@@ -1086,12 +1106,12 @@ func (t *Table[T]) Update(id any, record *T) error {
 					oldestIdx = i
 				}
 			}
-			t.db.writeAt([]byte{0}, int64(versions[oldestIdx].Offset+11))
+			_ = t.db.writeAt([]byte{0}, int64(versions[oldestIdx].Offset+11))
 			t.db.versionIndex.RemoveVersion(indexKey, versions[oldestIdx].Version)
 			versions = append(versions[:oldestIdx], versions[oldestIdx+1:]...)
 		}
 	} else {
-		t.db.writeAt([]byte{0}, int64(oldOffset+11))
+		_ = t.db.writeAt([]byte{0}, int64(oldOffset+11))
 	}
 
 	newVal := make([]byte, 8)
@@ -1122,13 +1142,15 @@ func (t *Table[T]) Delete(id any) error {
 	offset := binary.BigEndian.Uint64(val)
 
 	recordBuf := make([]byte, 12)
-	t.db.readAt(recordBuf, int64(offset))
+	if err := t.db.readAt(recordBuf, int64(offset)); err != nil {
+	}
 	if recordBuf[0] == EcCode && recordBuf[1] == RecordStartMark && recordBuf[11] == 1 {
 		recLen := binary.BigEndian.Uint32(recordBuf[7:11])
 		totalLen := 12 + int(recLen) + 2
 		oldRecordBuf := make([]byte, totalLen)
 		copy(oldRecordBuf, recordBuf)
-		t.db.readAt(oldRecordBuf[12:], int64(offset)+12)
+		if err := t.db.readAt(oldRecordBuf[12:], int64(offset)+12); err != nil {
+		}
 
 		var oldRecord T
 		t.decodeRecord(oldRecordBuf, &oldRecord)
@@ -1138,7 +1160,7 @@ func (t *Table[T]) Delete(id any) error {
 		}
 	}
 
-	t.db.writeAt([]byte{0}, int64(offset+11))
+	_ = t.db.writeAt([]byte{0}, int64(offset+11))
 
 	t.db.pkIndex.Delete(indexKey)
 
@@ -1172,13 +1194,15 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 		offset := binary.BigEndian.Uint64(val)
 
 		recordBuf := make([]byte, 12)
-		t.db.readAt(recordBuf, int64(offset))
+		if err := t.db.readAt(recordBuf, int64(offset)); err != nil {
+		}
 		if recordBuf[0] == EcCode && recordBuf[1] == RecordStartMark && recordBuf[11] == 1 {
 			recLen := binary.BigEndian.Uint32(recordBuf[7:11])
 			totalLen := 12 + int(recLen) + 2
 			oldRecordBuf := make([]byte, totalLen)
 			copy(oldRecordBuf, recordBuf)
-			t.db.readAt(oldRecordBuf[12:], int64(offset)+12)
+			if err := t.db.readAt(oldRecordBuf[12:], int64(offset)+12); err != nil {
+			}
 
 			var oldRecord T
 			t.decodeRecord(oldRecordBuf, &oldRecord)
@@ -1188,7 +1212,7 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 			}
 		}
 
-		t.db.writeAt([]byte{0}, int64(offset+11))
+		_ = t.db.writeAt([]byte{0}, int64(offset+11))
 		t.db.pkIndex.Delete(indexKey)
 		deleted++
 		if t.db.tx != nil {
@@ -1283,7 +1307,9 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate space: %w", err)
 	}
-	t.db.writeAt(recordBuf, int64(offset))
+	if err := t.db.writeAt(recordBuf, int64(offset)); err != nil {
+		return 0, fmt.Errorf("failed to write record: %w", err)
+	}
 
 	indexKey := encodePKForIndex(t.tableID, pkVal)
 	val := make([]byte, 8)
@@ -1317,7 +1343,8 @@ func (t *Table[T]) getLocked(id any) (*T, error) {
 	offset := binary.BigEndian.Uint64(val)
 
 	headerBuf := make([]byte, 12)
-	t.db.readAt(headerBuf, int64(offset))
+	if err := t.db.readAt(headerBuf, int64(offset)); err != nil {
+	}
 
 	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return nil, fmt.Errorf("invalid record header")
@@ -1333,7 +1360,8 @@ func (t *Table[T]) getLocked(id any) (*T, error) {
 
 	recordBuf := make([]byte, totalLen)
 	copy(recordBuf, headerBuf)
-	t.db.readAt(recordBuf[12:], int64(offset)+12)
+	if err := t.db.readAt(recordBuf[12:], int64(offset)+12); err != nil {
+	}
 
 	var result T
 	if err := t.decodeRecord(recordBuf, &result); err != nil {
@@ -1353,7 +1381,8 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	oldOffset := binary.BigEndian.Uint64(val)
 
 	headerBuf := make([]byte, 12)
-	t.db.readAt(headerBuf, int64(oldOffset))
+	if err := t.db.readAt(headerBuf, int64(oldOffset)); err != nil {
+	}
 	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
 		return fmt.Errorf("invalid record at offset %d", oldOffset)
 	}
@@ -1364,7 +1393,8 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 
 	oldRecordBuf := make([]byte, totalLen)
 	copy(oldRecordBuf, headerBuf)
-	t.db.readAt(oldRecordBuf[12:], int64(oldOffset)+12)
+	if err := t.db.readAt(oldRecordBuf[12:], int64(oldOffset)+12); err != nil {
+	}
 
 	var oldRecord T
 	t.decodeRecord(oldRecordBuf, &oldRecord)
@@ -1397,7 +1427,9 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	if err != nil {
 		return fmt.Errorf("failed to allocate space: %w", err)
 	}
-	t.db.writeAt(newRecordBuf, int64(newOffset))
+	if err := t.db.writeAt(newRecordBuf, int64(newOffset)); err != nil {
+		return fmt.Errorf("failed to write record: %w", err)
+	}
 
 	if t.maxVersions > 0 {
 		versions := t.db.versionIndex.GetVersions(indexKey)
@@ -1412,7 +1444,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 		}
 		t.db.versionIndex.Add(indexKey, newVersion, newOffset, time.Now().UnixNano())
 	} else {
-		t.db.writeAt([]byte{0}, int64(oldOffset+11))
+		_ = t.db.writeAt([]byte{0}, int64(oldOffset+11))
 	}
 
 	newVal := make([]byte, 8)
@@ -1474,7 +1506,9 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	if err != nil {
 		return 0, false, fmt.Errorf("failed to allocate space: %w", err)
 	}
-	t.db.writeAt(recordBuf, int64(offset))
+	if err := t.db.writeAt(recordBuf, int64(offset)); err != nil {
+		return 0, false, fmt.Errorf("failed to write record: %w", err)
+	}
 
 	pkVal, _ := t.getPKValue(record)
 	pkIndexKey := encodePKForIndex(t.tableID, pkVal)

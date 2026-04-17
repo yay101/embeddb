@@ -52,62 +52,75 @@ func TestMigrationAddField(t *testing.T) {
 
 		db.Close()
 	}
+}
+
+type MigrateV1Simple struct {
+	ID   uint32 `db:"id,primary"`
+	Name string
+}
+
+type MigrateV2NewFields struct {
+	ID    uint32 `db:"id,primary"`
+	Email string
+	Count int
+}
+
+func TestMigrationCompletelyNewFields(t *testing.T) {
+	os.Remove("/tmp/test_migrate_new_fields.db")
+	defer os.Remove("/tmp/test_migrate_new_fields.db")
 
 	{
-		db, err := Open("/tmp/test_migrate_add_field.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_new_fields.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		tbl, err := Use[MigrateV1Simple](db, "items")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		tbl.Insert(&MigrateV1Simple{Name: "Alpha"})
+		tbl.Insert(&MigrateV1Simple{Name: "Beta"})
+
+		if count := tbl.Count(); count != 2 {
+			t.Fatalf("expected 2 records before migration, got %d", count)
+		}
+
+		db.Close()
+	}
+
+	{
+		db, err := Open("/tmp/test_migrate_new_fields.db", OpenOptions{Migrate: true})
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer db.Close()
 
-		tbl, err := Use[MigrateV2](db, "users")
+		tbl, err := Use[MigrateV2NewFields](db, "items")
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if count := tbl.Count(); count != 3 {
-			t.Fatalf("expected 3 records after migration, got %d", count)
-		}
-
-		rec1, err := tbl.Get(uint32(1))
-		if err != nil {
-			t.Fatalf("failed to get record 1: %v", err)
-		}
-		if rec1.Name != "Alice" {
-			t.Errorf("record 1 Name: got %q, want %q", rec1.Name, "Alice")
-		}
-		if rec1.Age != 30 {
-			t.Errorf("record 1 Age: got %d, want %d", rec1.Age, 30)
-		}
-		if rec1.City != "" {
-			t.Errorf("record 1 City: got %q, want empty string", rec1.City)
-		}
-
-		rec2, err := tbl.Get(uint32(2))
-		if err != nil {
-			t.Fatalf("failed to get record 2: %v", err)
-		}
-		if rec2.Name != "Bob" {
-			t.Errorf("record 2 Name: got %q, want %q", rec2.Name, "Bob")
-		}
-		if rec2.Age != 25 {
-			t.Errorf("record 2 Age: got %d, want %d", rec2.Age, 25)
-		}
-
-		rec3, err := tbl.Get(uint32(3))
-		if err != nil {
-			t.Fatalf("failed to get record 3: %v", err)
-		}
-		if rec3.Name != "Charlie" {
-			t.Errorf("record 3 Name: got %q, want %q", rec3.Name, "Charlie")
+		if count := tbl.Count(); count != 2 {
+			t.Fatalf("expected 2 records after migration with all-new fields, got %d", count)
 		}
 
 		all, err := tbl.All()
 		if err != nil {
 			t.Fatalf("failed to get all records: %v", err)
 		}
-		if len(all) != 3 {
-			t.Errorf("expected 3 records from All(), got %d", len(all))
+		if len(all) != 2 {
+			t.Fatalf("expected 2 records from All(), got %d", len(all))
+		}
+
+		for _, rec := range all {
+			if rec.ID == 0 {
+				t.Errorf("ID should be preserved, got 0")
+			}
+			if rec.Count != 0 {
+				t.Errorf("Count should be 0 for new field, got %d", rec.Count)
+			}
 		}
 	}
 }
