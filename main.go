@@ -1402,6 +1402,13 @@ func (tx *Transaction) Commit() error {
 	return nil
 }
 
+// Rollback reverts all changes made during the transaction.
+// Note: B-tree on-disk pages modified during the transaction are not rolled back.
+// Only the in-memory root offset and index snapshots are restored. This means B-tree
+// nodes written during the transaction remain on disk and may be referenced by future
+// operations if they lie on a path reachable from the restored root. For workloads
+// that modify B-tree structure (e.g., many inserts causing splits), this is a known
+// limitation — a full rollback would require copy-on-write pages or a write-ahead log.
 func (tx *Transaction) Rollback() error {
 	if tx.committed {
 		return fmt.Errorf("cannot rollback committed transaction")
