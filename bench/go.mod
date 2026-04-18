@@ -5,9 +5,11 @@ go 1.25.8
 require github.com/yay101/embeddb v1.8.0
 
 require (
-	github.com/yay101/embeddbcore v0.3.0 // indirect
-	github.com/yay101/embeddbmmap v0.1.0 // indirect
+	github.com/yay101/embeddbcore v0.4.0 // indirect
+	github.com/yay101/embeddbmmap v0.1.1 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 )
 
 replace github.com/yay101/embeddb => /home/dave/workspace/embeddb
+
+replace github.com/yay101/embeddbcore => /home/dave/workspace/embeddbcore

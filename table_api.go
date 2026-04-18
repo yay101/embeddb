@@ -1,14 +1,12 @@
 package embeddb
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"reflect"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -180,29 +178,47 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 	typedDB.mu.Lock()
 	table, exists := typedDB.tableCat[tableName]
 	if !exists {
-		var maxID uint8
-		for _, entry := range typedDB.tableCat {
-			if entry.ID > maxID && !entry.Dropped {
-				maxID = entry.ID
+		var adoptedID uint8
+		if typedDB.rebuilt && typedDB.orphanedTables != nil {
+			for tid, info := range typedDB.orphanedTables {
+				adoptedID = tid
+				table = &tableCatalogEntry{
+					ID:            info.ID,
+					Name:          tableName,
+					SchemaVersion: layout.SchemaVersion,
+					NextRecordID:  info.NextRecordID,
+					RecordCount:   info.RecordCount,
+					MaxVersions:   useOpts.MaxVersions,
+				}
+				delete(typedDB.orphanedTables, tid)
+				break
 			}
 		}
-		maxID++
-		table = &tableCatalogEntry{
-			ID:           maxID,
-			Name:         tableName,
-			LayoutHash:   layout.Hash,
-			NextRecordID: 1,
-			RecordCount:  0,
-			MaxVersions:  useOpts.MaxVersions,
+		if adoptedID == 0 {
+			var maxID uint8
+			for _, entry := range typedDB.tableCat {
+				if entry.ID > maxID && !entry.Dropped {
+					maxID = entry.ID
+				}
+			}
+			maxID++
+			table = &tableCatalogEntry{
+				ID:            maxID,
+				Name:          tableName,
+				SchemaVersion: layout.SchemaVersion,
+				NextRecordID:  1,
+				RecordCount:   0,
+				MaxVersions:   useOpts.MaxVersions,
+			}
 		}
 		typedDB.tableCat[tableName] = table
-	} else if table.LayoutHash != layout.Hash {
+	} else if table.SchemaVersion != layout.SchemaVersion {
 		if db.migrate {
 			if err := migrateTable(typedDB, table, layout); err != nil {
 				typedDB.mu.Unlock()
 				return nil, fmt.Errorf("migration failed: %w", err)
 			}
-			table.LayoutHash = layout.Hash
+			table.SchemaVersion = layout.SchemaVersion
 		} else {
 			typedDB.mu.Unlock()
 			return nil, fmt.Errorf("schema mismatch for table %q: migration is disabled but struct layout has changed", tableName)
@@ -221,7 +237,7 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 	if db.autoIndex {
 		typedDB.mu.RLock()
 		typedTable.idxMgr = newIndexManager[T](typedDB, layout)
-		for _, field := range layout.FieldOffsets {
+		for _, field := range layout.Fields {
 			if field.Name != "" && !field.Primary && field.Offset > 0 {
 				_ = typedTable.idxMgr.CreateIndex(field.Name)
 			}
@@ -321,8 +337,8 @@ func (db *DB) FastSync() error {
 	}
 
 	for _, t := range db.tables {
-		if t.region != nil {
-			if err := t.region.Sync(embeddbmmap.SyncSync); err != nil {
+		if r := t.region.Load(); r != nil {
+			if err := r.Sync(embeddbmmap.SyncSync); err != nil {
 				return err
 			}
 		}
@@ -398,7 +414,7 @@ type indexManager[T any] struct {
 
 func newIndexManager[T any](db *database, layout *embedcore.StructLayout) *indexManager[T] {
 	fieldCache := make(map[string]embedcore.FieldOffset)
-	for _, f := range layout.FieldOffsets {
+	for _, f := range layout.Fields {
 		fieldCache[f.Name] = f
 	}
 	return &indexManager[T]{
@@ -410,7 +426,7 @@ func newIndexManager[T any](db *database, layout *embedcore.StructLayout) *index
 }
 
 func (im *indexManager[T]) CreateIndex(fieldName string) error {
-	for _, field := range im.layout.FieldOffsets {
+	for _, field := range im.layout.Fields {
 		if field.Name == fieldName {
 			im.indexes[fieldName] = newOffsetMapIndex()
 			return nil
@@ -450,6 +466,15 @@ func (im *indexManager[T]) InsertIntoIndexes(record *T, offset uint64) error {
 		key := embedcore.GetFieldAsString(record, field)
 		if key == "" {
 			continue
+		}
+		// Check uniqueness for unique fields
+		if field.Unique {
+			if val, ok := idx.Get(key); ok {
+				// Check if it's the same record (for updates)
+				if val != offset {
+					return fmt.Errorf("unique constraint violation for field %s: value %s already exists", fieldName, key)
+				}
+			}
 		}
 		idx.Set(key, offset)
 	}
@@ -731,6 +756,65 @@ func (im *indexManager[T]) QueryRangeBetween(fieldName string, min, max interfac
 	return results, nil
 }
 
+func (t *Table[T]) deactivateRecord(offset uint64) {
+	deactivateBuf := make([]byte, embedcore.RecordHeaderSize)
+	t.db.readAt(deactivateBuf, int64(offset))
+	deactivateBuf[1] &^= embedcore.FlagsActive
+	t.db.writeAt(deactivateBuf, int64(offset))
+}
+
+func (t *Table[T]) readRecordAt(offset uint64) (*T, error) {
+	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
+		return nil, fmt.Errorf("failed to read record header at offset %d: %w", offset, err)
+	}
+
+	hdr, err := decodeRecordHeader(hdrBuf)
+	if err != nil {
+		return nil, fmt.Errorf("invalid record header at offset %d: %w", offset, err)
+	}
+
+	if hdr.Version != V2RecordVersion {
+		return nil, fmt.Errorf("invalid record version at offset %d", offset)
+	}
+
+	if !hdr.IsActive() {
+		return nil, fmt.Errorf("record is deleted")
+	}
+
+	totalLen := recordTotalSize(hdr)
+	recordBuf := make([]byte, totalLen)
+	copy(recordBuf, hdrBuf)
+	if totalLen > embedcore.RecordHeaderSize {
+		if err := t.db.readAt(recordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
+			return nil, fmt.Errorf("failed to read record data at offset %d: %w", offset, err)
+		}
+	}
+
+	var result T
+	if err := t.decodeRecord(recordBuf, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func (t *Table[T]) encodeRecord(record *T, recordID uint32, flags byte, prevVersionOff uint64) ([]byte, error) {
+	payload, err := encodeFieldPayload(record, t.layout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode field payload: %w", err)
+	}
+	return buildV2Record(t.tableID, recordID, t.layout.SchemaVersion, flags, prevVersionOff, payload), nil
+}
+
+func (t *Table[T]) decodeRecord(data []byte, result *T) error {
+	_, payload, err := parseV2Record(data)
+	if err != nil {
+		return fmt.Errorf("failed to parse v2 record: %w", err)
+	}
+	return decodeFieldPayload(payload, result, t.layout)
+}
+
 func (t *Table[T]) Insert(record *T) (uint32, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -754,25 +838,10 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		}
 	}
 
-	encoded, err := t.encodeRecord(record)
+	recordBuf, err := t.encodeRecord(record, recordID, embedcore.FlagsActive, 0)
 	if err != nil {
-		return 0, fmt.Errorf("failed to encode record: %v", err)
+		return 0, fmt.Errorf("failed to encode record: %w", err)
 	}
-
-	headerBytes := make([]byte, 12)
-	headerBytes[0] = EcCode
-	headerBytes[1] = RecordStartMark
-	headerBytes[2] = t.tableID
-	binary.BigEndian.PutUint32(headerBytes[3:7], recordID)
-	binary.BigEndian.PutUint32(headerBytes[7:11], uint32(len(encoded)))
-	headerBytes[11] = 1
-
-	footerBytes := []byte{EcCode, RecordEndMark}
-
-	recordBuf := make([]byte, 0, len(headerBytes)+len(encoded)+len(footerBytes))
-	recordBuf = append(recordBuf, headerBytes...)
-	recordBuf = append(recordBuf, encoded...)
-	recordBuf = append(recordBuf, footerBytes...)
 
 	offset, _, err := t.db.alloc.Allocate(uint64(len(recordBuf)))
 	if err != nil {
@@ -838,7 +907,7 @@ func (t *Table[T]) isZeroPK(val any) bool {
 }
 
 func (t *Table[T]) setPKValue(record *T, val any) {
-	for _, field := range t.layout.FieldOffsets {
+	for _, field := range t.layout.Fields {
 		if field.Primary {
 			embedcore.SetFieldValue(record, field, val)
 			return
@@ -847,7 +916,7 @@ func (t *Table[T]) setPKValue(record *T, val any) {
 }
 
 func (t *Table[T]) getPKValue(record *T) (any, error) {
-	for _, field := range t.layout.FieldOffsets {
+	for _, field := range t.layout.Fields {
 		if field.Primary {
 			val, err := embedcore.GetFieldValue(record, field)
 			if err != nil {
@@ -871,68 +940,7 @@ func (t *Table[T]) Get(id any) (*T, error) {
 	}
 
 	offset := binary.BigEndian.Uint64(val)
-
-	headerBuf := make([]byte, 12)
-	if err := t.db.readAt(headerBuf, int64(offset)); err != nil {
-		return nil, fmt.Errorf("failed to read record: %w", err)
-	}
-
-	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
-		return nil, fmt.Errorf("invalid record header")
-	}
-
-	active := headerBuf[11]
-	if active != 1 {
-		return nil, fmt.Errorf("record is deleted")
-	}
-
-	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
-	totalLen := 12 + int(recLen) + 2
-
-	recordBuf := make([]byte, totalLen)
-	copy(recordBuf, headerBuf)
-	if err := t.db.readAt(recordBuf[12:], int64(offset)+12); err != nil {
-		return nil, fmt.Errorf("failed to read record data: %w", err)
-	}
-
-	var result T
-	if err := t.decodeRecord(recordBuf, &result); err != nil {
-		return nil, err
-	}
-
-	return &result, nil
-}
-
-func (t *Table[T]) getByOffset(offset uint64) (*T, error) {
-	headerBuf := make([]byte, 12)
-	if err := t.db.readAt(headerBuf, int64(offset)); err != nil {
-		return nil, fmt.Errorf("failed to read record at offset %d: %w", offset, err)
-	}
-
-	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
-		return nil, fmt.Errorf("invalid record header at offset %d", offset)
-	}
-
-	active := headerBuf[11]
-	if active != 1 {
-		return nil, fmt.Errorf("record is deleted")
-	}
-
-	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
-	totalLen := 12 + int(recLen) + 2
-
-	recordBuf := make([]byte, totalLen)
-	copy(recordBuf, headerBuf)
-	if err := t.db.readAt(recordBuf[12:], int64(offset)+12); err != nil {
-		return nil, fmt.Errorf("failed to read record data at offset %d: %w", offset, err)
-	}
-
-	var result T
-	if err := t.decodeRecord(recordBuf, &result); err != nil {
-		return nil, err
-	}
-
-	return &result, nil
+	return t.readRecordAt(offset)
 }
 
 func (t *Table[T]) queryByPK(pkValue string) (uint64, bool) {
@@ -963,37 +971,7 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 		return nil, fmt.Errorf("version %d not found for record", version)
 	}
 
-	offset := versionInfo.Offset
-
-	headerBuf := make([]byte, 12)
-	if err := t.db.readAt(headerBuf, int64(offset)); err != nil {
-		return nil, fmt.Errorf("failed to read version record: %w", err)
-	}
-
-	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
-		return nil, fmt.Errorf("invalid record header")
-	}
-
-	active := headerBuf[11]
-	if active != 1 {
-		return nil, fmt.Errorf("record version is deleted")
-	}
-
-	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
-	totalLen := 12 + int(recLen) + 2
-
-	recordBuf := make([]byte, totalLen)
-	copy(recordBuf, headerBuf)
-	if err := t.db.readAt(recordBuf[12:], int64(offset)+12); err != nil {
-		return nil, fmt.Errorf("failed to read version record data: %w", err)
-	}
-
-	var result T
-	if err := t.decodeRecord(recordBuf, &result); err != nil {
-		return nil, err
-	}
-
-	return &result, nil
+	return t.readRecordAt(versionInfo.Offset)
 }
 
 func (t *Table[T]) ListVersions(id any) ([]VersionMetadata, error) {
@@ -1030,22 +1008,26 @@ func (t *Table[T]) Update(id any, record *T) error {
 
 	oldOffset := binary.BigEndian.Uint64(val)
 
-	recordBuf := make([]byte, 12)
-	if err := t.db.readAt(recordBuf, int64(oldOffset)); err != nil {
+	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	if err := t.db.readAt(hdrBuf, int64(oldOffset)); err != nil {
 		return fmt.Errorf("failed to read record for update: %w", err)
 	}
-	if recordBuf[0] != EcCode || recordBuf[1] != RecordStartMark {
-		return fmt.Errorf("invalid record at offset %d", oldOffset)
+
+	hdr, err := decodeRecordHeader(hdrBuf)
+	if err != nil {
+		return fmt.Errorf("invalid record at offset %d: %w", oldOffset, err)
 	}
 
-	recordID := binary.BigEndian.Uint32(recordBuf[3:7])
+	if !hdr.IsActive() {
+		return fmt.Errorf("record at offset %d is not active", oldOffset)
+	}
 
-	recLen := binary.BigEndian.Uint32(recordBuf[7:11])
-	totalLen := 12 + int(recLen) + 2
+	recordID := hdr.RecordID
 
+	totalLen := recordTotalSize(hdr)
 	oldRecordBuf := make([]byte, totalLen)
-	copy(oldRecordBuf, recordBuf)
-	if err := t.db.readAt(oldRecordBuf[12:], int64(oldOffset)+12); err != nil {
+	copy(oldRecordBuf, hdrBuf)
+	if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(oldOffset)+int64(embedcore.RecordHeaderSize)); err != nil {
 		return fmt.Errorf("failed to read old record data: %w", err)
 	}
 
@@ -1056,25 +1038,17 @@ func (t *Table[T]) Update(id any, record *T) error {
 		t.idxMgr.DeleteFromIndexes(&oldRecord, oldOffset)
 	}
 
-	encoded, err := t.encodeRecord(record)
-	if err != nil {
-		return fmt.Errorf("failed to encode record: %v", err)
+	var flags byte = embedcore.FlagsActive
+	var prevVersionOff uint64
+	if t.maxVersions > 0 {
+		flags |= embedcore.FlagsHasPrevVersion
+		prevVersionOff = oldOffset
 	}
 
-	headerBytes := make([]byte, 12)
-	headerBytes[0] = EcCode
-	headerBytes[1] = RecordStartMark
-	headerBytes[2] = t.tableID
-	binary.BigEndian.PutUint32(headerBytes[3:7], recordID)
-	binary.BigEndian.PutUint32(headerBytes[7:11], uint32(len(encoded)))
-	headerBytes[11] = 1
-
-	footerBytes := []byte{EcCode, RecordEndMark}
-
-	newRecordBuf := make([]byte, 0, len(headerBytes)+len(encoded)+len(footerBytes))
-	newRecordBuf = append(newRecordBuf, headerBytes...)
-	newRecordBuf = append(newRecordBuf, encoded...)
-	newRecordBuf = append(newRecordBuf, footerBytes...)
+	newRecordBuf, err := t.encodeRecord(record, recordID, flags, prevVersionOff)
+	if err != nil {
+		return fmt.Errorf("failed to encode record: %w", err)
+	}
 
 	newOffset, _, err := t.db.alloc.Allocate(uint64(len(newRecordBuf)))
 	if err != nil {
@@ -1106,12 +1080,12 @@ func (t *Table[T]) Update(id any, record *T) error {
 					oldestIdx = i
 				}
 			}
-			_ = t.db.writeAt([]byte{0}, int64(versions[oldestIdx].Offset+11))
+			t.deactivateRecord(versions[oldestIdx].Offset)
 			t.db.versionIndex.RemoveVersion(indexKey, versions[oldestIdx].Version)
 			versions = append(versions[:oldestIdx], versions[oldestIdx+1:]...)
 		}
 	} else {
-		_ = t.db.writeAt([]byte{0}, int64(oldOffset+11))
+		t.deactivateRecord(oldOffset)
 	}
 
 	newVal := make([]byte, 8)
@@ -1141,26 +1115,28 @@ func (t *Table[T]) Delete(id any) error {
 
 	offset := binary.BigEndian.Uint64(val)
 
-	recordBuf := make([]byte, 12)
-	if err := t.db.readAt(recordBuf, int64(offset)); err != nil {
+	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 	}
-	if recordBuf[0] == EcCode && recordBuf[1] == RecordStartMark && recordBuf[11] == 1 {
-		recLen := binary.BigEndian.Uint32(recordBuf[7:11])
-		totalLen := 12 + int(recLen) + 2
-		oldRecordBuf := make([]byte, totalLen)
-		copy(oldRecordBuf, recordBuf)
-		if err := t.db.readAt(oldRecordBuf[12:], int64(offset)+12); err != nil {
-		}
+	if hdrBuf[0] == V2RecordVersion {
+		hdr, _ := decodeRecordHeader(hdrBuf)
+		if hdr.IsActive() {
+			totalLen := recordTotalSize(hdr)
+			oldRecordBuf := make([]byte, totalLen)
+			copy(oldRecordBuf, hdrBuf)
+			if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
+			}
 
-		var oldRecord T
-		t.decodeRecord(oldRecordBuf, &oldRecord)
+			var oldRecord T
+			t.decodeRecord(oldRecordBuf, &oldRecord)
 
-		if t.idxMgr != nil {
-			t.idxMgr.DeleteFromIndexes(&oldRecord, offset)
+			if t.idxMgr != nil {
+				t.idxMgr.DeleteFromIndexes(&oldRecord, offset)
+			}
 		}
 	}
 
-	_ = t.db.writeAt([]byte{0}, int64(offset+11))
+	t.deactivateRecord(offset)
 
 	t.db.pkIndex.Delete(indexKey)
 
@@ -1193,27 +1169,29 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 
 		offset := binary.BigEndian.Uint64(val)
 
-		recordBuf := make([]byte, 12)
-		if err := t.db.readAt(recordBuf, int64(offset)); err != nil {
+		hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+		if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 		}
-		if recordBuf[0] == EcCode && recordBuf[1] == RecordStartMark && recordBuf[11] == 1 {
-			recLen := binary.BigEndian.Uint32(recordBuf[7:11])
-			totalLen := 12 + int(recLen) + 2
-			oldRecordBuf := make([]byte, totalLen)
-			copy(oldRecordBuf, recordBuf)
-			if err := t.db.readAt(oldRecordBuf[12:], int64(offset)+12); err != nil {
-				continue
-			}
+		if hdrBuf[0] == V2RecordVersion {
+			hdr, _ := decodeRecordHeader(hdrBuf)
+			if hdr.IsActive() {
+				totalLen := recordTotalSize(hdr)
+				oldRecordBuf := make([]byte, totalLen)
+				copy(oldRecordBuf, hdrBuf)
+				if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
+					continue
+				}
 
-			var oldRecord T
-			t.decodeRecord(oldRecordBuf, &oldRecord)
+				var oldRecord T
+				t.decodeRecord(oldRecordBuf, &oldRecord)
 
-			if t.idxMgr != nil {
-				t.idxMgr.DeleteFromIndexes(&oldRecord, offset)
+				if t.idxMgr != nil {
+					t.idxMgr.DeleteFromIndexes(&oldRecord, offset)
+				}
 			}
 		}
 
-		_ = t.db.writeAt([]byte{0}, int64(offset+11))
+		t.deactivateRecord(offset)
 		t.db.pkIndex.Delete(indexKey)
 		deleted++
 		if t.db.tx != nil {
@@ -1298,25 +1276,10 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 		}
 	}
 
-	encoded, err := t.encodeRecord(record)
+	recordBuf, err := t.encodeRecord(record, recordID, embedcore.FlagsActive, 0)
 	if err != nil {
-		return 0, fmt.Errorf("failed to encode record: %v", err)
+		return 0, fmt.Errorf("failed to encode record: %w", err)
 	}
-
-	headerBytes := make([]byte, 12)
-	headerBytes[0] = EcCode
-	headerBytes[1] = RecordStartMark
-	headerBytes[2] = t.tableID
-	binary.BigEndian.PutUint32(headerBytes[3:7], recordID)
-	binary.BigEndian.PutUint32(headerBytes[7:11], uint32(len(encoded)))
-	headerBytes[11] = 1
-
-	footerBytes := []byte{EcCode, RecordEndMark}
-
-	recordBuf := make([]byte, 0, len(headerBytes)+len(encoded)+len(footerBytes))
-	recordBuf = append(recordBuf, headerBytes...)
-	recordBuf = append(recordBuf, encoded...)
-	recordBuf = append(recordBuf, footerBytes...)
 
 	offset, _, err := t.db.alloc.Allocate(uint64(len(recordBuf)))
 	if err != nil {
@@ -1356,34 +1319,7 @@ func (t *Table[T]) getLocked(id any) (*T, error) {
 	}
 
 	offset := binary.BigEndian.Uint64(val)
-
-	headerBuf := make([]byte, 12)
-	if err := t.db.readAt(headerBuf, int64(offset)); err != nil {
-	}
-
-	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
-		return nil, fmt.Errorf("invalid record header")
-	}
-
-	active := headerBuf[11]
-	if active != 1 {
-		return nil, fmt.Errorf("record is deleted")
-	}
-
-	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
-	totalLen := 12 + int(recLen) + 2
-
-	recordBuf := make([]byte, totalLen)
-	copy(recordBuf, headerBuf)
-	if err := t.db.readAt(recordBuf[12:], int64(offset)+12); err != nil {
-	}
-
-	var result T
-	if err := t.decodeRecord(recordBuf, &result); err != nil {
-		return nil, err
-	}
-
-	return &result, nil
+	return t.readRecordAt(offset)
 }
 
 func (t *Table[T]) updateLocked(id any, record *T) error {
@@ -1395,20 +1331,23 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 
 	oldOffset := binary.BigEndian.Uint64(val)
 
-	headerBuf := make([]byte, 12)
-	if err := t.db.readAt(headerBuf, int64(oldOffset)); err != nil {
-	}
-	if headerBuf[0] != EcCode || headerBuf[1] != RecordStartMark {
-		return fmt.Errorf("invalid record at offset %d", oldOffset)
+	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	if err := t.db.readAt(hdrBuf, int64(oldOffset)); err != nil {
+		return fmt.Errorf("failed to read record header at offset %d: %w", oldOffset, err)
 	}
 
-	recordID := binary.BigEndian.Uint32(headerBuf[3:7])
-	recLen := binary.BigEndian.Uint32(headerBuf[7:11])
-	totalLen := 12 + int(recLen) + 2
+	hdr, err := decodeRecordHeader(hdrBuf)
+	if err != nil {
+		return fmt.Errorf("invalid record at offset %d: %w", oldOffset, err)
+	}
 
+	recordID := hdr.RecordID
+
+	totalLen := recordTotalSize(hdr)
 	oldRecordBuf := make([]byte, totalLen)
-	copy(oldRecordBuf, headerBuf)
-	if err := t.db.readAt(oldRecordBuf[12:], int64(oldOffset)+12); err != nil {
+	copy(oldRecordBuf, hdrBuf)
+	if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(oldOffset)+int64(embedcore.RecordHeaderSize)); err != nil {
+		return fmt.Errorf("failed to read old record data: %w", err)
 	}
 
 	var oldRecord T
@@ -1418,25 +1357,17 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 		t.idxMgr.DeleteFromIndexes(&oldRecord, oldOffset)
 	}
 
-	encoded, err := t.encodeRecord(record)
-	if err != nil {
-		return fmt.Errorf("failed to encode record: %v", err)
+	var flags byte = embedcore.FlagsActive
+	var prevVersionOff uint64
+	if t.maxVersions > 0 {
+		flags |= embedcore.FlagsHasPrevVersion
+		prevVersionOff = oldOffset
 	}
 
-	headerBytes := make([]byte, 12)
-	headerBytes[0] = EcCode
-	headerBytes[1] = RecordStartMark
-	headerBytes[2] = t.tableID
-	binary.BigEndian.PutUint32(headerBytes[3:7], recordID)
-	binary.BigEndian.PutUint32(headerBytes[7:11], uint32(len(encoded)))
-	headerBytes[11] = 1
-
-	footerBytes := []byte{EcCode, RecordEndMark}
-
-	newRecordBuf := make([]byte, 0, len(headerBytes)+len(encoded)+len(footerBytes))
-	newRecordBuf = append(newRecordBuf, headerBytes...)
-	newRecordBuf = append(newRecordBuf, encoded...)
-	newRecordBuf = append(newRecordBuf, footerBytes...)
+	newRecordBuf, err := t.encodeRecord(record, recordID, flags, prevVersionOff)
+	if err != nil {
+		return fmt.Errorf("failed to encode record: %w", err)
+	}
 
 	newOffset, _, err := t.db.alloc.Allocate(uint64(len(newRecordBuf)))
 	if err != nil {
@@ -1459,7 +1390,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 		}
 		t.db.versionIndex.Add(indexKey, newVersion, newOffset, time.Now().UnixNano())
 	} else {
-		_ = t.db.writeAt([]byte{0}, int64(oldOffset+11))
+		t.deactivateRecord(oldOffset)
 	}
 
 	newVal := make([]byte, 8)
@@ -1497,25 +1428,10 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 
 	t.setPKValue(record, id)
 
-	encoded, err := t.encodeRecord(record)
+	recordBuf, err := t.encodeRecord(record, recordID, embedcore.FlagsActive, 0)
 	if err != nil {
-		return 0, true, fmt.Errorf("failed to encode record: %v", err)
+		return 0, true, fmt.Errorf("failed to encode record: %w", err)
 	}
-
-	headerBytes := make([]byte, 12)
-	headerBytes[0] = EcCode
-	headerBytes[1] = RecordStartMark
-	headerBytes[2] = t.tableID
-	binary.BigEndian.PutUint32(headerBytes[3:7], recordID)
-	binary.BigEndian.PutUint32(headerBytes[7:11], uint32(len(encoded)))
-	headerBytes[11] = 1
-
-	footerBytes := []byte{EcCode, RecordEndMark}
-
-	recordBuf := make([]byte, 0, len(headerBytes)+len(encoded)+len(footerBytes))
-	recordBuf = append(recordBuf, headerBytes...)
-	recordBuf = append(recordBuf, encoded...)
-	recordBuf = append(recordBuf, footerBytes...)
 
 	offset, _, err := t.db.alloc.Allocate(uint64(len(recordBuf)))
 	if err != nil {
@@ -1558,7 +1474,7 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 
 		t.db.mu.RLock()
 		for _, off := range offsets {
-			record, err := t.getByOffset(off)
+			record, err := t.readRecordAt(off)
 			if err == nil && record != nil {
 				results = append(results, *record)
 			}
@@ -1590,7 +1506,7 @@ func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, in
 
 		t.db.mu.RLock()
 		for _, off := range offsets {
-			record, err := t.getByOffset(off)
+			record, err := t.readRecordAt(off)
 			if err == nil && record != nil {
 				results = append(results, *record)
 			}
@@ -1618,7 +1534,7 @@ func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclu
 
 		t.db.mu.RLock()
 		for _, off := range offsets {
-			record, err := t.getByOffset(off)
+			record, err := t.readRecordAt(off)
 			if err == nil && record != nil {
 				results = append(results, *record)
 			}
@@ -1646,7 +1562,7 @@ func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inc
 
 		t.db.mu.RLock()
 		for _, off := range offsets {
-			record, err := t.getByOffset(off)
+			record, err := t.readRecordAt(off)
 			if err == nil && record != nil {
 				results = append(results, *record)
 			}
@@ -1798,7 +1714,7 @@ func (t *Table[T]) filterPagedByField(field embedcore.FieldOffset, fn func(inter
 }
 
 func (t *Table[T]) findField(fieldName string) (embedcore.FieldOffset, error) {
-	for _, f := range t.layout.FieldOffsets {
+	for _, f := range t.layout.Fields {
 		if f.Name == fieldName {
 			return f, nil
 		}
@@ -2091,7 +2007,7 @@ func (t *Table[T]) Count() int {
 	t.db.mu.RLock()
 	defer t.db.mu.RUnlock()
 	entry := t.db.tableCat[t.name]
-	if entry != nil && entry.RecordCount > 0 {
+	if entry != nil {
 		return int(entry.RecordCount)
 	}
 	count := 0
@@ -2116,21 +2032,28 @@ func (t *Table[T]) rebuildSecondaryIndexes() {
 		return
 	}
 
+	type kv struct {
+		key    []byte
+		offset uint64
+	}
+	var entries []kv
 	t.db.pkIndex.Range(func(k []byte, v []byte) bool {
 		if len(k) < 2 || k[0] != t.tableID {
 			return true
 		}
-
-		offset := binary.BigEndian.Uint64(v)
-
-		record, err := t.getByOffset(offset)
-		if err != nil {
-			return true
-		}
-
-		t.idxMgr.InsertIntoIndexes(record, offset)
+		keyCopy := make([]byte, len(k))
+		copy(keyCopy, k)
+		entries = append(entries, kv{key: keyCopy, offset: binary.BigEndian.Uint64(v)})
 		return true
 	})
+
+	for _, e := range entries {
+		record, err := t.readRecordAt(e.offset)
+		if err != nil {
+			continue
+		}
+		t.idxMgr.InsertIntoIndexes(record, e.offset)
+	}
 }
 
 func (t *Table[T]) DropIndex(fieldName string) error {
@@ -2303,521 +2226,4 @@ func paginateResults[T any](all []T, offset, limit int) *PagedResult[T] {
 		Offset:     offset,
 		Limit:      limit,
 	}
-}
-
-func (t *Table[T]) decodeRecord(data []byte, result *T) error {
-	data = data[12:]
-	data = data[:len(data)-2]
-
-	for len(data) > 0 {
-		if len(data) < 2 {
-			break
-		}
-
-		fieldKey := data[0]
-		if data[1] != valueStartMarker {
-			break
-		}
-
-		data = data[2:]
-
-		fieldOffset, exists := t.layout.FieldOffsets[fieldKey]
-		if !exists {
-			endIdx := bytes.IndexByte(data, valueEndMarker)
-			if endIdx == -1 {
-				break
-			}
-			data = data[endIdx+1:]
-			continue
-		}
-
-		var val interface{}
-		var err error
-
-		switch fieldOffset.Type {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			val, data, err = embedcore.DecodeVarint(data)
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			val, data, err = embedcore.DecodeUvarint(data)
-		case reflect.String:
-			val, data, err = embedcore.DecodeString(data)
-		case reflect.Bool:
-			val, data, err = embedcore.DecodeBool(data)
-		case reflect.Float64:
-			val, data, err = embedcore.DecodeFloat64(data)
-		case reflect.Float32:
-			var v float64
-			v, data, err = embedcore.DecodeFloat64(data)
-			if err == nil {
-				val = float32(v)
-			}
-		case reflect.Struct:
-			if fieldOffset.IsTime {
-				var nanoVal int64
-				nanoVal, data, err = embedcore.DecodeVarint(data)
-				if err == nil {
-					val = time.Unix(0, nanoVal).UTC()
-				}
-			} else {
-				endIdx := bytes.IndexByte(data, valueEndMarker)
-				if endIdx == -1 {
-					break
-				}
-				data = data[endIdx+1:]
-				continue
-			}
-		case reflect.Slice:
-			if fieldOffset.IsBytes {
-				val, data, err = embedcore.DecodeBytes(data)
-			} else if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.String {
-				val, data, err = embedcore.DecodeSlice(data)
-			} else if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.Int {
-				val, data, err = embedcore.DecodeIntSlice(data)
-			} else if fieldOffset.IsSlice && fieldOffset.SliceElem.Kind() == reflect.Struct {
-				val, data, err = t.decodeSliceOfStructs(data, fieldOffset)
-			} else {
-				endIdx := bytes.IndexByte(data, valueEndMarker)
-				if endIdx == -1 {
-					break
-				}
-				data = data[endIdx+1:]
-				continue
-			}
-		default:
-			endIdx := bytes.IndexByte(data, valueEndMarker)
-			if endIdx == -1 {
-				break
-			}
-			data = data[endIdx+1:]
-			continue
-		}
-
-		if err != nil {
-			endIdx := bytes.IndexByte(data, valueEndMarker)
-			if endIdx == -1 {
-				break
-			}
-			data = data[endIdx+1:]
-			continue
-		}
-
-		endIdx := bytes.IndexByte(data, valueEndMarker)
-		if endIdx != -1 {
-			data = data[endIdx+1:]
-		}
-
-		embedcore.SetFieldValue(result, fieldOffset, val)
-	}
-	return nil
-}
-
-func (t *Table[T]) encodeRecord(record *T) ([]byte, error) {
-	buf := make([]byte, 0, 64)
-
-	keys := make([]byte, 0, len(t.layout.FieldOffsets))
-	for k := range t.layout.FieldOffsets {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-
-	for _, key := range keys {
-		field := t.layout.FieldOffsets[key]
-		if field.IsStruct && !field.IsTime && !field.IsSlice {
-			continue
-		}
-
-		buf = append(buf, key, valueStartMarker)
-
-		switch field.Type {
-		case reflect.Int:
-			buf = embedcore.EncodeVarint(buf, int64(embedcore.GetIntField(record, field)))
-		case reflect.Int8:
-			buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt8Field(record, field)))
-		case reflect.Int16:
-			buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt16Field(record, field)))
-		case reflect.Int32:
-			buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt32Field(record, field)))
-		case reflect.Int64:
-			buf = embedcore.EncodeVarint(buf, embedcore.GetInt64Field(record, field))
-		case reflect.Uint:
-			buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUintField(record, field)))
-		case reflect.Uint8:
-			buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint8Field(record, field)))
-		case reflect.Uint16:
-			buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint16Field(record, field)))
-		case reflect.Uint32:
-			buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint32Field(record, field)))
-		case reflect.Uint64:
-			buf = embedcore.EncodeUvarint(buf, embedcore.GetUint64Field(record, field))
-		case reflect.String:
-			buf = embedcore.EncodeString(buf, embedcore.GetStringField(record, field))
-		case reflect.Bool:
-			buf = embedcore.EncodeBool(buf, embedcore.GetBoolField(record, field))
-		case reflect.Float64:
-			buf = embedcore.EncodeFloat64(buf, embedcore.GetFloat64Field(record, field))
-		case reflect.Float32:
-			buf = embedcore.EncodeFloat64(buf, float64(embedcore.GetFloat32Field(record, field)))
-		case reflect.Struct:
-			if field.IsTime {
-				buf = embedcore.EncodeVarint(buf, embedcore.GetTimeField(record, field).UnixNano())
-			}
-		case reflect.Slice:
-			if field.IsBytes {
-				bytesVal, _ := embedcore.GetBytesField(record, field)
-				buf = embedcore.EncodeBytes(buf, bytesVal)
-			} else if field.IsSlice && field.SliceElem.Kind() == reflect.String {
-				sliceVal := embedcore.GetStringSlice(record, field)
-				buf = embedcore.EncodeSlice(buf, sliceVal)
-			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int {
-				sliceVal := embedcore.GetIntSlice(record, field)
-				buf = embedcore.EncodeIntSlice(buf, sliceVal)
-			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Struct {
-				buf = t.encodeSliceOfStructs(record, field, buf)
-			} else {
-				buf = buf[:len(buf)-2]
-				continue
-			}
-		default:
-			buf = buf[:len(buf)-2]
-			continue
-		}
-
-		buf = append(buf, valueEndMarker)
-	}
-
-	return t.encodeNestedStructs(record, buf)
-}
-
-func (t *Table[T]) encodeNestedStructs(record *T, buf []byte) ([]byte, error) {
-	for _, field := range t.layout.FieldOffsets {
-		// Skip non-struct fields or time fields
-		if !field.IsStruct || field.IsTime {
-			continue
-		}
-		// Also skip slices - they're handled by encodeSliceOfStructs
-		if field.IsSlice {
-			continue
-		}
-
-		parentPath := field.Parent
-		if len(parentPath) == 0 {
-			continue
-		}
-
-		for nestedKey, nestedField := range t.layout.FieldOffsets {
-			if len(nestedField.Parent) != len(parentPath)+1 {
-				continue
-			}
-
-			isChild := true
-			for i, p := range parentPath {
-				if nestedField.Parent[i] != p {
-					isChild = false
-					break
-				}
-			}
-			if !isChild {
-				continue
-			}
-
-			if nestedField.Type == reflect.Struct {
-				continue
-			}
-
-			switch nestedField.Type {
-			case reflect.Int:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetIntField(record, nestedField)))
-			case reflect.Int8:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt8Field(record, nestedField)))
-			case reflect.Int16:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt16Field(record, nestedField)))
-			case reflect.Int32:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt32Field(record, nestedField)))
-			case reflect.Int64:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeVarint(buf, embedcore.GetInt64Field(record, nestedField))
-			case reflect.Uint:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUintField(record, nestedField)))
-			case reflect.Uint8:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint8Field(record, nestedField)))
-			case reflect.Uint16:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint16Field(record, nestedField)))
-			case reflect.Uint32:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint32Field(record, nestedField)))
-			case reflect.Uint64:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeUvarint(buf, embedcore.GetUint64Field(record, nestedField))
-			case reflect.String:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeString(buf, embedcore.GetStringField(record, nestedField))
-			case reflect.Bool:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeBool(buf, embedcore.GetBoolField(record, nestedField))
-			case reflect.Float64:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeFloat64(buf, embedcore.GetFloat64Field(record, nestedField))
-			case reflect.Float32:
-				buf = append(buf, nestedKey, valueStartMarker)
-				buf = embedcore.EncodeFloat64(buf, float64(embedcore.GetFloat32Field(record, nestedField)))
-			case reflect.Slice:
-				if nestedField.IsSlice && nestedField.SliceElem.Kind() == reflect.String {
-					buf = append(buf, nestedKey, valueStartMarker)
-					sliceVal := embedcore.GetStringSlice(record, nestedField)
-					buf = embedcore.EncodeSlice(buf, sliceVal)
-				} else if nestedField.IsSlice && nestedField.SliceElem.Kind() == reflect.Int {
-					buf = append(buf, nestedKey, valueStartMarker)
-					sliceVal := embedcore.GetIntSlice(record, nestedField)
-					buf = embedcore.EncodeIntSlice(buf, sliceVal)
-				} else if nestedField.IsSlice && nestedField.SliceElem.Kind() == reflect.Struct {
-					buf = append(buf, nestedKey, valueStartMarker)
-					buf = t.encodeSliceOfStructs(record, nestedField, buf)
-				} else {
-					continue
-				}
-			default:
-				continue
-			}
-
-			buf = append(buf, valueEndMarker)
-		}
-	}
-
-	return buf, nil
-}
-
-func (t *Table[T]) encodeSliceOfStructs(record *T, field embedcore.FieldOffset, buf []byte) []byte {
-	// Navigate to the slice value using reflection
-	rootVal := reflect.ValueOf(record).Elem()
-
-	// Navigate through parent path to get the nested struct if applicable
-	var val reflect.Value
-	if len(field.Parent) > 0 {
-		val = rootVal
-		for _, part := range field.Parent {
-			val = val.FieldByName(part)
-			if !val.IsValid() {
-				return buf
-			}
-		}
-		// Get the last part of the field name (the actual slice field)
-		fieldParts := strings.Split(field.Name, ".")
-		lastPart := fieldParts[len(fieldParts)-1]
-		val = val.FieldByName(lastPart)
-	} else {
-		val = rootVal.FieldByName(field.Name)
-	}
-
-	if !val.IsValid() || val.IsNil() {
-		return buf
-	}
-
-	numElems := val.Len()
-	buf = embedcore.EncodeUvarint(buf, uint64(numElems))
-
-	if numElems == 0 {
-		return buf
-	}
-
-	elementType := field.SliceElem
-	elemLayout, err := embedcore.ComputeStructLayout(reflect.New(elementType).Interface())
-	if err != nil {
-		return buf
-	}
-
-	for i := 0; i < numElems; i++ {
-		elem := val.Index(i)
-		elemPtr := elem.Addr().Interface()
-
-		for key, f := range elemLayout.FieldOffsets {
-			if f.IsStruct && !f.IsTime {
-				continue
-			}
-
-			elemKey := key + 128 // Offset element keys to avoid conflicts with parent
-			buf = append(buf, elemKey, valueStartMarker)
-
-			switch f.Type {
-			case reflect.Int:
-				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetIntField(elemPtr, f)))
-			case reflect.Int8:
-				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt8Field(elemPtr, f)))
-			case reflect.Int16:
-				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt16Field(elemPtr, f)))
-			case reflect.Int32:
-				buf = embedcore.EncodeVarint(buf, int64(embedcore.GetInt32Field(elemPtr, f)))
-			case reflect.Int64:
-				buf = embedcore.EncodeVarint(buf, embedcore.GetInt64Field(elemPtr, f))
-			case reflect.Uint:
-				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUintField(elemPtr, f)))
-			case reflect.Uint8:
-				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint8Field(elemPtr, f)))
-			case reflect.Uint16:
-				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint16Field(elemPtr, f)))
-			case reflect.Uint32:
-				buf = embedcore.EncodeUvarint(buf, uint64(embedcore.GetUint32Field(elemPtr, f)))
-			case reflect.Uint64:
-				buf = embedcore.EncodeUvarint(buf, embedcore.GetUint64Field(elemPtr, f))
-			case reflect.String:
-				buf = embedcore.EncodeString(buf, embedcore.GetStringField(elemPtr, f))
-			case reflect.Bool:
-				buf = embedcore.EncodeBool(buf, embedcore.GetBoolField(elemPtr, f))
-			case reflect.Float64:
-				buf = embedcore.EncodeFloat64(buf, embedcore.GetFloat64Field(elemPtr, f))
-			case reflect.Float32:
-				buf = embedcore.EncodeFloat64(buf, float64(embedcore.GetFloat32Field(elemPtr, f)))
-			case reflect.Struct:
-				if f.IsTime {
-					buf = embedcore.EncodeVarint(buf, embedcore.GetTimeField(elemPtr, f).UnixNano())
-				}
-			default:
-				buf = buf[:len(buf)-2]
-				continue
-			}
-
-			buf = append(buf, valueEndMarker)
-		}
-
-		buf = append(buf, embedcore.SliceElementMarker)
-	}
-
-	return buf
-}
-
-func (t *Table[T]) decodeSliceOfStructs(data []byte, fieldOffset embedcore.FieldOffset) (interface{}, []byte, error) {
-	length, n := binary.Uvarint(data)
-	if n <= 0 {
-		return nil, data, errors.New("invalid slice length")
-	}
-	data = data[n:]
-
-	elementType := fieldOffset.SliceElem
-	elemLayout, err := embedcore.ComputeStructLayout(reflect.New(elementType).Interface())
-	if err != nil {
-		return nil, data, err
-	}
-
-	result := reflect.MakeSlice(reflect.SliceOf(elementType), 0, int(length))
-
-	for i := 0; i < int(length); i++ {
-		elem := reflect.New(elementType)
-
-		for len(data) > 0 {
-			if data[0] == valueEndMarker {
-				data = data[1:]
-				break
-			}
-			if data[0] == embedcore.SliceElementMarker {
-				data = data[1:]
-				break
-			}
-			if len(data) < 2 {
-				break
-			}
-
-			key := data[0]
-			if data[1] != valueStartMarker {
-				data = data[1:]
-				continue
-			}
-			data = data[2:]
-
-			adjustedKey := key - 128
-			f, exists := elemLayout.FieldOffsets[adjustedKey]
-			if !exists {
-				endIdx := bytes.IndexByte(data, valueEndMarker)
-				if endIdx == -1 {
-					endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
-				}
-				if endIdx == -1 {
-					break
-				}
-				data = data[endIdx+1:]
-				continue
-			}
-
-			var val interface{}
-			var decodeErr error
-
-			switch f.Type {
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-				val, data, decodeErr = embedcore.DecodeVarint(data)
-			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-				val, data, decodeErr = embedcore.DecodeUvarint(data)
-			case reflect.String:
-				val, data, decodeErr = embedcore.DecodeString(data)
-			case reflect.Bool:
-				val, data, decodeErr = embedcore.DecodeBool(data)
-			case reflect.Float64:
-				val, data, decodeErr = embedcore.DecodeFloat64(data)
-			case reflect.Float32:
-				var v float64
-				v, data, decodeErr = embedcore.DecodeFloat64(data)
-				if decodeErr == nil {
-					val = float32(v)
-				}
-			case reflect.Struct:
-				if f.IsTime {
-					var nanoVal int64
-					nanoVal, data, decodeErr = embedcore.DecodeVarint(data)
-					if decodeErr == nil {
-						val = time.Unix(0, nanoVal).UTC()
-					}
-				} else {
-					endIdx := bytes.IndexByte(data, valueEndMarker)
-					if endIdx == -1 {
-						endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
-					}
-					if endIdx == -1 {
-						break
-					}
-					data = data[endIdx+1:]
-					continue
-				}
-			default:
-				endIdx := bytes.IndexByte(data, valueEndMarker)
-				if endIdx == -1 {
-					endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
-				}
-				if endIdx == -1 {
-					break
-				}
-				data = data[endIdx+1:]
-				continue
-			}
-
-			if decodeErr != nil {
-				endIdx := bytes.IndexByte(data, valueEndMarker)
-				if endIdx == -1 {
-					endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
-				}
-				if endIdx == -1 {
-					break
-				}
-				data = data[endIdx+1:]
-				continue
-			}
-
-			endIdx := bytes.IndexByte(data, valueEndMarker)
-			if endIdx == -1 {
-				endIdx = bytes.IndexByte(data, embedcore.SliceElementMarker)
-			}
-			if endIdx != -1 {
-				data = data[endIdx+1:]
-			}
-
-			embedcore.SetFieldValue(elem.Interface(), f, val)
-		}
-
-		result = reflect.Append(result, elem.Elem())
-	}
-
-	return result.Interface(), data, nil
 }

@@ -100,7 +100,7 @@ func TestAllocateTruncateError(t *testing.T) {
 	if err != nil {
 		t.Skipf("mmap not available: %v", err)
 	}
-	a.region = region
+	a.region.Store(region)
 
 	f.Close()
 	os.Remove(f.Name())
@@ -162,7 +162,7 @@ func TestAllocateRollbackOnTruncateFail(t *testing.T) {
 	if err != nil {
 		t.Skipf("mmap not available: %v", err)
 	}
-	a.region = region
+	a.region.Store(region)
 
 	a.Allocate(100)
 	_ = a.CopyFreeList()
@@ -170,7 +170,7 @@ func TestAllocateRollbackOnTruncateFail(t *testing.T) {
 	f.Close()
 	os.Remove(f.Name())
 
-	_, _, err = a.Allocate(1024 * 1024)
+	_, _, err = a.Allocate(8 * 1024 * 1024)
 	if err == nil {
 		t.Fatal("expected error from allocate after file removed")
 	}

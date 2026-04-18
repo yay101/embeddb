@@ -1,9 +1,12 @@
 package embeddb
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/yay101/embeddbmmap"
 )
@@ -15,12 +18,13 @@ func pageAlign(n int64) int64 {
 
 // allocator manages free space in the database file.
 type allocator struct {
-	file       *os.File
-	region     *embeddbmmap.MappedRegion
-	nextOffset uint64      // next free offset assuming no reuse
-	freeList   []freeBlock // sorted by offset, coalesced
-	actualSize uint64      // actual file size on disk
-	mu         sync.Mutex  // protects freeList, nextOffset, and actualSize
+	file        *os.File
+	region      atomic.Pointer[embeddbmmap.MappedRegion]
+	nextOffset  uint64
+	freeList    []freeBlock
+	actualSize  uint64
+	truncatedTo uint64
+	mu          sync.Mutex
 }
 
 // freeBlock represents a free region in the file.
@@ -32,11 +36,16 @@ type freeBlock struct {
 // newAllocator creates a new allocator for the given file.
 func newAllocator(file *os.File) *allocator {
 	info, _ := file.Stat()
+	sz := uint64(0)
+	if info != nil {
+		sz = uint64(info.Size())
+	}
 	return &allocator{
-		file:       file,
-		nextOffset: 4096,
-		freeList:   nil,
-		actualSize: uint64(info.Size()),
+		file:        file,
+		nextOffset:  4096,
+		freeList:    nil,
+		actualSize:  sz,
+		truncatedTo: sz,
 	}
 }
 
@@ -46,7 +55,10 @@ func (a *allocator) SetFile(file *os.File) {
 	defer a.mu.Unlock()
 	a.file = file
 	info, _ := file.Stat()
-	a.actualSize = uint64(info.Size())
+	if info != nil {
+		a.actualSize = uint64(info.Size())
+		a.truncatedTo = a.actualSize
+	}
 }
 
 // Allocate returns a free region of at least size bytes.
@@ -68,19 +80,43 @@ func (a *allocator) Allocate(size uint64) (offset uint64, length uint64, err err
 	offset = a.actualSize
 	a.actualSize += size
 	a.nextOffset = a.actualSize
-	if a.region != nil {
-		alignedSize := pageAlign(int64(a.actualSize))
-		if alignedSize > a.region.Size() {
-			if err := a.file.Truncate(alignedSize); err != nil {
+	if r := a.region.Load(); r != nil {
+		r.RLock()
+		regionSize := r.Size()
+		r.RUnlock()
+		needed := pageAlign(int64(a.actualSize))
+		minFile := uint64(needed)
+		if uint64(regionSize) > minFile {
+			minFile = uint64(regionSize)
+		}
+		if uint64(needed) > uint64(regionSize) {
+			growBy := uint64(needed) - uint64(regionSize) + 4*1024*1024
+			newSize := uint64(regionSize) + growBy
+			if newSize < minFile {
+				newSize = minFile
+			}
+			if err := a.file.Truncate(int64(newSize)); err != nil {
 				a.actualSize = offset
 				a.nextOffset = offset
 				return 0, 0, fmt.Errorf("allocate: truncate failed: %w", err)
 			}
-			if _, err := a.region.Resize(alignedSize); err != nil {
+			a.truncatedTo = newSize
+			relocated, err := r.Resize(int64(newSize))
+			if err != nil {
 				a.actualSize = offset
 				a.nextOffset = offset
 				return 0, 0, fmt.Errorf("allocate: mmap resize failed: %w", err)
 			}
+			if relocated {
+				a.region.Store(r)
+			}
+		} else if minFile > a.truncatedTo {
+			if err := a.file.Truncate(int64(minFile)); err != nil {
+				a.actualSize = offset
+				a.nextOffset = offset
+				return 0, 0, fmt.Errorf("allocate: truncate to %d failed: %w", minFile, err)
+			}
+			a.truncatedTo = minFile
 		}
 	}
 	return offset, size, nil
@@ -144,10 +180,77 @@ func (a *allocator) Reset(nextOffset uint64, freeList []freeBlock) {
 	defer a.mu.Unlock()
 	a.nextOffset = nextOffset
 	a.freeList = freeList
-	// Ensure actualSize is at least nextOffset
 	if a.actualSize < nextOffset {
 		a.actualSize = nextOffset
 	}
+}
+
+// Save writes the free list to the file at the given offset.
+func (a *allocator) Save(file *os.File, offset int64) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Write block count (4 bytes)
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf[:4], uint32(len(a.freeList)))
+
+	// Write free blocks: [8 byte offset LE][8 byte length LE] each
+	for _, fb := range a.freeList {
+		var block [16]byte
+		binary.LittleEndian.PutUint64(block[:8], fb.offset)
+		binary.LittleEndian.PutUint64(block[8:], fb.length)
+		buf = append(buf, block[:]...)
+	}
+
+	// Calculate CRC32
+	crc := crc32.ChecksumIEEE(buf)
+
+	// Write CRC at end (4 bytes)
+	var crcBuf [4]byte
+	binary.LittleEndian.PutUint32(crcBuf[:], crc)
+	buf = append(buf, crcBuf[:]...)
+
+	_, err := file.WriteAt(buf, offset)
+	return err
+}
+
+// Load loads the free list from the file at the given offset.
+func (a *allocator) Load(file *os.File, offset int64) error {
+	// Read block count
+	var buf4 [4]byte
+	_, err := file.ReadAt(buf4[:], offset)
+	if err != nil {
+		return err
+	}
+	blockCount := int(binary.LittleEndian.Uint32(buf4[:]))
+
+	// Read all blocks
+	totalSize := 4 + blockCount*16 + 4 // count + blocks + crc
+	buf := make([]byte, totalSize)
+	_, err = file.ReadAt(buf, offset)
+	if err != nil {
+		return err
+	}
+
+	// Verify CRC
+	storedCRC := binary.LittleEndian.Uint32(buf[totalSize-4:])
+	computedCRC := crc32.ChecksumIEEE(buf[:totalSize-4])
+	if storedCRC != computedCRC {
+		return fmt.Errorf("free list CRC mismatch")
+	}
+
+	// Parse blocks
+	pos := 4
+	a.freeList = make([]freeBlock, 0, blockCount)
+	for i := 0; i < blockCount; i++ {
+		a.freeList = append(a.freeList, freeBlock{
+			offset: binary.LittleEndian.Uint64(buf[pos : pos+8]),
+			length: binary.LittleEndian.Uint64(buf[pos+8 : pos+16]),
+		})
+		pos += 16
+	}
+
+	return nil
 }
 
 // CopyFreeList returns a copy of the current free list (for serialization).
