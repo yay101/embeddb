@@ -143,49 +143,49 @@ func (db *database) ensureRegion(size int64) error {
 }
 
 func (db *database) readAt(buf []byte, offset int64) error {
-	currentRegion := db.region.Load()
-	if currentRegion == nil {
-		if _, err := db.file.ReadAt(buf, offset); err != nil {
-			return fmt.Errorf("readAt: %w", err)
+	for {
+		currentRegion := db.region.Load()
+		if currentRegion == nil {
+			if _, err := db.file.ReadAt(buf, offset); err != nil {
+				return fmt.Errorf("readAt: %w", err)
+			}
+			return nil
 		}
-		return nil
-	}
-	needed := offset + int64(len(buf))
-	currentRegion.RLock()
-	if needed > currentRegion.Size() {
+		needed := offset + int64(len(buf))
+		currentRegion.RLock()
+		if needed <= currentRegion.Size() {
+			copy(buf, unsafe.Slice((*byte)(unsafe.Add(currentRegion.Pointer(), offset)), len(buf)))
+			currentRegion.RUnlock()
+			return nil
+		}
 		currentRegion.RUnlock()
 		if err := db.ensureRegion(needed); err != nil {
 			return fmt.Errorf("readAt ensureRegion: %w", err)
 		}
-		currentRegion = db.region.Load()
-		currentRegion.RLock()
 	}
-	copy(buf, unsafe.Slice((*byte)(unsafe.Add(currentRegion.Pointer(), offset)), len(buf)))
-	currentRegion.RUnlock()
-	return nil
 }
 
 func (db *database) writeAt(buf []byte, offset int64) error {
-	currentRegion := db.region.Load()
-	if currentRegion != nil {
+	for {
+		currentRegion := db.region.Load()
+		if currentRegion == nil {
+			if _, err := db.file.WriteAt(buf, offset); err != nil {
+				return fmt.Errorf("writeAt: %w", err)
+			}
+			return nil
+		}
 		needed := offset + int64(len(buf))
 		currentRegion.RLock()
-		if needed > currentRegion.Size() {
+		if needed <= currentRegion.Size() {
+			copy(unsafe.Slice((*byte)(unsafe.Add(currentRegion.Pointer(), offset)), len(buf)), buf)
 			currentRegion.RUnlock()
-			if err := db.ensureRegion(needed); err != nil {
-				return fmt.Errorf("writeAt ensureRegion: %w", err)
-			}
-			currentRegion = db.region.Load()
-			currentRegion.RLock()
+			return nil
 		}
-		copy(unsafe.Slice((*byte)(unsafe.Add(currentRegion.Pointer(), offset)), len(buf)), buf)
 		currentRegion.RUnlock()
-		return nil
+		if err := db.ensureRegion(needed); err != nil {
+			return fmt.Errorf("writeAt ensureRegion: %w", err)
+		}
 	}
-	if _, err := db.file.WriteAt(buf, offset); err != nil {
-		return fmt.Errorf("writeAt: %w", err)
-	}
-	return nil
 }
 
 func (db *database) readAtFn() func([]byte, int64) {
@@ -438,6 +438,30 @@ func (db *database) rebuildIndexFromScan() error {
 
 			key := encodePrimaryKey(hdr.TableID, hdr.RecordID)
 			db.index.Insert(key, uint64(offset))
+
+			if hdr.HasPrevVersion() && hdr.PrevVersionOff >= FileHeaderSize {
+				verKey := encodeVersionKey(hdr.TableID, hdr.RecordID, 1)
+				db.index.Insert(verKey, uint64(offset))
+			}
+
+			payloadEnd := totalLen - embedcore.RecordFooterSize
+			if payloadEnd > embedcore.RecordHeaderSize {
+				payload := recData[embedcore.RecordHeaderSize:payloadEnd]
+				for len(payload) > 0 {
+					fieldName, fieldValue, remaining, err := embedcore.DecodeTLVField(payload)
+					if err != nil {
+						break
+					}
+					payload = remaining
+
+					if fieldName == "" {
+						continue
+					}
+
+					secKey := encodeSecondaryKey(hdr.TableID, fieldName, fieldValue, uint64(offset))
+					db.index.Insert(secKey, uint64(offset))
+				}
+			}
 
 			info := tableInfo[hdr.TableID]
 			if info == nil {

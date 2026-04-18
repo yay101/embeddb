@@ -85,21 +85,17 @@ func (a *allocator) Allocate(size uint64) (offset uint64, length uint64, err err
 		regionSize := r.Size()
 		r.RUnlock()
 		needed := pageAlign(int64(a.actualSize))
-		minFile := uint64(needed)
-		if uint64(regionSize) > minFile {
-			minFile = uint64(regionSize)
-		}
 		if uint64(needed) > uint64(regionSize) {
 			growBy := uint64(needed) - uint64(regionSize) + 4*1024*1024
 			newSize := uint64(regionSize) + growBy
-			if newSize < minFile {
-				newSize = minFile
-			}
+			a.mu.Unlock()
 			if err := a.file.Truncate(int64(newSize)); err != nil {
+				a.mu.Lock()
 				a.actualSize = offset
 				a.nextOffset = offset
 				return 0, 0, fmt.Errorf("allocate: truncate failed: %w", err)
 			}
+			a.mu.Lock()
 			a.truncatedTo = newSize
 			relocated, err := r.Resize(int64(newSize))
 			if err != nil {
@@ -110,13 +106,19 @@ func (a *allocator) Allocate(size uint64) (offset uint64, length uint64, err err
 			if relocated {
 				a.region.Store(r)
 			}
-		} else if minFile > a.truncatedTo {
-			if err := a.file.Truncate(int64(minFile)); err != nil {
-				a.actualSize = offset
-				a.nextOffset = offset
-				return 0, 0, fmt.Errorf("allocate: truncate to %d failed: %w", minFile, err)
+		} else {
+			minFile := uint64(needed)
+			if uint64(regionSize) > minFile {
+				minFile = uint64(regionSize)
 			}
-			a.truncatedTo = minFile
+			if minFile > a.truncatedTo {
+				if err := a.file.Truncate(int64(minFile)); err != nil {
+					a.actualSize = offset
+					a.nextOffset = offset
+					return 0, 0, fmt.Errorf("allocate: truncate to %d failed: %w", minFile, err)
+				}
+				a.truncatedTo = minFile
+			}
 		}
 	}
 	return offset, size, nil

@@ -30,6 +30,13 @@ const (
 
 var ErrKeyNotFound = errors.New("key not found")
 
+var pageBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, PageSize)
+		return &buf
+	},
+}
+
 type BTree struct {
 	db        *database
 	alloc     *allocator
@@ -294,25 +301,32 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 	r.RLock()
 	page := bt.pageData(offset)
 
-	pageCopy := make([]byte, PageSize)
+	pageBufPtr := pageBufPool.Get().(*[]byte)
+	pageCopy := *pageBufPtr
 	copy(pageCopy, page)
 	r.RUnlock()
 
 	storedCRC := binary.LittleEndian.Uint32(pageCopy[PageFooterOff:])
 	computedCRC := crc32.ChecksumIEEE(pageCopy[:PageFooterOff])
 	if storedCRC != computedCRC {
-		filePageCopy := make([]byte, PageSize)
+		filePageBufPtr := pageBufPool.Get().(*[]byte)
+		filePageCopy := *filePageBufPtr
 		if _, err := bt.db.file.ReadAt(filePageCopy, int64(offset)); err == nil {
 			fileCRC := binary.LittleEndian.Uint32(filePageCopy[PageFooterOff:])
 			fileComputed := crc32.ChecksumIEEE(filePageCopy[:PageFooterOff])
 			if fileCRC == fileComputed {
 				copy(pageCopy, filePageCopy)
 			} else {
+				pageBufPool.Put(filePageBufPtr)
+				pageBufPool.Put(pageBufPtr)
 				return nil, fmt.Errorf("btree page %d: CRC mismatch (stored=%08x computed=%08x)", offset, storedCRC, computedCRC)
 			}
 		} else {
+			pageBufPool.Put(filePageBufPtr)
+			pageBufPool.Put(pageBufPtr)
 			return nil, fmt.Errorf("btree page %d: CRC mismatch (stored=%08x computed=%08x)", offset, storedCRC, computedCRC)
 		}
+		pageBufPool.Put(filePageBufPtr)
 	}
 
 	nodeType := pageCopy[0]
@@ -374,6 +388,8 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 	if nodeType == PageTypeRootLeaf || nodeType == PageTypeRootInternal {
 		bt.count = int(binary.LittleEndian.Uint32(pageCopy[RootCountOff : RootCountOff+4]))
 	}
+
+	pageBufPool.Put(pageBufPtr)
 
 	bt.cacheNode(node)
 	return node, nil

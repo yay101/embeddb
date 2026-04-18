@@ -3,6 +3,7 @@ package embeddb
 import (
 	"encoding/binary"
 	"math"
+	"sync"
 	"time"
 
 	embedcore "github.com/yay101/embeddbcore"
@@ -14,18 +15,37 @@ const (
 	indexNSVersion   byte = 0x02
 )
 
+var keyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 64)
+		return &b
+	},
+}
+
 func encodePrimaryKey(tableID uint8, pkValue any) []byte {
-	var key []byte
+	bp := keyBufPool.Get().(*[]byte)
+	key := (*bp)[:0]
 	key = append(key, indexNSPrimary)
 	key = append(key, tableID)
 	key = encodeIndexValue(key, pkValue)
-	return key
+	out := make([]byte, len(key))
+	copy(out, key)
+	*bp = key
+	keyBufPool.Put(bp)
+	return out
 }
 
 const maxIndexValueLen = 252
 
 func encodeIndexValueBytes(value any) []byte {
-	return encodeIndexValue(nil, value)
+	bp := keyBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	buf = encodeIndexValue(buf, value)
+	out := make([]byte, len(buf))
+	copy(out, buf)
+	*bp = buf
+	keyBufPool.Put(bp)
+	return out
 }
 
 func truncIndexValue(v []byte) []byte {
@@ -36,60 +56,90 @@ func truncIndexValue(v []byte) []byte {
 }
 
 func encodeSecondaryKey(tableID uint8, fieldName string, fieldValue any, recordOffset uint64) []byte {
-	var key []byte
+	bp := keyBufPool.Get().(*[]byte)
+	key := (*bp)[:0]
 	key = append(key, indexNSSecondary)
 	key = append(key, tableID)
 	key = embedcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
 	key = append(key, truncIndexValue(encodeIndexValueBytes(fieldValue))...)
 	key = binary.BigEndian.AppendUint64(key, recordOffset)
-	return key
+	out := make([]byte, len(key))
+	copy(out, key)
+	*bp = key
+	keyBufPool.Put(bp)
+	return out
 }
 
 func encodeSecondaryKeyPrefix(tableID uint8, fieldName string) []byte {
-	var prefix []byte
+	bp := keyBufPool.Get().(*[]byte)
+	prefix := (*bp)[:0]
 	prefix = append(prefix, indexNSSecondary)
 	prefix = append(prefix, tableID)
 	prefix = embedcore.EncodeUvarint(prefix, uint64(len(fieldName)))
 	prefix = append(prefix, fieldName...)
-	return prefix
+	out := make([]byte, len(prefix))
+	copy(out, prefix)
+	*bp = prefix
+	keyBufPool.Put(bp)
+	return out
 }
 
 func encodeSecondaryKeyPrefixWithValue(tableID uint8, fieldName string, fieldValue any) []byte {
-	var key []byte
+	bp := keyBufPool.Get().(*[]byte)
+	key := (*bp)[:0]
 	key = append(key, indexNSSecondary)
 	key = append(key, tableID)
 	key = embedcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
 	key = append(key, truncIndexValue(encodeIndexValueBytes(fieldValue))...)
-	return key
+	out := make([]byte, len(key))
+	copy(out, key)
+	*bp = key
+	keyBufPool.Put(bp)
+	return out
 }
 
 func encodeSecondaryKeyEndPrefix(tableID uint8, fieldName string) []byte {
-	var key []byte
+	bp := keyBufPool.Get().(*[]byte)
+	key := (*bp)[:0]
 	key = append(key, indexNSSecondary)
 	nextID := tableID + 1
 	key = append(key, nextID)
 	key = embedcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
-	return key
+	out := make([]byte, len(key))
+	copy(out, key)
+	*bp = key
+	keyBufPool.Put(bp)
+	return out
 }
 
 func encodeVersionKeyPrefix(tableID uint8, recordID uint32) []byte {
-	var key []byte
+	bp := keyBufPool.Get().(*[]byte)
+	key := (*bp)[:0]
 	key = append(key, indexNSVersion)
 	key = append(key, tableID)
 	key = embedcore.EncodeUvarint(key, uint64(recordID))
-	return key
+	out := make([]byte, len(key))
+	copy(out, key)
+	*bp = key
+	keyBufPool.Put(bp)
+	return out
 }
 
 func encodeVersionKey(tableID uint8, recordID uint32, version uint32) []byte {
-	var key []byte
+	bp := keyBufPool.Get().(*[]byte)
+	key := (*bp)[:0]
 	key = append(key, indexNSVersion)
 	key = append(key, tableID)
 	key = embedcore.EncodeUvarint(key, uint64(recordID))
 	key = embedcore.EncodeUvarint(key, uint64(version))
-	return key
+	out := make([]byte, len(key))
+	copy(out, key)
+	*bp = key
+	keyBufPool.Put(bp)
+	return out
 }
 
 func parsePrimaryKey(key []byte) (tableID uint8, pkValue []byte) {

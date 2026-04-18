@@ -16,6 +16,12 @@ import (
 	"github.com/yay101/embeddbmmap"
 )
 
+var hdrBufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, embedcore.RecordHeaderSize)
+	},
+}
+
 func encodePKForIndex(tableID uint8, pkValue any) []byte {
 	var key []byte
 	key = append(key, tableID)
@@ -460,73 +466,156 @@ func (t *Table[T]) deleteSecondaryKeys(record *T, offset uint64) {
 }
 
 func (t *Table[T]) deactivateRecord(offset uint64) {
-	deactivateBuf := make([]byte, embedcore.RecordHeaderSize)
+	deactivateBuf := hdrBufPool.Get().([]byte)
+	defer hdrBufPool.Put(deactivateBuf)
 	t.db.readAt(deactivateBuf, int64(offset))
 	deactivateBuf[1] &^= embedcore.FlagsActive
 	t.db.writeAt(deactivateBuf, int64(offset))
 }
 
 func (t *Table[T]) normalizePK(id any) any {
-	v := reflect.ValueOf(id)
-	pkType := reflect.TypeOf(id)
 	switch t.layout.PKType {
 	case reflect.Uint:
-		pkType = reflect.TypeOf(uint(0))
+		switch v := id.(type) {
+		case int:
+			return uint(v)
+		case int8:
+			return uint(v)
+		case int16:
+			return uint(v)
+		case int32:
+			return uint(v)
+		case int64:
+			return uint(v)
+		case uint:
+			return v
+		case uint8:
+			return uint(v)
+		case uint16:
+			return uint(v)
+		case uint32:
+			return uint(v)
+		case uint64:
+			return uint(v)
+		}
 	case reflect.Uint8:
-		pkType = reflect.TypeOf(uint8(0))
+		switch v := id.(type) {
+		case int:
+			return uint8(v)
+		case uint:
+			return uint8(v)
+		case uint32:
+			return uint8(v)
+		}
 	case reflect.Uint16:
-		pkType = reflect.TypeOf(uint16(0))
+		switch v := id.(type) {
+		case int:
+			return uint16(v)
+		case uint:
+			return uint16(v)
+		case uint32:
+			return uint16(v)
+		}
 	case reflect.Uint32:
-		pkType = reflect.TypeOf(uint32(0))
+		switch v := id.(type) {
+		case int:
+			return uint32(v)
+		case uint:
+			return uint32(v)
+		case uint64:
+			return uint32(v)
+		}
 	case reflect.Uint64:
-		pkType = reflect.TypeOf(uint64(0))
+		switch v := id.(type) {
+		case int:
+			return uint64(v)
+		case uint:
+			return v
+		case uint32:
+			return uint64(v)
+		}
 	case reflect.Int:
-		pkType = reflect.TypeOf(int(0))
+		switch v := id.(type) {
+		case int:
+			return v
+		case uint:
+			return int(v)
+		case uint32:
+			return int(v)
+		case uint64:
+			return int(v)
+		}
 	case reflect.Int8:
-		pkType = reflect.TypeOf(int8(0))
+		switch v := id.(type) {
+		case int:
+			return int8(v)
+		case uint:
+			return int8(v)
+		}
 	case reflect.Int16:
-		pkType = reflect.TypeOf(int16(0))
+		switch v := id.(type) {
+		case int:
+			return int16(v)
+		case uint:
+			return int16(v)
+		}
 	case reflect.Int32:
-		pkType = reflect.TypeOf(int32(0))
+		switch v := id.(type) {
+		case int:
+			return int32(v)
+		case uint:
+			return int32(v)
+		}
 	case reflect.Int64:
-		pkType = reflect.TypeOf(int64(0))
+		switch v := id.(type) {
+		case int:
+			return int64(v)
+		case uint:
+			return int64(v)
+		}
 	case reflect.String:
-		pkType = reflect.TypeOf("")
+		if s, ok := id.(string); ok {
+			return s
+		}
 	default:
 		return id
-	}
-	if v.CanConvert(pkType) {
-		return v.Convert(pkType).Interface()
 	}
 	return id
 }
 
 func (t *Table[T]) readRecordAt(offset uint64) (*T, error) {
-	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	hdrBuf := hdrBufPool.Get().([]byte)
 	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
+		hdrBufPool.Put(hdrBuf)
 		return nil, fmt.Errorf("failed to read record header at offset %d: %w", offset, err)
 	}
 
 	hdr, err := decodeRecordHeader(hdrBuf)
 	if err != nil {
+		hdrBufPool.Put(hdrBuf)
 		return nil, fmt.Errorf("invalid record header at offset %d: %w", offset, err)
 	}
 
 	if hdr.Version != V2RecordVersion {
+		hdrBufPool.Put(hdrBuf)
 		return nil, fmt.Errorf("invalid record version at offset %d", offset)
 	}
 
 	if !hdr.IsActive() {
+		hdrBufPool.Put(hdrBuf)
 		return nil, fmt.Errorf("record is deleted")
 	}
 
 	if hdr.PayloadLen > 128*1024*1024 {
+		hdrBufPool.Put(hdrBuf)
 		return nil, fmt.Errorf("record payload too large at offset %d: %d bytes", offset, hdr.PayloadLen)
 	}
 
 	totalLen := recordTotalSize(hdr)
 	recordBuf := make([]byte, totalLen)
-	copy(recordBuf, hdrBuf)
+	copy(recordBuf[:embedcore.RecordHeaderSize], hdrBuf[:embedcore.RecordHeaderSize])
+	hdrBufPool.Put(hdrBuf)
+
 	if totalLen > embedcore.RecordHeaderSize {
 		if err := t.db.readAt(recordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
 			return nil, fmt.Errorf("failed to read record data at offset %d: %w", offset, err)
@@ -670,7 +759,11 @@ func (t *Table[T]) Get(id any) (*T, error) {
 	t.db.mu.RLock()
 	defer t.db.mu.RUnlock()
 
-	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
+	return t.getLocked(t.normalizePK(id))
+}
+
+func (t *Table[T]) getLocked(pkValue any) (*T, error) {
+	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, pkValue))
 	if err != nil {
 		return nil, fmt.Errorf("record not found")
 	}
@@ -1063,15 +1156,6 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	t.insertSecondaryKeys(record, offset)
 
 	return recordID, nil
-}
-
-func (t *Table[T]) getLocked(id any) (*T, error) {
-	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
-	if err != nil {
-		return nil, fmt.Errorf("record not found")
-	}
-
-	return t.readRecordAt(offset)
 }
 
 func (t *Table[T]) updateLocked(id any, record *T) error {
@@ -1984,6 +2068,7 @@ type Scanner[T any] struct {
 	pos     int
 	current *T
 	err     error
+	locked  bool
 }
 
 func (t *Table[T]) ScanRecords() *Scanner[T] {
@@ -2011,12 +2096,12 @@ func (t *Table[T]) ScanRecords() *Scanner[T] {
 		}
 		return true
 	})
-	t.db.mu.RUnlock()
 
 	return &Scanner[T]{
 		table:   t,
 		entries: entries,
 		pos:     0,
+		locked:  true,
 	}
 }
 
@@ -2026,7 +2111,7 @@ func (s *Scanner[T]) Next() bool {
 			return false
 		}
 
-		record, err := s.table.Get(s.entries[s.pos].pkValue)
+		record, err := s.table.getLocked(s.entries[s.pos].pkValue)
 		s.pos++
 		if err != nil {
 			continue
@@ -2049,6 +2134,10 @@ func (s *Scanner[T]) Err() error {
 }
 
 func (s *Scanner[T]) Close() {
+	if s.locked {
+		s.table.db.mu.RUnlock()
+		s.locked = false
+	}
 	s.entries = nil
 }
 

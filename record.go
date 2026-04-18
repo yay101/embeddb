@@ -28,18 +28,6 @@ type RecordHeader struct {
 	PayloadLen     uint32
 }
 
-func encodeRecordHeader(h RecordHeader) []byte {
-	buf := make([]byte, embedcore.RecordHeaderSize)
-	buf[0] = h.Version
-	buf[1] = h.Flags
-	buf[2] = byte(h.TableID)
-	binary.LittleEndian.PutUint32(buf[3:7], h.RecordID)
-	binary.LittleEndian.PutUint64(buf[7:15], h.PrevVersionOff)
-	binary.LittleEndian.PutUint32(buf[15:19], h.SchemaVersion)
-	binary.LittleEndian.PutUint32(buf[19:23], h.PayloadLen)
-	return buf
-}
-
 func decodeRecordHeader(data []byte) (RecordHeader, error) {
 	if len(data) < embedcore.RecordHeaderSize {
 		return RecordHeader{}, fmt.Errorf("%w: header too short (%d bytes)", ErrInvalidRecord, len(data))
@@ -475,25 +463,22 @@ func decodeSliceOfStructs(data []byte, field embedcore.FieldOffset) (interface{}
 }
 
 func buildV2Record(tableID uint8, recordID uint32, schemaVersion uint32, flags byte, prevVersionOff uint64, payload []byte) []byte {
-	hdr := RecordHeader{
-		Version:        V2RecordVersion,
-		Flags:          flags,
-		TableID:        tableID,
-		RecordID:       recordID,
-		PrevVersionOff: prevVersionOff,
-		SchemaVersion:  schemaVersion,
-		PayloadLen:     uint32(len(payload)),
-	}
-	headerBytes := encodeRecordHeader(hdr)
+	headerSize := embedcore.RecordHeaderSize
 	footerSize := embedcore.RecordFooterSize
-	totalSize := len(headerBytes) + len(payload) + footerSize
+	totalSize := headerSize + len(payload) + footerSize
 
 	rec := make([]byte, totalSize)
-	copy(rec, headerBytes)
-	copy(rec[len(headerBytes):], payload)
+	rec[0] = V2RecordVersion
+	rec[1] = flags
+	rec[2] = byte(tableID)
+	binary.LittleEndian.PutUint32(rec[3:7], recordID)
+	binary.LittleEndian.PutUint64(rec[7:15], prevVersionOff)
+	binary.LittleEndian.PutUint32(rec[15:19], schemaVersion)
+	binary.LittleEndian.PutUint32(rec[19:23], uint32(len(payload)))
+	copy(rec[headerSize:], payload)
 
-	checksum := crc32.ChecksumIEEE(rec[:len(headerBytes)+len(payload)])
-	binary.LittleEndian.PutUint32(rec[len(headerBytes)+len(payload):], checksum)
+	checksum := crc32.ChecksumIEEE(rec[:headerSize+len(payload)])
+	binary.LittleEndian.PutUint32(rec[headerSize+len(payload):], checksum)
 
 	return rec
 }
