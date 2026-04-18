@@ -214,36 +214,6 @@ func TestMapIndex(t *testing.T) {
 	}
 }
 
-func TestOffsetMapIndex(t *testing.T) {
-	mi := newOffsetMapIndex()
-
-	mi.Set("key1", 100)
-	mi.Set("key2", 200)
-
-	val, ok := mi.Get("key1")
-	if !ok {
-		t.Error("expected to find key1")
-	}
-	if val != 100 {
-		t.Errorf("expected 100, got %d", val)
-	}
-
-	count := 0
-	mi.Range(func(k string, v uint64) bool {
-		count++
-		return true
-	})
-	if count != 2 {
-		t.Errorf("expected 2 entries, got %d", count)
-	}
-
-	mi.Delete("key1")
-	_, ok = mi.Get("key1")
-	if ok {
-		t.Error("expected key1 to be deleted")
-	}
-}
-
 func TestRestartBasic(t *testing.T) {
 	os.Remove("/tmp/test_restart.db")
 

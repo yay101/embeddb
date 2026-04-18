@@ -1,7 +1,7 @@
 package embeddb
 
 import (
-	"encoding/binary"
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -178,23 +178,24 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 	typedDB.mu.Lock()
 	table, exists := typedDB.tableCat[tableName]
 	if !exists {
-		var adoptedID uint8
-		if typedDB.rebuilt && typedDB.orphanedTables != nil {
-			for tid, info := range typedDB.orphanedTables {
-				adoptedID = tid
-				table = &tableCatalogEntry{
-					ID:            info.ID,
-					Name:          tableName,
-					SchemaVersion: layout.SchemaVersion,
-					NextRecordID:  info.NextRecordID,
-					RecordCount:   info.RecordCount,
-					MaxVersions:   useOpts.MaxVersions,
-				}
-				delete(typedDB.orphanedTables, tid)
+		orphanedEntry := (*tableCatalogEntry)(nil)
+		for _, entry := range typedDB.tableCat {
+			if entry.Dropped {
+				continue
+			}
+			if strings.HasPrefix(entry.Name, "table_") && entry.Name != tableName {
+				orphanedEntry = entry
 				break
 			}
 		}
-		if adoptedID == 0 {
+		if orphanedEntry != nil {
+			delete(typedDB.tableCat, orphanedEntry.Name)
+			orphanedEntry.Name = tableName
+			orphanedEntry.SchemaVersion = layout.SchemaVersion
+			orphanedEntry.MaxVersions = useOpts.MaxVersions
+			typedDB.tableCat[tableName] = orphanedEntry
+			table = orphanedEntry
+		} else {
 			var maxID uint8
 			for _, entry := range typedDB.tableCat {
 				if entry.ID > maxID && !entry.Dropped {
@@ -210,8 +211,8 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 				RecordCount:   0,
 				MaxVersions:   useOpts.MaxVersions,
 			}
+			typedDB.tableCat[tableName] = table
 		}
-		typedDB.tableCat[tableName] = table
 	} else if table.SchemaVersion != layout.SchemaVersion {
 		if db.migrate {
 			if err := migrateTable(typedDB, table, layout); err != nil {
@@ -232,18 +233,6 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 		tableID:     table.ID,
 		layout:      layout,
 		maxVersions: table.MaxVersions,
-	}
-
-	if db.autoIndex {
-		typedDB.mu.RLock()
-		typedTable.idxMgr = newIndexManager[T](typedDB, layout)
-		for _, field := range layout.Fields {
-			if field.Name != "" && !field.Primary && field.Offset > 0 {
-				_ = typedTable.idxMgr.CreateIndex(field.Name)
-			}
-		}
-		typedTable.rebuildSecondaryIndexes()
-		typedDB.mu.RUnlock()
 	}
 
 	db.tables[tableName] = typedDB
@@ -401,359 +390,66 @@ type Table[T any] struct {
 	name        string
 	tableID     uint8
 	layout      *embedcore.StructLayout
-	idxMgr      *indexManager[T]
 	maxVersions uint8
 }
 
-type indexManager[T any] struct {
-	db         *database
-	layout     *embedcore.StructLayout
-	indexes    map[string]offsetIndexInterface
-	fieldCache map[string]embedcore.FieldOffset
-}
-
-func newIndexManager[T any](db *database, layout *embedcore.StructLayout) *indexManager[T] {
-	fieldCache := make(map[string]embedcore.FieldOffset)
-	for _, f := range layout.Fields {
-		fieldCache[f.Name] = f
+func (t *Table[T]) insertSecondaryKeys(record *T, offset uint64) {
+	if t.db.parent == nil {
+		return
 	}
-	return &indexManager[T]{
-		db:         db,
-		layout:     layout,
-		indexes:    make(map[string]offsetIndexInterface),
-		fieldCache: fieldCache,
-	}
-}
-
-func (im *indexManager[T]) CreateIndex(fieldName string) error {
-	for _, field := range im.layout.Fields {
-		if field.Name == fieldName {
-			im.indexes[fieldName] = newOffsetMapIndex()
-			return nil
+	if !t.db.parent.autoIndex {
+		if t.db.explicitIndexes == nil {
+			return
 		}
-	}
-	return fmt.Errorf("field %s not found", fieldName)
-}
-
-func (im *indexManager[T]) DropIndex(fieldName string) error {
-	delete(im.indexes, fieldName)
-	return nil
-}
-
-func (im *indexManager[T]) HasIndex(fieldName string) bool {
-	_, ok := im.indexes[fieldName]
-	return ok
-}
-
-func (im *indexManager[T]) GetIndexedFields() []string {
-	fields := make([]string, 0, len(im.indexes))
-	for f := range im.indexes {
-		fields = append(fields, f)
-	}
-	return fields
-}
-
-func (im *indexManager[T]) InsertIntoIndexes(record *T, offset uint64) error {
-	for fieldName, idx := range im.indexes {
-		field, found := im.fieldCache[fieldName]
-		if !found {
-			continue
+		explicitFields := t.db.explicitIndexes[t.name]
+		if len(explicitFields) == 0 {
+			return
 		}
-		if field.IsSlice {
-			im.indexSliceElement(record, field, idx, offset)
-			continue
+		explicitSet := make(map[string]bool, len(explicitFields))
+		for _, f := range explicitFields {
+			explicitSet[f] = true
 		}
-		key := embedcore.GetFieldAsString(record, field)
-		if key == "" {
-			continue
-		}
-		// Check uniqueness for unique fields
-		if field.Unique {
-			if val, ok := idx.Get(key); ok {
-				// Check if it's the same record (for updates)
-				if val != offset {
-					return fmt.Errorf("unique constraint violation for field %s: value %s already exists", fieldName, key)
+		for _, field := range t.layout.Fields {
+			if field.Name != "" && !field.Primary && field.Offset > 0 && !field.IsSlice && explicitSet[field.Name] {
+				if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][field.Name] {
+					continue
+				}
+				key := embedcore.GetFieldAsString(record, field)
+				if key != "" {
+					secKey := encodeSecondaryKey(t.tableID, field.Name, key, offset)
+					t.db.index.Insert(secKey, offset)
 				}
 			}
 		}
-		idx.Set(key, offset)
-	}
-	return nil
-}
-
-func (im *indexManager[T]) indexSliceElement(record *T, field embedcore.FieldOffset, idx offsetIndexInterface, offset uint64) {
-	v := reflect.ValueOf(record).Elem()
-	for _, parentName := range field.Parent {
-		for i := 0; i < v.NumField(); i++ {
-			if v.Type().Field(i).Name == parentName {
-				v = v.Field(i)
-				break
-			}
-		}
-	}
-	v = v.FieldByName(field.Name)
-	if !v.IsValid() || v.Kind() != reflect.Slice {
 		return
 	}
-	for i := 0; i < v.Len(); i++ {
-		elem := v.Index(i)
-		key := ""
-		switch elem.Kind() {
-		case reflect.String:
-			key = elem.String()
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			key = strconv.FormatInt(elem.Int(), 10)
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			key = strconv.FormatUint(elem.Uint(), 10)
-		case reflect.Float32:
-			key = strconv.FormatFloat(elem.Float(), 'f', -1, 32)
-		case reflect.Float64:
-			key = strconv.FormatFloat(elem.Float(), 'f', -1, 64)
-		}
-		if key != "" {
-			idx.Set(key, offset)
-		}
-	}
-}
-
-func (im *indexManager[T]) UpdateIndexes(record *T, offset uint64) error {
-	for fieldName, idx := range im.indexes {
-		field, found := im.fieldCache[fieldName]
-		if !found {
-			continue
-		}
-		if field.IsSlice {
-			im.indexSliceElement(record, field, idx, offset)
-			continue
-		}
-		key := embedcore.GetFieldAsString(record, field)
-		if key == "" {
-			continue
-		}
-		idx.Set(key, offset)
-	}
-	return nil
-}
-
-func (im *indexManager[T]) DeleteFromIndexes(record *T, offset uint64) error {
-	for fieldName, idx := range im.indexes {
-		field, found := im.fieldCache[fieldName]
-		if !found {
-			continue
-		}
-		if field.IsSlice {
-			im.indexSliceElementDelete(record, field, idx, offset)
-			continue
-		}
-		key := embedcore.GetFieldAsString(record, field)
-		if key == "" {
-			continue
-		}
-		idx.Delete(key)
-	}
-	return nil
-}
-
-func (im *indexManager[T]) indexSliceElementDelete(record *T, field embedcore.FieldOffset, idx offsetIndexInterface, offset uint64) {
-	v := reflect.ValueOf(record).Elem()
-	for _, parentName := range field.Parent {
-		for i := 0; i < v.NumField(); i++ {
-			if v.Type().Field(i).Name == parentName {
-				v = v.Field(i)
-				break
+	for _, field := range t.layout.Fields {
+		if field.Name != "" && !field.Primary && field.Offset > 0 && !field.IsSlice {
+			if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][field.Name] {
+				continue
+			}
+			key := embedcore.GetFieldAsString(record, field)
+			if key != "" {
+				secKey := encodeSecondaryKey(t.tableID, field.Name, key, offset)
+				t.db.index.Insert(secKey, offset)
 			}
 		}
 	}
-	v = v.FieldByName(field.Name)
-	if !v.IsValid() || v.Kind() != reflect.Slice {
+}
+
+func (t *Table[T]) deleteSecondaryKeys(record *T, offset uint64) {
+	if t.db.parent == nil || !t.db.parent.autoIndex {
 		return
 	}
-	for i := 0; i < v.Len(); i++ {
-		elem := v.Index(i)
-		key := ""
-		switch elem.Kind() {
-		case reflect.String:
-			key = elem.String()
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			key = strconv.FormatInt(elem.Int(), 10)
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			key = strconv.FormatUint(elem.Uint(), 10)
-		case reflect.Float32:
-			key = strconv.FormatFloat(elem.Float(), 'f', -1, 32)
-		case reflect.Float64:
-			key = strconv.FormatFloat(elem.Float(), 'f', -1, 64)
-		}
-		if key != "" {
-			idx.Delete(key)
-		}
-	}
-}
-
-func (im *indexManager[T]) Query(fieldName string, value interface{}) ([]uint64, error) {
-	idx, ok := im.indexes[fieldName]
-	if !ok {
-		return nil, fmt.Errorf("no index for field %s", fieldName)
-	}
-	var key string
-	if t, ok := value.(time.Time); ok {
-		key = strconv.FormatInt(t.UnixNano(), 10)
-	} else {
-		key = fmt.Sprintf("%v", value)
-	}
-	ids, ok := idx.GetAll(key)
-	if !ok {
-		return []uint64{}, nil
-	}
-	return ids, nil
-}
-
-func parseIndexKey(key string, fieldKind reflect.Kind) interface{} {
-	switch fieldKind {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		if v, err := strconv.ParseInt(key, 10, 64); err == nil {
-			return v
-		}
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		if v, err := strconv.ParseUint(key, 10, 64); err == nil {
-			return v
-		}
-	case reflect.Float32, reflect.Float64:
-		if v, err := strconv.ParseFloat(key, 64); err == nil {
-			return v
-		}
-	case reflect.String:
-		return key
-	case reflect.Bool:
-		if v, err := strconv.ParseBool(key); err == nil {
-			return v
-		}
-	case reflect.Struct:
-		if v, err := strconv.ParseInt(key, 10, 64); err == nil {
-			return time.Unix(0, v).UTC()
-		}
-	}
-	return key
-}
-
-func valueToIndexKey(val any, fieldKind reflect.Kind) string {
-	switch v := val.(type) {
-	case time.Time:
-		return strconv.FormatInt(v.UnixNano(), 10)
-	case int:
-		return strconv.FormatInt(int64(v), 10)
-	case int8:
-		return strconv.FormatInt(int64(v), 10)
-	case int16:
-		return strconv.FormatInt(int64(v), 10)
-	case int32:
-		return strconv.FormatInt(int64(v), 10)
-	case int64:
-		return strconv.FormatInt(v, 10)
-	case uint:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint8:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint16:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint32:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint64:
-		return strconv.FormatUint(v, 10)
-	case float32:
-		return strconv.FormatFloat(float64(v), 'f', -1, 32)
-	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
-	case string:
-		return v
-	case bool:
-		return strconv.FormatBool(v)
-	}
-	return fmt.Sprintf("%v", val)
-}
-
-func (im *indexManager[T]) getFieldType(fieldName string) reflect.Kind {
-	if f, ok := im.fieldCache[fieldName]; ok {
-		return f.Type
-	}
-	return reflect.Invalid
-}
-
-func (im *indexManager[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]uint64, error) {
-	idx, ok := im.indexes[fieldName]
-	if !ok {
-		return nil, fmt.Errorf("no index for field %s", fieldName)
-	}
-
-	fieldType := im.getFieldType(fieldName)
-	keys := idx.SortedKeys()
-
-	var results []uint64
-	for _, k := range keys {
-		parsedVal := parseIndexKey(k, fieldType)
-		cmp := compareValues(parsedVal, value)
-		if cmp > 0 || (inclusive && cmp == 0) {
-			if ids, ok := idx.GetAll(k); ok {
-				results = append(results, ids...)
+	for _, field := range t.layout.Fields {
+		if field.Name != "" && !field.Primary && field.Offset > 0 && !field.IsSlice {
+			key := embedcore.GetFieldAsString(record, field)
+			if key != "" {
+				secKey := encodeSecondaryKey(t.tableID, field.Name, key, offset)
+				t.db.index.Delete(secKey)
 			}
 		}
 	}
-	if results == nil {
-		return []uint64{}, nil
-	}
-	return results, nil
-}
-
-func (im *indexManager[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]uint64, error) {
-	idx, ok := im.indexes[fieldName]
-	if !ok {
-		return nil, fmt.Errorf("no index for field %s", fieldName)
-	}
-
-	fieldType := im.getFieldType(fieldName)
-	keys := idx.SortedKeys()
-
-	var results []uint64
-	for _, k := range keys {
-		parsedVal := parseIndexKey(k, fieldType)
-		cmp := compareValues(parsedVal, value)
-		if cmp < 0 || (inclusive && cmp == 0) {
-			if ids, ok := idx.GetAll(k); ok {
-				results = append(results, ids...)
-			}
-		}
-	}
-	if results == nil {
-		return []uint64{}, nil
-	}
-	return results, nil
-}
-
-func (im *indexManager[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint64, error) {
-	idx, ok := im.indexes[fieldName]
-	if !ok {
-		return nil, fmt.Errorf("no index for field %s", fieldName)
-	}
-
-	fieldType := im.getFieldType(fieldName)
-	keys := idx.SortedKeys()
-
-	var results []uint64
-	for _, k := range keys {
-		parsedVal := parseIndexKey(k, fieldType)
-		cMin := compareValues(parsedVal, min)
-		cMax := compareValues(parsedVal, max)
-		aboveMin := cMin > 0 || (inclusiveMin && cMin == 0)
-		belowMax := cMax < 0 || (inclusiveMax && cMax == 0)
-		if aboveMin && belowMax {
-			if ids, ok := idx.GetAll(k); ok {
-				results = append(results, ids...)
-			}
-		}
-	}
-	if results == nil {
-		return []uint64{}, nil
-	}
-	return results, nil
 }
 
 func (t *Table[T]) deactivateRecord(offset uint64) {
@@ -761,6 +457,41 @@ func (t *Table[T]) deactivateRecord(offset uint64) {
 	t.db.readAt(deactivateBuf, int64(offset))
 	deactivateBuf[1] &^= embedcore.FlagsActive
 	t.db.writeAt(deactivateBuf, int64(offset))
+}
+
+func (t *Table[T]) normalizePK(id any) any {
+	v := reflect.ValueOf(id)
+	pkType := reflect.TypeOf(id)
+	switch t.layout.PKType {
+	case reflect.Uint:
+		pkType = reflect.TypeOf(uint(0))
+	case reflect.Uint8:
+		pkType = reflect.TypeOf(uint8(0))
+	case reflect.Uint16:
+		pkType = reflect.TypeOf(uint16(0))
+	case reflect.Uint32:
+		pkType = reflect.TypeOf(uint32(0))
+	case reflect.Uint64:
+		pkType = reflect.TypeOf(uint64(0))
+	case reflect.Int:
+		pkType = reflect.TypeOf(int(0))
+	case reflect.Int8:
+		pkType = reflect.TypeOf(int8(0))
+	case reflect.Int16:
+		pkType = reflect.TypeOf(int16(0))
+	case reflect.Int32:
+		pkType = reflect.TypeOf(int32(0))
+	case reflect.Int64:
+		pkType = reflect.TypeOf(int64(0))
+	case reflect.String:
+		pkType = reflect.TypeOf("")
+	default:
+		return id
+	}
+	if v.CanConvert(pkType) {
+		return v.Convert(pkType).Interface()
+	}
+	return id
 }
 
 func (t *Table[T]) readRecordAt(offset uint64) (*T, error) {
@@ -780,6 +511,10 @@ func (t *Table[T]) readRecordAt(offset uint64) (*T, error) {
 
 	if !hdr.IsActive() {
 		return nil, fmt.Errorf("record is deleted")
+	}
+
+	if hdr.PayloadLen > 128*1024*1024 {
+		return nil, fmt.Errorf("record payload too large at offset %d: %d bytes", offset, hdr.PayloadLen)
 	}
 
 	totalLen := recordTotalSize(hdr)
@@ -832,8 +567,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		t.setPKValue(record, recordID)
 		pkVal = recordID
 	} else {
-		indexKey := encodePKForIndex(t.tableID, pkVal)
-		if _, exists := t.db.pkIndex.Get(indexKey); exists {
+		if _, err := t.db.index.Get(encodePrimaryKey(t.tableID, pkVal)); err == nil {
 			return 0, fmt.Errorf("primary key already exists: %v", pkVal)
 		}
 	}
@@ -851,13 +585,12 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		return 0, fmt.Errorf("failed to write record: %w", err)
 	}
 
-	indexKey := encodePKForIndex(t.tableID, pkVal)
-	val := make([]byte, 8)
-	binary.BigEndian.PutUint64(val, offset)
-	t.db.pkIndex.Set(indexKey, val)
+	if err := t.db.index.Insert(encodePrimaryKey(t.tableID, pkVal), offset); err != nil {
+		return 0, fmt.Errorf("failed to insert primary key: %w", err)
+	}
 
 	if t.maxVersions > 0 {
-		t.db.versionIndex.Add(indexKey, 1, offset, time.Now().UnixNano())
+		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, 1), offset)
 	}
 
 	if t.db.tx != nil {
@@ -866,9 +599,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		entry.RecordCount++
 	}
 
-	if t.idxMgr != nil {
-		t.idxMgr.InsertIntoIndexes(record, offset)
-	}
+	t.insertSecondaryKeys(record, offset)
 
 	t.db.autoSync()
 
@@ -932,29 +663,12 @@ func (t *Table[T]) Get(id any) (*T, error) {
 	t.db.mu.RLock()
 	defer t.db.mu.RUnlock()
 
-	indexKey := encodePKForIndex(t.tableID, id)
-
-	val, ok := t.db.pkIndex.Get(indexKey)
-	if !ok {
+	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
+	if err != nil {
 		return nil, fmt.Errorf("record not found")
 	}
 
-	offset := binary.BigEndian.Uint64(val)
 	return t.readRecordAt(offset)
-}
-
-func (t *Table[T]) queryByPK(pkValue string) (uint64, bool) {
-	if t.idxMgr == nil {
-		return 0, false
-	}
-	for fieldName, idx := range t.idxMgr.indexes {
-		if f, ok := t.idxMgr.fieldCache[fieldName]; !ok || !f.Primary {
-			continue
-		}
-		offset, ok := idx.Get(pkValue)
-		return offset, ok
-	}
-	return 0, false
 }
 
 func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
@@ -965,13 +679,26 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 	t.db.mu.RLock()
 	defer t.db.mu.RUnlock()
 
-	indexKey := encodePKForIndex(t.tableID, id)
-	versionInfo, ok := t.db.versionIndex.GetVersion(indexKey, version)
-	if !ok {
+	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
+	if err != nil {
+		return nil, fmt.Errorf("record not found")
+	}
+
+	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
+		return nil, fmt.Errorf("failed to read record header: %w", err)
+	}
+	hdr, err := decodeRecordHeader(hdrBuf)
+	if err != nil {
+		return nil, fmt.Errorf("invalid record header: %w", err)
+	}
+
+	versionOffset, err := t.db.index.Get(encodeVersionKey(t.tableID, hdr.RecordID, version))
+	if err != nil {
 		return nil, fmt.Errorf("version %d not found for record", version)
 	}
 
-	return t.readRecordAt(versionInfo.Offset)
+	return t.readRecordAt(versionOffset)
 }
 
 func (t *Table[T]) ListVersions(id any) ([]VersionMetadata, error) {
@@ -982,44 +709,55 @@ func (t *Table[T]) ListVersions(id any) ([]VersionMetadata, error) {
 	t.db.mu.RLock()
 	defer t.db.mu.RUnlock()
 
-	indexKey := encodePKForIndex(t.tableID, id)
-	versions := t.db.versionIndex.GetVersions(indexKey)
-
-	result := make([]VersionMetadata, 0, len(versions))
-	for _, v := range versions {
-		result = append(result, VersionMetadata{
-			Version:   v.Version,
-			CreatedAt: time.Unix(0, v.CreatedAt),
-		})
+	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
+	if err != nil {
+		return nil, fmt.Errorf("record not found")
 	}
 
-	return result, nil
+	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
+		return nil, fmt.Errorf("failed to read record header: %w", err)
+	}
+	hdr, err := decodeRecordHeader(hdrBuf)
+	if err != nil {
+		return nil, fmt.Errorf("invalid record header: %w", err)
+	}
+
+	prefix := encodeVersionKeyPrefix(t.tableID, hdr.RecordID)
+	var results []VersionMetadata
+	t.db.index.Scan(func(key []byte, value uint64) bool {
+		if bytes.HasPrefix(key, prefix) {
+			if _, _, ver, ok := parseVersionKey(key); ok {
+				results = append(results, VersionMetadata{Version: ver})
+			}
+		}
+		return true
+	})
+
+	return results, nil
 }
 
 func (t *Table[T]) Update(id any, record *T) error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
-	indexKey := encodePKForIndex(t.tableID, id)
-	val, ok := t.db.pkIndex.Get(indexKey)
-	if !ok {
+	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
+	if err != nil {
 		return fmt.Errorf("record not found")
 	}
 
-	oldOffset := binary.BigEndian.Uint64(val)
-
 	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
-	if err := t.db.readAt(hdrBuf, int64(oldOffset)); err != nil {
+	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 		return fmt.Errorf("failed to read record for update: %w", err)
 	}
 
 	hdr, err := decodeRecordHeader(hdrBuf)
 	if err != nil {
-		return fmt.Errorf("invalid record at offset %d: %w", oldOffset, err)
+		return fmt.Errorf("invalid record at offset %d: %w", offset, err)
 	}
 
 	if !hdr.IsActive() {
-		return fmt.Errorf("record at offset %d is not active", oldOffset)
+		return fmt.Errorf("record at offset %d is not active", offset)
 	}
 
 	recordID := hdr.RecordID
@@ -1027,22 +765,20 @@ func (t *Table[T]) Update(id any, record *T) error {
 	totalLen := recordTotalSize(hdr)
 	oldRecordBuf := make([]byte, totalLen)
 	copy(oldRecordBuf, hdrBuf)
-	if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(oldOffset)+int64(embedcore.RecordHeaderSize)); err != nil {
+	if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
 		return fmt.Errorf("failed to read old record data: %w", err)
 	}
 
 	var oldRecord T
 	t.decodeRecord(oldRecordBuf, &oldRecord)
 
-	if t.idxMgr != nil {
-		t.idxMgr.DeleteFromIndexes(&oldRecord, oldOffset)
-	}
+	t.deleteSecondaryKeys(&oldRecord, offset)
 
 	var flags byte = embedcore.FlagsActive
 	var prevVersionOff uint64
 	if t.maxVersions > 0 {
 		flags |= embedcore.FlagsHasPrevVersion
-		prevVersionOff = oldOffset
+		prevVersionOff = offset
 	}
 
 	newRecordBuf, err := t.encodeRecord(record, recordID, flags, prevVersionOff)
@@ -1059,42 +795,53 @@ func (t *Table[T]) Update(id any, record *T) error {
 	}
 
 	if t.maxVersions > 0 {
-		versions := t.db.versionIndex.GetVersions(indexKey)
+		prefix := encodeVersionKeyPrefix(t.tableID, recordID)
+		type verInfo struct {
+			version uint32
+			offset  uint64
+		}
+		var versions []verInfo
+		t.db.index.Scan(func(key []byte, value uint64) bool {
+			if bytes.HasPrefix(key, prefix) {
+				if _, _, ver, ok := parseVersionKey(key); ok {
+					versions = append(versions, verInfo{version: ver, offset: value})
+				}
+			}
+			return true
+		})
+
 		if len(versions) == 0 {
-			t.db.versionIndex.Add(indexKey, 1, oldOffset, time.Now().UnixNano())
-			versions = []VersionInfo{{Version: 1, Offset: oldOffset, CreatedAt: time.Now().UnixNano()}}
+			t.db.index.Insert(encodeVersionKey(t.tableID, recordID, 1), offset)
+			versions = append(versions, verInfo{version: 1, offset: offset})
 		}
 		newVersion := uint32(1)
 		for _, v := range versions {
-			if v.Version >= newVersion {
-				newVersion = v.Version + 1
+			if v.version >= newVersion {
+				newVersion = v.version + 1
 			}
 		}
-		t.db.versionIndex.Add(indexKey, newVersion, newOffset, time.Now().UnixNano())
-		versions = append(versions, VersionInfo{Version: newVersion, Offset: newOffset, CreatedAt: time.Now().UnixNano()})
+		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, newVersion), newOffset)
+		versions = append(versions, verInfo{version: newVersion, offset: newOffset})
+
 		maxTotal := int(t.maxVersions) + 1
 		for len(versions) > maxTotal {
 			oldestIdx := 0
 			for i, v := range versions {
-				if v.Version < versions[oldestIdx].Version {
+				if v.version < versions[oldestIdx].version {
 					oldestIdx = i
 				}
 			}
-			t.deactivateRecord(versions[oldestIdx].Offset)
-			t.db.versionIndex.RemoveVersion(indexKey, versions[oldestIdx].Version)
+			t.deactivateRecord(versions[oldestIdx].offset)
+			t.db.index.Delete(encodeVersionKey(t.tableID, recordID, versions[oldestIdx].version))
 			versions = append(versions[:oldestIdx], versions[oldestIdx+1:]...)
 		}
 	} else {
-		t.deactivateRecord(oldOffset)
+		t.deactivateRecord(offset)
 	}
 
-	newVal := make([]byte, 8)
-	binary.BigEndian.PutUint64(newVal, newOffset)
-	t.db.pkIndex.Set(indexKey, newVal)
+	t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset)
 
-	if t.idxMgr != nil {
-		t.idxMgr.UpdateIndexes(record, newOffset)
-	}
+	t.insertSecondaryKeys(record, newOffset)
 
 	t.db.autoSync()
 
@@ -1107,20 +854,19 @@ func (t *Table[T]) Delete(id any) error {
 
 	entry := t.db.tableCat[t.name]
 
-	indexKey := encodePKForIndex(t.tableID, id)
-	val, ok := t.db.pkIndex.Get(indexKey)
-	if !ok {
+	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
+	if err != nil {
 		return fmt.Errorf("record not found")
 	}
 
-	offset := binary.BigEndian.Uint64(val)
-
+	var recordID uint32
 	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
 	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 	}
 	if hdrBuf[0] == V2RecordVersion {
 		hdr, _ := decodeRecordHeader(hdrBuf)
 		if hdr.IsActive() {
+			recordID = hdr.RecordID
 			totalLen := recordTotalSize(hdr)
 			oldRecordBuf := make([]byte, totalLen)
 			copy(oldRecordBuf, hdrBuf)
@@ -1130,18 +876,28 @@ func (t *Table[T]) Delete(id any) error {
 			var oldRecord T
 			t.decodeRecord(oldRecordBuf, &oldRecord)
 
-			if t.idxMgr != nil {
-				t.idxMgr.DeleteFromIndexes(&oldRecord, offset)
-			}
+			t.deleteSecondaryKeys(&oldRecord, offset)
 		}
 	}
 
 	t.deactivateRecord(offset)
 
-	t.db.pkIndex.Delete(indexKey)
+	t.db.index.Delete(encodePrimaryKey(t.tableID, t.normalizePK(id)))
 
-	if t.maxVersions > 0 {
-		t.db.versionIndex.RemoveKey(indexKey)
+	if t.maxVersions > 0 && recordID > 0 {
+		prefix := encodeVersionKeyPrefix(t.tableID, recordID)
+		var versionKeys [][]byte
+		t.db.index.Scan(func(key []byte, value uint64) bool {
+			if bytes.HasPrefix(key, prefix) {
+				keyCopy := make([]byte, len(key))
+				copy(keyCopy, key)
+				versionKeys = append(versionKeys, keyCopy)
+			}
+			return true
+		})
+		for _, k := range versionKeys {
+			t.db.index.Delete(k)
+		}
 	}
 
 	if t.db.tx != nil {
@@ -1161,13 +917,10 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 
 	deleted := 0
 	for _, id := range ids {
-		indexKey := encodePKForIndex(t.tableID, id)
-		val, ok := t.db.pkIndex.Get(indexKey)
-		if !ok {
+		offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
+		if err != nil {
 			continue
 		}
-
-		offset := binary.BigEndian.Uint64(val)
 
 		hdrBuf := make([]byte, embedcore.RecordHeaderSize)
 		if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
@@ -1185,14 +938,12 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 				var oldRecord T
 				t.decodeRecord(oldRecordBuf, &oldRecord)
 
-				if t.idxMgr != nil {
-					t.idxMgr.DeleteFromIndexes(&oldRecord, offset)
-				}
+				t.deleteSecondaryKeys(&oldRecord, offset)
 			}
 		}
 
 		t.deactivateRecord(offset)
-		t.db.pkIndex.Delete(indexKey)
+		t.db.index.Delete(encodePrimaryKey(t.tableID, t.normalizePK(id)))
 		deleted++
 		if t.db.tx != nil {
 			t.db.tx.recordCounts[t.name]--
@@ -1270,8 +1021,7 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 		t.setPKValue(record, recordID)
 		pkVal = recordID
 	} else {
-		indexKey := encodePKForIndex(t.tableID, pkVal)
-		if _, exists := t.db.pkIndex.Get(indexKey); exists {
+		if _, err := t.db.index.Get(encodePrimaryKey(t.tableID, pkVal)); err == nil {
 			return 0, fmt.Errorf("primary key already exists: %v", pkVal)
 		}
 	}
@@ -1289,13 +1039,10 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 		return 0, fmt.Errorf("failed to write record: %w", err)
 	}
 
-	indexKey := encodePKForIndex(t.tableID, pkVal)
-	val := make([]byte, 8)
-	binary.BigEndian.PutUint64(val, offset)
-	t.db.pkIndex.Set(indexKey, val)
+	t.db.index.Insert(encodePrimaryKey(t.tableID, pkVal), offset)
 
 	if t.maxVersions > 0 {
-		t.db.versionIndex.Add(indexKey, 1, offset, time.Now().UnixNano())
+		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, 1), offset)
 	}
 
 	if t.db.tx != nil {
@@ -1304,32 +1051,27 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 		entry.RecordCount++
 	}
 
-	if t.idxMgr != nil {
-		t.idxMgr.InsertIntoIndexes(record, offset)
-	}
+	t.insertSecondaryKeys(record, offset)
 
 	return recordID, nil
 }
 
 func (t *Table[T]) getLocked(id any) (*T, error) {
-	indexKey := encodePKForIndex(t.tableID, id)
-	val, ok := t.db.pkIndex.Get(indexKey)
-	if !ok {
+	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
+	if err != nil {
 		return nil, fmt.Errorf("record not found")
 	}
 
-	offset := binary.BigEndian.Uint64(val)
 	return t.readRecordAt(offset)
 }
 
 func (t *Table[T]) updateLocked(id any, record *T) error {
-	indexKey := encodePKForIndex(t.tableID, id)
-	val, ok := t.db.pkIndex.Get(indexKey)
-	if !ok {
+	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
+	if err != nil {
 		return fmt.Errorf("record not found")
 	}
 
-	oldOffset := binary.BigEndian.Uint64(val)
+	oldOffset := offset
 
 	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
 	if err := t.db.readAt(hdrBuf, int64(oldOffset)); err != nil {
@@ -1353,9 +1095,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	var oldRecord T
 	t.decodeRecord(oldRecordBuf, &oldRecord)
 
-	if t.idxMgr != nil {
-		t.idxMgr.DeleteFromIndexes(&oldRecord, oldOffset)
-	}
+	t.deleteSecondaryKeys(&oldRecord, oldOffset)
 
 	var flags byte = embedcore.FlagsActive
 	var prevVersionOff uint64
@@ -1378,28 +1118,38 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	}
 
 	if t.maxVersions > 0 {
-		versions := t.db.versionIndex.GetVersions(indexKey)
+		prefix := encodeVersionKeyPrefix(t.tableID, recordID)
+		type verInfo struct {
+			version uint32
+			offset  uint64
+		}
+		var versions []verInfo
+		t.db.index.Scan(func(key []byte, value uint64) bool {
+			if bytes.HasPrefix(key, prefix) {
+				if _, _, ver, ok := parseVersionKey(key); ok {
+					versions = append(versions, verInfo{version: ver, offset: value})
+				}
+			}
+			return true
+		})
+
 		if len(versions) == 0 {
-			t.db.versionIndex.Add(indexKey, 1, oldOffset, time.Now().UnixNano())
+			t.db.index.Insert(encodeVersionKey(t.tableID, recordID, 1), oldOffset)
 		}
 		newVersion := uint32(1)
 		for _, v := range versions {
-			if v.Version >= newVersion {
-				newVersion = v.Version + 1
+			if v.version >= newVersion {
+				newVersion = v.version + 1
 			}
 		}
-		t.db.versionIndex.Add(indexKey, newVersion, newOffset, time.Now().UnixNano())
+		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, newVersion), newOffset)
 	} else {
 		t.deactivateRecord(oldOffset)
 	}
 
-	newVal := make([]byte, 8)
-	binary.BigEndian.PutUint64(newVal, newOffset)
-	t.db.pkIndex.Set(indexKey, newVal)
+	t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset)
 
-	if t.idxMgr != nil {
-		t.idxMgr.UpdateIndexes(record, newOffset)
-	}
+	t.insertSecondaryKeys(record, newOffset)
 
 	return nil
 }
@@ -1408,11 +1158,10 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
-	indexKey := encodePKForIndex(t.tableID, id)
-	_, exists := t.db.pkIndex.Get(indexKey)
+	_, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
 
-	if exists {
-		if err := t.updateLocked(id, record); err != nil {
+	if err == nil {
+		if err := t.updateLocked(t.normalizePK(id), record); err != nil {
 			return 0, false, err
 		}
 		return 0, false, nil
@@ -1426,7 +1175,7 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	recordID := entry.NextRecordID
 	entry.NextRecordID++
 
-	t.setPKValue(record, id)
+	t.setPKValue(record, t.normalizePK(id))
 
 	recordBuf, err := t.encodeRecord(record, recordID, embedcore.FlagsActive, 0)
 	if err != nil {
@@ -1442,14 +1191,9 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	}
 
 	pkVal, _ := t.getPKValue(record)
-	pkIndexKey := encodePKForIndex(t.tableID, pkVal)
-	val := make([]byte, 8)
-	binary.BigEndian.PutUint64(val, offset)
-	t.db.pkIndex.Set(pkIndexKey, val)
+	t.db.index.Insert(encodePrimaryKey(t.tableID, pkVal), offset)
 
-	if t.idxMgr != nil {
-		t.idxMgr.InsertIntoIndexes(record, offset)
-	}
+	t.insertSecondaryKeys(record, offset)
 
 	if t.db.tx != nil {
 		t.db.tx.recordCounts[t.name]++
@@ -1463,25 +1207,49 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 }
 
 func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
-	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
-		offsets, err := t.idxMgr.Query(fieldName, value)
-		if err != nil {
-			return nil, err
-		}
+	if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][fieldName] {
+		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
+	}
 
-		slices.Sort(offsets)
-		results := make([]T, 0, len(offsets))
-
-		t.db.mu.RLock()
-		for _, off := range offsets {
-			record, err := t.readRecordAt(off)
-			if err == nil && record != nil {
-				results = append(results, *record)
+	autoIndex := t.db.parent != nil && t.db.parent.autoIndex
+	explicitAllowed := false
+	if !autoIndex && t.db.explicitIndexes != nil {
+		for _, f := range t.db.explicitIndexes[t.name] {
+			if f == fieldName {
+				explicitAllowed = true
+				break
 			}
 		}
-		t.db.mu.RUnlock()
+	}
 
-		return results, nil
+	if autoIndex || explicitAllowed {
+		field, err := t.findField(fieldName)
+		if err == nil && !field.Primary && field.Offset > 0 {
+			strValue := valueToIndexKey(value, field.Type)
+			prefix := encodeSecondaryKeyPrefixWithValue(t.tableID, fieldName, strValue)
+
+			var offsets []uint64
+			_ = t.db.index.Scan(func(key []byte, val uint64) bool {
+				if bytes.HasPrefix(key, prefix) {
+					offsets = append(offsets, val)
+				}
+				return true
+			})
+
+			slices.Sort(offsets)
+			results := make([]T, 0, len(offsets))
+
+			t.db.mu.RLock()
+			for _, off := range offsets {
+				record, err := t.readRecordAt(off)
+				if err == nil && record != nil {
+					results = append(results, *record)
+				}
+			}
+			t.db.mu.RUnlock()
+
+			return results, nil
+		}
 	}
 
 	if strings.Contains(fieldName, ".") {
@@ -1495,27 +1263,6 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 }
 
 func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
-	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
-		offsets, err := t.idxMgr.QueryRangeGreaterThan(fieldName, value, inclusive)
-		if err != nil {
-			return nil, err
-		}
-
-		slices.Sort(offsets)
-		results := make([]T, 0, len(offsets))
-
-		t.db.mu.RLock()
-		for _, off := range offsets {
-			record, err := t.readRecordAt(off)
-			if err == nil && record != nil {
-				results = append(results, *record)
-			}
-		}
-		t.db.mu.RUnlock()
-
-		return results, nil
-	}
-
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) > 0 || (inclusive && compareValues(fieldValue, value) == 0)
 	}
@@ -1523,27 +1270,6 @@ func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, in
 }
 
 func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
-	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
-		offsets, err := t.idxMgr.QueryRangeLessThan(fieldName, value, inclusive)
-		if err != nil {
-			return nil, err
-		}
-
-		slices.Sort(offsets)
-		results := make([]T, 0, len(offsets))
-
-		t.db.mu.RLock()
-		for _, off := range offsets {
-			record, err := t.readRecordAt(off)
-			if err == nil && record != nil {
-				results = append(results, *record)
-			}
-		}
-		t.db.mu.RUnlock()
-
-		return results, nil
-	}
-
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) < 0 || (inclusive && compareValues(fieldValue, value) == 0)
 	}
@@ -1551,27 +1277,6 @@ func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclu
 }
 
 func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
-	if t.idxMgr != nil && t.idxMgr.HasIndex(fieldName) {
-		offsets, err := t.idxMgr.QueryRangeBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
-		if err != nil {
-			return nil, err
-		}
-
-		slices.Sort(offsets)
-		results := make([]T, 0, len(offsets))
-
-		t.db.mu.RLock()
-		for _, off := range offsets {
-			record, err := t.readRecordAt(off)
-			if err == nil && record != nil {
-				results = append(results, *record)
-			}
-		}
-		t.db.mu.RUnlock()
-
-		return results, nil
-	}
-
 	comparator := func(fieldValue interface{}) bool {
 		cMin := compareValues(fieldValue, min)
 		cMax := compareValues(fieldValue, max)
@@ -1869,6 +1574,70 @@ func toFloat64(v interface{}) float64 {
 	return 0
 }
 
+func parseIndexKey(key string, fieldKind reflect.Kind) interface{} {
+	switch fieldKind {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if v, err := strconv.ParseInt(key, 10, 64); err == nil {
+			return v
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if v, err := strconv.ParseUint(key, 10, 64); err == nil {
+			return v
+		}
+	case reflect.Float32, reflect.Float64:
+		if v, err := strconv.ParseFloat(key, 64); err == nil {
+			return v
+		}
+	case reflect.String:
+		return key
+	case reflect.Bool:
+		if v, err := strconv.ParseBool(key); err == nil {
+			return v
+		}
+	case reflect.Struct:
+		if v, err := strconv.ParseInt(key, 10, 64); err == nil {
+			return time.Unix(0, v).UTC()
+		}
+	}
+	return key
+}
+
+func valueToIndexKey(val any, fieldKind reflect.Kind) string {
+	switch v := val.(type) {
+	case time.Time:
+		return strconv.FormatInt(v.UnixNano(), 10)
+	case int:
+		return strconv.FormatInt(int64(v), 10)
+	case int8:
+		return strconv.FormatInt(int64(v), 10)
+	case int16:
+		return strconv.FormatInt(int64(v), 10)
+	case int32:
+		return strconv.FormatInt(int64(v), 10)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case uint:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint64:
+		return strconv.FormatUint(v, 10)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case string:
+		return v
+	case bool:
+		return strconv.FormatBool(v)
+	}
+	return fmt.Sprintf("%v", val)
+}
+
 func (t *Table[T]) All() ([]T, error) {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
@@ -1924,66 +1693,65 @@ func (t *Table[T]) Scan(fn func(T) bool) error {
 	return scanner.Err()
 }
 
+type scanEntry struct {
+	pkValue any
+}
+
 type Scanner[T any] struct {
-	table     *Table[T]
-	indexSnap []uint32
-	indexKeys [][]byte
-	pos       int
-	current   *T
-	err       error
+	table   *Table[T]
+	entries []scanEntry
+	pos     int
+	current *T
+	err     error
 }
 
 func (t *Table[T]) ScanRecords() *Scanner[T] {
 	t.db.mu.RLock()
-	keys := make([][]byte, 0)
-	t.db.pkIndex.Range(func(k, v []byte) bool {
-		if len(k) >= 2 && k[0] == t.tableID {
-			keyCopy := make([]byte, len(k))
-			copy(keyCopy, k)
-			keys = append(keys, keyCopy)
+	var entries []scanEntry
+	_ = t.db.index.Scan(func(key []byte, value uint64) bool {
+		if len(key) >= 2 && key[0] == indexNSPrimary && key[1] == t.tableID {
+			pkBytes := key[2:]
+			var pkVal any
+			switch t.layout.PKType {
+			case reflect.String:
+				s, _, _ := embedcore.DecodeString(pkBytes)
+				pkVal = s
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				v, _, _ := embedcore.DecodeVarint(pkBytes)
+				pkVal = int(v)
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				v, _, _ := embedcore.DecodeUvarint(pkBytes)
+				pkVal = uint64(v)
+			default:
+				v, _, _ := embedcore.DecodeUvarint(pkBytes)
+				pkVal = uint64(v)
+			}
+			entries = append(entries, scanEntry{pkValue: pkVal})
 		}
 		return true
 	})
 	t.db.mu.RUnlock()
 
 	return &Scanner[T]{
-		table:     t,
-		indexSnap: nil,
-		indexKeys: keys,
-		pos:       0,
+		table:   t,
+		entries: entries,
+		pos:     0,
 	}
 }
 
 func (s *Scanner[T]) Next() bool {
 	for {
-		if s.err != nil || s.pos >= len(s.indexKeys) {
+		if s.err != nil || s.pos >= len(s.entries) {
 			return false
 		}
 
-		encodedPK := s.indexKeys[s.pos][1:]
-		var pkVal any
-		switch s.table.layout.PKType {
-		case reflect.String:
-			pkVal, _, _ = embedcore.DecodeString(encodedPK)
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			val, _, _ := embedcore.DecodeUvarint(encodedPK)
-			pkVal = int(int64(val))
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			val, _, _ := embedcore.DecodeUvarint(encodedPK)
-			pkVal = uint64(val)
-		default:
-			val, _, _ := embedcore.DecodeUvarint(encodedPK)
-			pkVal = uint64(val)
-		}
-
-		record, err := s.table.Get(pkVal)
+		record, err := s.table.Get(s.entries[s.pos].pkValue)
+		s.pos++
 		if err != nil {
-			s.pos++
 			continue
 		}
 
 		s.current = record
-		s.pos++
 		return true
 	}
 }
@@ -2000,7 +1768,7 @@ func (s *Scanner[T]) Err() error {
 }
 
 func (s *Scanner[T]) Close() {
-	s.indexKeys = nil
+	s.entries = nil
 }
 
 func (t *Table[T]) Count() int {
@@ -2011,8 +1779,8 @@ func (t *Table[T]) Count() int {
 		return int(entry.RecordCount)
 	}
 	count := 0
-	t.db.pkIndex.Range(func(k, v []byte) bool {
-		if len(k) >= 2 && k[0] == t.tableID {
+	_ = t.db.index.Scan(func(key []byte, value uint64) bool {
+		if len(key) >= 2 && key[0] == indexNSPrimary && key[1] == t.tableID {
 			count++
 		}
 		return true
@@ -2021,46 +1789,96 @@ func (t *Table[T]) Count() int {
 }
 
 func (t *Table[T]) CreateIndex(fieldName string) error {
-	if t.idxMgr == nil {
-		t.idxMgr = newIndexManager[T](t.db, t.layout)
-	}
-	return t.idxMgr.CreateIndex(fieldName)
-}
-
-func (t *Table[T]) rebuildSecondaryIndexes() {
-	if t.idxMgr == nil {
-		return
-	}
-
-	type kv struct {
-		key    []byte
-		offset uint64
-	}
-	var entries []kv
-	t.db.pkIndex.Range(func(k []byte, v []byte) bool {
-		if len(k) < 2 || k[0] != t.tableID {
-			return true
+	if t.db.parent != nil && !t.db.parent.autoIndex {
+		t.db.mu.Lock()
+		if t.db.explicitIndexes == nil {
+			t.db.explicitIndexes = make(map[string][]string)
 		}
-		keyCopy := make([]byte, len(k))
-		copy(keyCopy, k)
-		entries = append(entries, kv{key: keyCopy, offset: binary.BigEndian.Uint64(v)})
+		found := false
+		for _, f := range t.db.explicitIndexes[t.name] {
+			if f == fieldName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.db.explicitIndexes[t.name] = append(t.db.explicitIndexes[t.name], fieldName)
+		}
+		t.db.mu.Unlock()
+	}
+
+	field, err := t.findField(fieldName)
+	if err != nil {
+		return err
+	}
+
+	prefix := encodeSecondaryKeyPrefix(t.tableID, fieldName)
+	var existing int
+	t.db.mu.RLock()
+	t.db.index.Scan(func(key []byte, value uint64) bool {
+		if bytes.HasPrefix(key, prefix) {
+			existing++
+		}
 		return true
 	})
+	t.db.mu.RUnlock()
+	if existing > 0 {
+		return nil
+	}
 
-	for _, e := range entries {
-		record, err := t.readRecordAt(e.offset)
+	scanner := t.ScanRecords()
+	defer scanner.Close()
+	for scanner.Next() {
+		record, err := scanner.Record()
 		if err != nil {
 			continue
 		}
-		t.idxMgr.InsertIntoIndexes(record, e.offset)
+		key := embedcore.GetFieldAsString(record, field)
+		if key != "" {
+			pkVal, _ := t.getPKValue(record)
+			offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(pkVal)))
+			if err != nil {
+				continue
+			}
+			secKey := encodeSecondaryKey(t.tableID, fieldName, key, offset)
+			t.db.index.Insert(secKey, offset)
+		}
 	}
+
+	if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil {
+		delete(t.db.droppedIndexes[t.name], fieldName)
+	}
+
+	return nil
 }
 
 func (t *Table[T]) DropIndex(fieldName string) error {
-	if t.idxMgr == nil {
-		return nil
+	t.db.mu.Lock()
+	defer t.db.mu.Unlock()
+
+	prefix := encodeSecondaryKeyPrefix(t.tableID, fieldName)
+	var keys [][]byte
+	t.db.index.Scan(func(key []byte, value uint64) bool {
+		if bytes.HasPrefix(key, prefix) {
+			keyCopy := make([]byte, len(key))
+			copy(keyCopy, key)
+			keys = append(keys, keyCopy)
+		}
+		return true
+	})
+	for _, k := range keys {
+		t.db.index.Delete(k)
 	}
-	return t.idxMgr.DropIndex(fieldName)
+
+	if t.db.droppedIndexes == nil {
+		t.db.droppedIndexes = make(map[string]map[string]bool)
+	}
+	if t.db.droppedIndexes[t.name] == nil {
+		t.db.droppedIndexes[t.name] = make(map[string]bool)
+	}
+	t.db.droppedIndexes[t.name][fieldName] = true
+
+	return nil
 }
 
 func (t *Table[T]) Drop() error {
@@ -2075,15 +1893,16 @@ func (t *Table[T]) Drop() error {
 	entry.Dropped = true
 
 	var keys [][]byte
-	t.db.pkIndex.Range(func(k, v []byte) bool {
-		if len(k) >= 2 && k[0] == t.tableID {
-			keys = append(keys, k)
+	t.db.index.Scan(func(key []byte, value uint64) bool {
+		if len(key) >= 2 && key[1] == t.tableID {
+			keyCopy := make([]byte, len(key))
+			copy(keyCopy, key)
+			keys = append(keys, keyCopy)
 		}
 		return true
 	})
 	for _, k := range keys {
-		t.db.pkIndex.Delete(k)
-		t.db.versionIndex.RemoveKey(k)
+		t.db.index.Delete(k)
 	}
 
 	entry.RecordCount = 0
@@ -2092,10 +1911,26 @@ func (t *Table[T]) Drop() error {
 }
 
 func (t *Table[T]) GetIndexedFields() []string {
-	if t.idxMgr == nil {
-		return nil
+	var fields []string
+	if t.db.parent != nil && t.db.parent.autoIndex {
+		for _, field := range t.layout.Fields {
+			if field.Name != "" && !field.Primary && field.Offset > 0 && !field.IsSlice {
+				if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][field.Name] {
+					continue
+				}
+				fields = append(fields, field.Name)
+			}
+		}
+	} else {
+		if t.db.explicitIndexes != nil {
+			for _, f := range t.db.explicitIndexes[t.name] {
+				if t.db.droppedIndexes == nil || t.db.droppedIndexes[t.name] == nil || !t.db.droppedIndexes[t.name][f] {
+					fields = append(fields, f)
+				}
+			}
+		}
 	}
-	return t.idxMgr.GetIndexedFields()
+	return fields
 }
 
 func (t *Table[T]) Name() string {

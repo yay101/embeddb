@@ -6,5 +6,8 @@ require github.com/yay101/embeddb v1.0.0
 
 require (
 	github.com/yay101/embeddbcore v0.4.0 // indirect
-	golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 // indirect
+	github.com/yay101/embeddbmmap v0.1.2 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 )
+
+replace github.com/yay101/embeddb => ../

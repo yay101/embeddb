@@ -1,306 +1,213 @@
-# EmbedDB v2 Rewrite Plan
+# EmbedDB v1.0.0 — Improvement Plan
 
-## Phase 1: Foundation
+## Priority 1: Performance (High Impact)
 
-### 1.1 TLV Record Format
-Rework embeddbcore to use length-prefixed fields instead of delimiter-based framing.
+### 1.1 B-Tree Range Scans for QueryRange
+**Problem**: All range queries (`QueryRangeGreaterThan`, `QueryRangeLessThan`, `QueryRangeBetween`, `QueryNotEqual`, `QueryGreaterOrEqual`, `QueryLessOrEqual`, `QueryLike`, `QueryNotLike`) fall through to `filterByField()` — a full table scan deserializing every record. Benchmark shows `QueryRangeBetween` at **13.7ms** vs `Query` at **312µs** — a 44x gap.
 
-**Current problem**: Fields delimited by `0x1E`/`0x1F` markers corrupt when those bytes appear in varint-encoded data.
+**Fix**: Add `ScanRange(startPrefix, endPrefix []byte)` to `BTree` that walks the leaf chain starting from the first key ≥ `startPrefix` and stopping after keys exceed `endPrefix`. Then implement each range method to construct appropriate start/end bounds from the secondary key encoding and call `ScanRange` instead of `filterByField`.
 
-**New format** (per field):
-```
-[uvarint name_length][name_bytes][uvarint value_length][value_bytes]
-```
-- Field names as tags (e.g. "Name", "Age") instead of single-byte keys
-- No delimiters needed — length-prefix makes parsing unambiguous
-- Self-describing: can decode without schema
+**Example** for `QueryRangeGreaterThan("Age", 20)`:
+- Start: `encodeSecondaryKeyPrefixWithValue(tableID, "Age", encodeIndexValue(21))`
+- End: `encodeSecondaryKeyPrefix(tableID+1, "Age")` (or a sentinel)
 
-**Record envelope**:
-```
-[1 byte version][1 byte flags][1 byte table_id][4 byte record_id LE][8 byte prev_version_offset LE][4 byte schema_version LE][4 byte payload_length LE][payload...][4 byte CRC32 LE]
-```
-- `flags & 0x01` = active
-- `flags & 0x02` = has_prev_version
-- `prev_version_offset` = 0 if no previous version (enables on-disk version chain)
-- `schema_version` links record to a schema version in the table catalog
+**Files**: `btree.go` (add `ScanRange`), `table_api.go` (rewrite QueryRange* methods), `index.go` (add bound constructors)
 
-**Files to change**:
-- `embeddbcore/encoding.go`: Remove `ValueStartMarker`/`ValueEndMarker`, add TLV encode/decode
-- `embeddbcore/field_offsets.go`: Replace `Key byte` with `Name string` in `FieldOffset`, remove `Hash` (use schema version instead)
-- `table_api.go`: Rewrite `encodeRecord`/`decodeRecord` to use TLV format
-- `main.go`: Update record header constants and migration logic
+**Expected result**: Range queries drop from O(n) to O(k+m) where k is result count and m is sibling leaf pages traversed. Should match `Query` performance (~300µs).
 
-### 1.2 Type-Aware Index Key Encoding
-Replace `fmt.Sprintf("%v", value)` with deterministic byte encoding that preserves sort order.
+---
 
-**Encoding rules**:
-| Type | Prefix | Encoding | Sort order |
-|------|--------|----------|------------|
-| uint/int | 0x01 | 8 bytes big-endian (flip sign bit for signed) | numeric |
-| string | 0x02 | uvarint len + UTF-8 bytes | lexicographic |
-| float | 0x03 | 8 bytes IEEE754 big-endian (flip sign+exponent for sort) | numeric |
-| bool | 0x04 | 1 byte (0/1) | false < true |
-| time | 0x05 | 8 bytes UnixNano big-endian | chronological |
+### 1.2 B-Tree Page Cache Improvements
+**Problem**: Cache is a fixed 2048-entry ring buffer (8MB) with FIFO eviction, `sync.Mutex` (no read concurrency), root page gets no special treatment, and the unused `pagePool` sync.Pool wastes code.
 
-**Files to create**:
-- `key_encoding.go`: New file with `EncodeIndexKey`/`DecodeIndexKey`
+**Fixes**:
+- Replace `sync.Mutex` with `sync.RWMutex` for `cacheMu` — concurrent reads should not serialize
+- Pin the root node in cache (never evict) — it's traversed on every operation
+- Make cache size configurable via `OpenOptions.CachePages` (default 4096)
+- LRU eviction instead of FIFO — use a doubly-linked list or container/heap
+- Remove the unused `pagePool` at `btree.go:33-38`
 
-### 1.3 B+ Tree with Byte-Size Split Threshold
-Replace the existing B-tree with a proper B+ tree.
+**Files**: `btree.go`
 
-**Key changes from current**:
-- Split when serialized cell data exceeds `(PageSize - headerOverhead) / 2`, not at fixed key count
-- Values only in leaf nodes; internal nodes store only keys + child page numbers
-- Leaf linked-list for O(k) range scans
-- Copy-on-write pages for transaction safety
-- CRC32 per page
-- Node count stored in root page (O(1) instead of O(n) scan on open)
-- Rebalancing on delete (merge/borrow when below min occupancy)
+---
 
-**Page format** (4096 bytes):
-```
-[1 byte page_type][1 byte flags][2 byte key_count][2 byte free_space_offset]
-[4 byte prev_leaf_page][4 byte next_leaf_page]  // leaves only
-[4 byte CRC32 at offset 4092]
-```
+### 1.3 Eliminate Double Allocation in serializeNode
+**Problem**: `serializeNode()` allocates two `PageSize` buffers — one working buffer and one result copy (`btree.go:189,231`). Every node write wastes 4KB.
 
-**Cell format** (leaf):
-```
-[uvarint key_len][key_bytes][8 byte value LE]
-```
+**Fix**: Return the working buffer directly. The caller (`writeNode`) already copies it to the mmap region.
 
-**Cell format** (internal):
-```
-[uvarint key_len][key_bytes][4 byte left_child_page LE]
-```
+**Files**: `btree.go:188-233`
 
-**Files to create**:
-- `btree.go`: Complete rewrite as B+ tree with CoW pages
+---
 
-## Phase 2: Storage Layer
+### 1.4 Remove Pre-Insert Search in B-Tree
+**Problem**: `Insert()` and `Put()` both call `searchUnlocked(key)` before the actual insert just to decide whether to increment `bt.count`. This is an extra full tree traversal per insert.
 
-### 2.1 Persistent Free List
-Persist the allocator's free list to disk so freed space is reusable across restarts.
+**Fix**: Track count during the insert itself. After `insertNonFull`, check if the key was newly added vs updated (return a bool). Alternatively, maintain a count delta and reconcile on flush.
 
-**Format**: Written during `Sync()`/`Close()`, read during `Open()`.
-```
-[4 byte block_count][4 byte bitmap_size_pages]
-[bitmap: 1 bit per page, 1=free]
-[sorted free blocks: 8 byte offset + 8 byte length each]
-[4 byte CRC32]
-```
+**Files**: `btree.go:401-468`
 
-**Files to change**:
-- `storage.go`: Add `Save()`/`Load()` methods for free list persistence
+---
 
-### 2.2 Separate Allocation Regions
-Two allocators: one for index pages (4096-byte aligned), one for records (variable size).
+### 1.5 Reduce Per-Record Allocations in Hot Paths
+**Problem**: Every `readRecordAt` allocates 2-3 byte slices (header, record buffer, result). `ScanRecords().Next()` re-acquires `db.mu.RLock()` per record. `encodePrimaryKey`/`encodeSecondaryKey` allocate on every call.
 
-**Files to change**:
-- `main.go`: Add `indexAlloc` and `recordAlloc` to `database` struct
-- `storage.go`: `allocator` unchanged, just used twice
+**Fixes**:
+- `Get()` already holds RLock — `readRecordAt` shouldn't re-lock internally
+- Pool record buffers or use arena allocation for batch operations
+- Use `sync.Pool` for `encodePrimaryKey` buffers (currently `index.go:17-23` allocates fresh each time)
+- `ScanRecords` should read all records in a single RLock pass, not per-record Get()
 
-### 2.3 Crash-Safe File Operations
-- All writes go through mmap (copy to mapped region)
-- `Sync()` calls `region.Sync()` to flush
-- No mixing of `file.WriteAt` and mmap writes
+**Files**: `table_api.go`, `index.go`, `main.go`
 
-**Files to change**:
-- `main.go`: Remove `readAt`/`writeAt` fallback to `file.ReadAt`/`file.WriteAt` — always use mmap
+---
 
-## Phase 3: Write-Ahead Log
+### 1.6 Allocator Mutex Holds Through Syscalls
+**Problem**: `Allocate()` holds `a.mu.Lock()` through `file.Truncate` and `mmap.Resize` — both blocking syscalls. All concurrent writes serialize on this.
 
-### 3.1 WAL Format
-Append-only log written before any main-file mutation.
+**Fix**: Pre-allocate the file in chunks (e.g., 64MB at a time). Only take the mutex for the fast path (bump offset). Slow path (growth) is rare and can be lock-free after reservation.
 
-**Frame format**:
-```
-[4 byte magic 0xEDB1A111][8 byte transaction_id][1 byte frame_type]
-[uvarint payload_len][payload_bytes][4 byte CRC32]
-```
+**Files**: `storage.go:66-123`
 
-**Frame types**:
-- `0x01` INSERT: table_id + record_id + TLV payload
-- `0x02` UPDATE: table_id + record_id + old_offset + TLV payload
-- `0x03` DELETE: table_id + record_id + old_offset
-- `0x04` INDEX_PAGE: page_number + page_data (4092 bytes)
-- `0x05` CATALOG: full catalog payload
-- `0xFF` COMMIT: transaction_id only
+---
 
-### 3.2 WAL Lifecycle
-1. On `Begin()`: record current WAL offset
-2. On each mutation: write frame to WAL, `fsync`
-3. On `Commit()`: write COMMIT frame, `fsync`, then apply to main file
-4. On `Open()`: if WAL has uncommitted frames, replay them
-5. Checkpoint: after `Sync()`, truncate WAL
+## Priority 2: Correctness & Robustness
 
-**Files to create**:
-- `wal.go`: WAL writer, reader, replay
+### 2.1 Rebuild Secondary Indexes After Corruption Recovery
+**Problem**: `rebuildIndexFromScan()` only rebuilds primary keys. Secondary and version entries are permanently lost. After reopening, `Query()` returns empty results and `ListVersions()` fails.
 
-## Phase 4: Transactions v2
+**Fix**: After inserting primary keys, scan each record's payload to extract indexed field values and re-insert secondary keys. For version entries, use the record header's `PrevVersionOff` to reconstruct the version chain.
 
-### 4.1 Snapshot Isolation
-- `Begin()` snapshots the B+ tree root offset (O(1), not O(n))
-- Readers at snapshot T see only records committed before T
-- Single writer, multiple concurrent readers
-- Writer holds exclusive lock only during commit, not entire transaction
+**Files**: `main.go:439-566`
 
-### 4.2 Copy-on-Write B+tree Pages
-On write:
-1. Allocate new page
-2. Write modified data to new page
-3. Propagate new page numbers up to root
-4. On commit: atomically update root pointer (single 8-byte write)
-5. On rollback: just discard new pages (old root still valid)
+---
 
-**Files to change**:
-- `btree.go`: CoW page allocation, root pointer atomic swap
-- `main.go`: `Transaction` struct uses root snapshot instead of full index copy
+### 2.2 Transaction Rollback Doesn't Reclaim Space
+**Problem**: On `Rollback()`, the B-tree root is reset and cache is cleared, but written record data and allocated B-tree pages remain in the file. The allocator's free list is never restored.
 
-### 4.3 Rollback That Works
-- Since CoW pages are never modified in-place, rollback is trivial
-- Just discard all pages allocated during the transaction
-- Restore root pointer to snapshot value
-- Record data on disk from aborted transactions is harmless (active flag = 0)
+**Fix**: Snapshot the allocator state at `Begin()`. On `Rollback()`, restore it. Alternatively, use a WAL-based approach for true atomicity.
 
-## Phase 5: Schema & Migration v2
+**Files**: `main.go:1085-1158`
 
-### 5.1 Schema Version in Table Catalog
-Each table has a monotonically increasing `schema_version` (uint32). Migrations bump this version. Old records carry their schema version in the header.
+---
 
-### 5.2 Field-Name-Based Record Format
-TLV fields use `string` field names (from struct tags), not single-byte keys. This makes:
-- Migration robust: fields matched by name, not position
-- Format self-describing: can read without schema
-- No key-assignment instability when fields are added/removed/reordered
+### 2.3 Silent Error Swallowing in Delete
+**Problem**: `readAt` errors are silently discarded in `Delete()` (`table_api.go:864-865`) and `DeleteMany()`. If the read fails, `hdr.RecordID` is 0, and secondary keys won't be cleaned up — orphaned index entries persist forever.
 
-### 5.3 Lazy Migration
-When a record's schema_version doesn't match the current table version, migrate on read:
-1. Read old record bytes
-2. Decode using old schema (or best-effort by field name)
-3. Apply user-provided migration function: `func(old V1) V2`
-4. Write new record with current schema_version
-5. Update index to point to new record
-6. Deactivate old record
+**Fix**: Return errors from `readAt` calls. If the read fails, skip the record but log a warning. Consider adding an `Err` return to `Delete`.
 
-If no migration function is provided, best-effort field-by-name match happens automatically (like current behavior, but by name instead of key byte).
+**Files**: `table_api.go:864-865`
 
-### 5.4 Eager Migration (Optional)
-`MigrateTable()` still available as a batch operation for when you want to upgrade all records at once.
+---
 
-**Files to change**:
-- `table_api.go`: `Use[T]()` detects schema version mismatch, triggers lazy migration
-- `main.go`: Remove `migrateTable`'s byte-copy approach, use TLV decode/re-encode
+### 2.4 Mmap Region Data Race
+**Problem**: In `readAt()`/`writeAt()`, after releasing `currentRegion.RLock()` and calling `ensureRegion()`, the region is re-loaded. If another goroutine resizes the region between the reload and the copy, the offset could be stale.
 
-## Phase 6: Index Persistence
+**Fix**: Hold the region RLock through the entire read/write operation, or use atomic pointer swaps that guarantee the region doesn't change mid-operation.
 
-### 6.1 Persisted Secondary Indexes
-Secondary indexes stored as B+ trees with root offsets in the table catalog. Created once, maintained incrementally. No full rebuild on `Use[T]()`.
+**Files**: `main.go:248-277`
 
-**Table catalog format**:
-```
-[uint32 table_count]
-For each table:
-  [uvarint name_len][name][uint8 table_id][uint32 schema_version]
-  [uvarint hash_len][hash][uint32 record_count][uint32 next_record_id]
-  [uint64 pk_index_root_page]
-  [uint16 secondary_index_count]
-  For each secondary index:
-    [uvarint field_name_len][field_name][uint64 root_page][uint8 unique_flag]
-  [uint64 version_catalog_offset]
-```
+---
 
-### 6.2 Uniqueness Enforcement
-On `Insert`/`Update`, check secondary index before committing. If unique flag is set and key already exists, return error.
+## Priority 3: Code Quality & Cleanup
 
-**Files to change**:
-- `table_api.go`: `CreateIndex` creates B+ tree index, persists root in catalog
-- `table_api.go`: `Insert`/`Update` check unique constraints
+### 3.1 Remove Dead Code
+- `mapIndex` type and all methods (`main.go:24-108`) — unused
+- `btreeMapIndex` and `btreeOffsetMapIndex` (`btree.go:964-1130`) — vestigial wrappers for deleted interfaces
+- `decodeVersionValue`/`encodeVersionValue` (`index.go:85-99`) — never called
+- `shrinkRegion` (`main.go:231-237`) — no-op
+- `pagePool` (`btree.go:33-38`) — defined but never used
+- Entire `wal.go` — defines types but never integrated
 
-## Phase 7: Safe Vacuum
+**Files**: `main.go`, `btree.go`, `index.go`, `wal.go`
 
-### 7.1 Atomic File Swap
-Instead of rename-over (which has a data-loss window):
+---
 
-1. Write new file to `<filename>.new`
-2. `fsync` new file
-3. `os.Rename(filename, filename + ".bak")`
-4. `os.Rename(filename + ".new", filename)`
-5. `os.Rename(filename + ".bak", filename + ".old")` (keep one backup)
-6. Re-open, remap
-7. On next `Open()`, if `.new` exists: it was mid-swap, complete it
-8. If `.old` exists: previous vacuum succeeded, clean up
+### 3.2 Split table_api.go (2064 lines) Into Focused Files
+Current file mixes concerns:
+- `table_crud.go` — Insert, Get, Update, Delete, Upsert
+- `table_query.go` — Query, QueryRange*, filterByField
+- `table_index.go` — CreateIndex, DropIndex, insertSecondaryKeys, deleteSecondaryKeys, explicitIndexes
+- `scanner.go` — ScanRecords, Scanner type, Next/Record/Close
+- `pagination.go` — Paged result types and pagination logic
+- `types.go` — normalizePK, compareValues, valueToIndexKey, helper functions
 
-**Files to change**:
-- `main.go`: Rewrite `Vacuum()` with safe swap
+---
 
-## Phase 7: Updated API Surface
+### 3.3 Split main.go (1288 lines) Into Focused Files
+- `database.go` — openDatabase, Close, load, flush, ensureRegion, readAt, writeAt
+- `vacuum.go` — Vacuum
+- `transaction.go` — Begin, Commit, Rollback
+- `migration.go` — migrateTable
+- `allocator.go` — already in storage.go, but mapIndex should be removed
 
-### Public API (unchanged semantics, improved internals)
-```go
-db, err := embeddb.Open("path.db", embeddb.OpenOptions{
-    Migrate: true,           // enable auto-migration
-    AutoIndex: true,         // auto-create indexes for tagged fields
-    WAL: true,               // enable write-ahead log
-    PageSize: 4096,          // B+ tree page size
-})
+---
 
-tbl, err := embeddb.Use[User](db, "users",
-    embeddb.UseOptions{
-        MaxVersions: 5,       // keep last 5 versions
-        MigrateFunc: embeddb.AutoMigrate[V1,V2](),  // or custom func
-    },
-)
+### 3.4 Secondary Key Encoding: Use RecordID Instead of RecordOffset
+**Problem**: `encodeSecondaryKey` embeds `recordOffset` as a suffix. When Vacuum compacts the file, every secondary key must be reconstructed with new offsets. This is O(n) and requires a full index rebuild.
 
-// CRUD (same as v1)
-id, err := tbl.Insert(&User{Name: "Alice"})
-record, err := tbl.Get(id)
-err = tbl.Update(id, &User{Name: "Alice v2"})
-err = tbl.Delete(id)
+**Fix**: Use `recordID` (uint32, already in the record header) instead of `recordOffset`. Then secondary keys become stable across Vacuum operations. To look up a record, use the primary key index: `secondaryKey → recordID → primaryKey → offset`.
 
-// Versioning (same as v1)
-versions, err := tbl.ListVersions(id)
-old, err := tbl.GetVersion(id, 2)
+This requires either:
+- Storing `recordID → primaryKey` mapping somewhere, or
+- Encoding `tableID + recordID` in the secondary key and scanning primary keys for that recordID
 
-// Transactions (same API, but now with proper rollback)
-err = db.Begin()
-// ... operations ...
-err = db.Commit()  // or db.Rollback()
+**Trade-off**: Adds an extra primary key lookup per secondary query, but eliminates the need to rebuild secondary keys during Vacuum.
 
-// Indexes (now persisted)
-err = tbl.CreateIndex("Email")
-err = tbl.DropIndex("Email")
-err = tbl.CreateIndex("Name")  // non-unique by default
-err = tbl.CreateIndex("Email", embeddb.IndexUnique)  // unique constraint
-results, err := tbl.Query("Name", "Alice")
+**Files**: `index.go`, `main.go` (Vacuum), `table_api.go`
 
-// Vacuum (same API, safer internals)
-err = db.Vacuum()
+---
 
-// Close (auto-checkpoints WAL)
-err = db.Close()
-```
+## Priority 4: Future Features
 
-## Execution Order
+### 4.1 Write-Ahead Log (WAL)
+**Problem**: No durability guarantee. A crash between `Insert` and `Sync` loses data. The `wal.go` placeholder exists but is never integrated.
 
-| Step | Description | Depends on | Estimated effort |
-|------|-------------|------------|------------------|
-| 1 | TLV encoding in embeddbcore | Nothing | Medium |
-| 2 | Type-aware index key encoding | Nothing | Small |
-| 3 | B+ tree rewrite with byte-size splits | Nothing | Large |
-| 4 | Record format v2 (new envelope + TLV) | Step 1 | Large |
-| 5 | Persistent free list | Step 4 | Medium |
-| 6 | Separate allocators | Step 5 | Small |
-| 7 | Crash-safe mmap-only I/O | Step 4 | Medium |
-| 8 | WAL | Steps 3, 4 | Large |
-| 9 | CoW B+ tree pages | Step 3 | Medium |
-| 10 | Snapshot isolation transactions | Steps 8, 9 | Large |
-| 11 | Schema version + field-name TLV | Step 4 | Medium |
-| 12 | Lazy migration | Step 11 | Medium |
-| 13 | Persisted secondary indexes | Steps 3, 5 | Medium |
-| 14 | Uniqueness enforcement | Step 13 | Small |
-| 15 | Safe vacuum | Step 7 | Medium |
-| 16 | Table API v2 (glue everything together) | All above | Large |
-| 17 | Full test suite | Step 16 | Large |
+**Fix**: 
+- On `Open`, create WAL file
+- Before each mutation, append a WAL frame (operation type, key, value)
+- On `Sync`, flush WAL then flush main data
+- On recovery, replay WAL frames
 
-Starting with **Step 1** (TLV encoding) since it's the foundation everything else builds on.
+**Files**: `wal.go`, `main.go`
+
+---
+
+### 4.2 B-Tree Prefix Range Scan Method
+**Problem**: Currently `Scan()` iterates all leaf nodes. No method for bounded iteration from a start key to an end key.
+
+**Fix**: Add `ScanRange(startKey, endKey []byte, fn func(key []byte, value uint64) bool)` to `BTree`:
+1. Search for the first key ≥ `startKey`
+2. Walk leaf chain until keys exceed `endKey`
+3. Call `fn` for each entry
+
+This is needed for Priority 1.1 (range queries) but also useful for prefix queries, pagination, and cursor-based iteration.
+
+**Files**: `btree.go`
+
+---
+
+### 4.3 Configurable Cache Size
+**Problem**: B-tree page cache is hardcoded to 2048 entries regardless of database size or available memory.
+
+**Fix**: Add `CachePages int` to `OpenOptions`. Default to 4096. Apply in `openBTree`.
+
+**Files**: `table_api.go` (OpenOptions), `btree.go` (openBTree)
+
+---
+
+### 4.4 Batch Operations
+**Problem**: `InsertMany`, `UpdateMany`, `DeleteMany` all hold the write lock for the entire batch and perform individual B-tree operations. No batching at the B-tree level.
+
+**Fix**: Add `BTree.BatchInsert(entries []KeyValue)` that amortizes lock acquisition and page splits. Also consider `Table.BatchInsert(records []*T)` that does a single lock acquisition + batch B-tree mutation.
+
+**Files**: `btree.go`, `table_api.go`
+
+---
+
+### 4.5 CRC Verification Toggle
+**Problem**: Every B-tree page read verifies CRC (`btree.go:304-319`). This adds CPU overhead on every cache miss during normal operation. CRC should only be verified on recovery.
+
+**Fix**: Add `VerifyCRC bool` to `OpenOptions`. Only check on `rebuildIndexFromScan` path or explicit `Verify()` call.
+
+**Files**: `btree.go`, `table_api.go`
