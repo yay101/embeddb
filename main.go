@@ -21,92 +21,6 @@ const (
 	FileMagic      = "embeddb v3.0"
 )
 
-type mapIndex struct {
-	mu   sync.RWMutex
-	data map[string][]byte
-}
-
-func newMapIndex() *mapIndex {
-	return &mapIndex{
-		data: make(map[string][]byte),
-	}
-}
-
-func (mi *mapIndex) Set(key []byte, value []byte) {
-	mi.mu.Lock()
-	defer mi.mu.Unlock()
-	keyCopy := make([]byte, len(key))
-	valCopy := make([]byte, len(value))
-	copy(keyCopy, key)
-	copy(valCopy, value)
-	mi.data[string(keyCopy)] = valCopy
-}
-
-func (mi *mapIndex) SetUint32(key []byte, value uint32) {
-	mi.mu.Lock()
-	defer mi.mu.Unlock()
-	keyCopy := make([]byte, len(key))
-	copy(keyCopy, key)
-	val := make([]byte, 4)
-	binary.BigEndian.PutUint32(val, value)
-	mi.data[string(keyCopy)] = val
-}
-
-func (mi *mapIndex) Get(key []byte) ([]byte, bool) {
-	mi.mu.RLock()
-	defer mi.mu.RUnlock()
-	val, ok := mi.data[string(key)]
-	if !ok {
-		return nil, false
-	}
-	valCopy := make([]byte, len(val))
-	copy(valCopy, val)
-	return valCopy, true
-}
-
-func (mi *mapIndex) GetUint32(key []byte) (uint32, bool) {
-	mi.mu.RLock()
-	defer mi.mu.RUnlock()
-	val, ok := mi.data[string(key)]
-	if !ok {
-		return 0, false
-	}
-	return binary.BigEndian.Uint32(val), true
-}
-
-func (mi *mapIndex) Delete(key []byte) {
-	mi.mu.Lock()
-	defer mi.mu.Unlock()
-	delete(mi.data, string(key))
-}
-
-func (mi *mapIndex) Range(fn func(k []byte, v []byte) bool) {
-	mi.mu.RLock()
-	defer mi.mu.RUnlock()
-	for k, v := range mi.data {
-		keyCopy := make([]byte, len(k))
-		valCopy := make([]byte, len(v))
-		copy(keyCopy, k)
-		copy(valCopy, v)
-		if !fn(keyCopy, valCopy) {
-			return
-		}
-	}
-}
-
-func (mi *mapIndex) Size() int {
-	mi.mu.RLock()
-	defer mi.mu.RUnlock()
-	return len(mi.data)
-}
-
-func (mi *mapIndex) RootOffset() uint64 {
-	return 0
-}
-
-func (mi *mapIndex) SetRootOffset(off uint64) {
-}
-
 func lockFile(f *os.File) error {
 	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
@@ -224,14 +138,6 @@ func (db *database) ensureRegion(size int64) error {
 		db.region.Store(currentRegion)
 		db.alloc.region.Store(currentRegion)
 
-	}
-	return nil
-}
-
-func (db *database) shrinkRegion(size int64) error {
-	currentRegion := db.region.Load()
-	if currentRegion == nil {
-		return nil
 	}
 	return nil
 }

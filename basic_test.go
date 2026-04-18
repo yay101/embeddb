@@ -184,36 +184,6 @@ func TestDelete(t *testing.T) {
 	os.Remove("/tmp/test_delete.db")
 }
 
-func TestMapIndex(t *testing.T) {
-	mi := newMapIndex()
-
-	mi.Set([]byte("key1"), []byte("value1"))
-	mi.Set([]byte("key2"), []byte("value2"))
-
-	val, ok := mi.Get([]byte("key1"))
-	if !ok {
-		t.Error("expected to find key1")
-	}
-	if string(val) != "value1" {
-		t.Errorf("expected 'value1', got '%s'", string(val))
-	}
-
-	count := 0
-	mi.Range(func(k []byte, v []byte) bool {
-		count++
-		return true
-	})
-	if count != 2 {
-		t.Errorf("expected 2 entries, got %d", count)
-	}
-
-	mi.Delete([]byte("key1"))
-	_, ok = mi.Get([]byte("key1"))
-	if ok {
-		t.Error("expected key1 to be deleted")
-	}
-}
-
 func TestRestartBasic(t *testing.T) {
 	os.Remove("/tmp/test_restart.db")
 

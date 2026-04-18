@@ -51,6 +51,7 @@ type OpenOptions struct {
 	AutoIndex     bool
 	SyncThreshold uint64
 	IdleThreshold time.Duration
+	CachePages    int
 }
 
 type UseOptions struct {
@@ -68,6 +69,7 @@ type DB struct {
 	autoIndex     bool
 	syncThreshold uint64
 	idleThreshold time.Duration
+	cachePages    int
 	writeCount    uint64
 	lastSync      time.Time
 	lock          sync.Mutex
@@ -85,6 +87,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	autoIndex := true
 	syncThreshold := uint64(1000)
 	idleThreshold := 10 * time.Second
+	cachePages := 0
 	if len(opts) > 0 {
 		migrate = opts[0].Migrate
 		autoIndex = opts[0].AutoIndex
@@ -93,6 +96,9 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		}
 		if opts[0].IdleThreshold > 0 {
 			idleThreshold = opts[0].IdleThreshold
+		}
+		if opts[0].CachePages > 0 {
+			cachePages = opts[0].CachePages
 		}
 	}
 
@@ -110,6 +116,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		autoIndex:     autoIndex,
 		syncThreshold: syncThreshold,
 		idleThreshold: idleThreshold,
+		cachePages:    cachePages,
 		writeCount:    0,
 		lastSync:      time.Now(),
 		tables:        make(map[string]*database),
@@ -862,6 +869,7 @@ func (t *Table[T]) Delete(id any) error {
 	var recordID uint32
 	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
 	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
+		return fmt.Errorf("failed to read record header: %w", err)
 	}
 	if hdrBuf[0] == V2RecordVersion {
 		hdr, _ := decodeRecordHeader(hdrBuf)
@@ -871,6 +879,7 @@ func (t *Table[T]) Delete(id any) error {
 			oldRecordBuf := make([]byte, totalLen)
 			copy(oldRecordBuf, hdrBuf)
 			if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
+				return fmt.Errorf("failed to read record data: %w", err)
 			}
 
 			var oldRecord T
@@ -1263,6 +1272,9 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 }
 
 func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+	if t.canUseIndex(fieldName) {
+		return t.rangeQueryFromField(fieldName, value, inclusive, true)
+	}
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) > 0 || (inclusive && compareValues(fieldValue, value) == 0)
 	}
@@ -1270,6 +1282,9 @@ func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, in
 }
 
 func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
+	if t.canUseIndex(fieldName) {
+		return t.rangeQueryToField(fieldName, value, inclusive)
+	}
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) < 0 || (inclusive && compareValues(fieldValue, value) == 0)
 	}
@@ -1277,6 +1292,9 @@ func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclu
 }
 
 func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
+	if t.canUseIndex(fieldName) {
+		return t.rangeQueryBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
+	}
 	comparator := func(fieldValue interface{}) bool {
 		cMin := compareValues(fieldValue, min)
 		cMax := compareValues(fieldValue, max)
@@ -1295,6 +1313,9 @@ func (t *Table[T]) QueryNotEqual(fieldName string, value interface{}) ([]T, erro
 }
 
 func (t *Table[T]) QueryGreaterOrEqual(fieldName string, value interface{}) ([]T, error) {
+	if t.canUseIndex(fieldName) {
+		return t.rangeQueryFromField(fieldName, value, true, true)
+	}
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) >= 0
 	}
@@ -1302,6 +1323,9 @@ func (t *Table[T]) QueryGreaterOrEqual(fieldName string, value interface{}) ([]T
 }
 
 func (t *Table[T]) QueryLessOrEqual(fieldName string, value interface{}) ([]T, error) {
+	if t.canUseIndex(fieldName) {
+		return t.rangeQueryToField(fieldName, value, true)
+	}
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) <= 0
 	}
@@ -1349,6 +1373,263 @@ func matchLike(s, pattern string) bool {
 		return strings.HasPrefix(sLower, strings.Trim(patternLower, "%"))
 	}
 	return sLower == patternLower
+}
+
+func (t *Table[T]) canUseIndex(fieldName string) bool {
+	if strings.Contains(fieldName, ".") {
+		return false
+	}
+	if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][fieldName] {
+		return false
+	}
+	if t.db.parent != nil && t.db.parent.autoIndex {
+		field, err := t.findField(fieldName)
+		return err == nil && !field.Primary && field.Offset > 0 && !field.IsSlice
+	}
+	if t.db.explicitIndexes != nil {
+		for _, f := range t.db.explicitIndexes[t.name] {
+			if f == fieldName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (t *Table[T]) rangeQueryFromField(fieldName string, startValue interface{}, inclusive bool, fromField bool) ([]T, error) {
+	field, err := t.findField(fieldName)
+	if err != nil {
+		return nil, err
+	}
+
+	prefix := encodeSecondaryKeyPrefix(t.tableID, fieldName)
+
+	cmpFunc := func(fieldValue any) bool {
+		return compareValues(fieldValue, startValue) > 0 || (inclusive && compareValues(fieldValue, startValue) == 0)
+	}
+
+	var offsets []uint64
+	t.db.mu.RLock()
+	_ = t.db.index.Scan(func(key []byte, val uint64) bool {
+		if bytes.HasPrefix(key, prefix) {
+			_, _, fv, _, parsed := parseSecondaryKey(key)
+			if parsed {
+				fieldVal := decodeIndexKeyToValue(fv, field.Type)
+				if cmpFunc(fieldVal) {
+					offsets = append(offsets, val)
+				}
+			}
+		}
+		return true
+	})
+	t.db.mu.RUnlock()
+
+	slices.Sort(offsets)
+	results := make([]T, 0, len(offsets))
+	t.db.mu.RLock()
+	for _, off := range offsets {
+		record, err := t.readRecordAt(off)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+	t.db.mu.RUnlock()
+
+	return results, nil
+}
+
+func (t *Table[T]) rangeQueryToField(fieldName string, endValue interface{}, inclusive bool) ([]T, error) {
+	field, err := t.findField(fieldName)
+	if err != nil {
+		return nil, err
+	}
+
+	prefix := encodeSecondaryKeyPrefix(t.tableID, fieldName)
+
+	cmpFunc := func(fieldValue any) bool {
+		return compareValues(fieldValue, endValue) < 0 || (inclusive && compareValues(fieldValue, endValue) == 0)
+	}
+
+	var offsets []uint64
+	t.db.mu.RLock()
+	_ = t.db.index.Scan(func(key []byte, val uint64) bool {
+		if bytes.HasPrefix(key, prefix) {
+			_, _, fv, _, parsed := parseSecondaryKey(key)
+			if parsed {
+				fieldVal := decodeIndexKeyToValue(fv, field.Type)
+				if cmpFunc(fieldVal) {
+					offsets = append(offsets, val)
+				}
+			}
+		}
+		return true
+	})
+	t.db.mu.RUnlock()
+
+	slices.Sort(offsets)
+	results := make([]T, 0, len(offsets))
+	t.db.mu.RLock()
+	for _, off := range offsets {
+		record, err := t.readRecordAt(off)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+	t.db.mu.RUnlock()
+
+	return results, nil
+}
+
+func (t *Table[T]) rangeQueryBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
+	field, err := t.findField(fieldName)
+	if err != nil {
+		return nil, err
+	}
+
+	prefix := encodeSecondaryKeyPrefix(t.tableID, fieldName)
+
+	cmpFunc := func(fieldValue any) bool {
+		cMin := compareValues(fieldValue, min)
+		cMax := compareValues(fieldValue, max)
+		aboveMin := cMin > 0 || (inclusiveMin && cMin == 0)
+		belowMax := cMax < 0 || (inclusiveMax && cMax == 0)
+		return aboveMin && belowMax
+	}
+
+	var offsets []uint64
+	t.db.mu.RLock()
+	_ = t.db.index.Scan(func(key []byte, val uint64) bool {
+		if bytes.HasPrefix(key, prefix) {
+			_, _, fv, _, parsed := parseSecondaryKey(key)
+			if parsed {
+				fieldVal := decodeIndexKeyToValue(fv, field.Type)
+				if cmpFunc(fieldVal) {
+					offsets = append(offsets, val)
+				}
+			}
+		}
+		return true
+	})
+	t.db.mu.RUnlock()
+
+	slices.Sort(offsets)
+	results := make([]T, 0, len(offsets))
+	t.db.mu.RLock()
+	for _, off := range offsets {
+		record, err := t.readRecordAt(off)
+		if err == nil && record != nil {
+			results = append(results, *record)
+		}
+	}
+	t.db.mu.RUnlock()
+
+	return results, nil
+}
+
+func incrementIndexValue(v []byte) []byte {
+	result := make([]byte, len(v))
+	copy(result, v)
+	for i := len(result) - 1; i >= 0; i-- {
+		result[i]++
+		if result[i] != 0 {
+			return result
+		}
+	}
+	return append(result, 0)
+}
+
+func decrementIndexValue(v []byte) []byte {
+	if len(v) == 0 {
+		return v
+	}
+	result := make([]byte, len(v))
+	copy(result, v)
+	for i := len(result) - 1; i >= 0; i-- {
+		result[i]--
+		if result[i] != 0xFF {
+			if i == len(result)-1 && result[i] == 0 {
+				return result[:len(result)-1]
+			}
+			return result
+		}
+	}
+	return result
+}
+
+func decodeIndexKeyToValue(data []byte, kind reflect.Kind) any {
+	s := valueToIndexKeyReverse(data)
+	if s == "" && len(data) > 0 && data[0] != 0x02 {
+		return int(0)
+	}
+	switch kind {
+	case reflect.Int:
+		v, _ := strconv.ParseInt(s, 10, 64)
+		return int(v)
+	case reflect.Int8:
+		v, _ := strconv.ParseInt(s, 10, 8)
+		return int8(v)
+	case reflect.Int16:
+		v, _ := strconv.ParseInt(s, 10, 16)
+		return int16(v)
+	case reflect.Int32:
+		v, _ := strconv.ParseInt(s, 10, 32)
+		return int32(v)
+	case reflect.Int64:
+		v, _ := strconv.ParseInt(s, 10, 64)
+		return v
+	case reflect.Uint:
+		v, _ := strconv.ParseUint(s, 10, 64)
+		return uint(v)
+	case reflect.Uint8:
+		v, _ := strconv.ParseUint(s, 10, 8)
+		return uint8(v)
+	case reflect.Uint16:
+		v, _ := strconv.ParseUint(s, 10, 16)
+		return uint16(v)
+	case reflect.Uint32:
+		v, _ := strconv.ParseUint(s, 10, 32)
+		return uint32(v)
+	case reflect.Uint64:
+		v, _ := strconv.ParseUint(s, 10, 64)
+		return v
+	case reflect.Float32:
+		v, _ := strconv.ParseFloat(s, 32)
+		return float32(v)
+	case reflect.Float64:
+		v, _ := strconv.ParseFloat(s, 64)
+		return v
+	case reflect.String:
+		return s
+	case reflect.Bool:
+		return s == "true" || s == "1"
+	case reflect.Struct:
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err == nil {
+			return time.Unix(0, n)
+		}
+	}
+	return nil
+}
+
+func valueToIndexKeyReverse(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	s, _, err := embedcore.DecodeString(data)
+	if err == nil {
+		return s
+	}
+	var buf []byte
+	v, _, err2 := embedcore.DecodeVarint(data)
+	if err2 == nil {
+		buf = strconv.AppendInt(buf, v, 10)
+	} else {
+		uv, _, err3 := embedcore.DecodeUvarint(data)
+		if err3 == nil {
+			buf = strconv.AppendUint(buf, uv, 10)
+		}
+	}
+	return string(buf)
 }
 
 func (t *Table[T]) filterByField(fieldName string, fn func(interface{}) bool) ([]T, error) {

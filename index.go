@@ -41,7 +41,7 @@ func encodeSecondaryKey(tableID uint8, fieldName string, fieldValue any, recordO
 	key = append(key, tableID)
 	key = embedcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
-	key = truncIndexValue(encodeIndexValueBytes(fieldValue))
+	key = append(key, truncIndexValue(encodeIndexValueBytes(fieldValue))...)
 	key = binary.BigEndian.AppendUint64(key, recordOffset)
 	return key
 }
@@ -61,7 +61,17 @@ func encodeSecondaryKeyPrefixWithValue(tableID uint8, fieldName string, fieldVal
 	key = append(key, tableID)
 	key = embedcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
-	key = truncIndexValue(encodeIndexValueBytes(fieldValue))
+	key = append(key, truncIndexValue(encodeIndexValueBytes(fieldValue))...)
+	return key
+}
+
+func encodeSecondaryKeyEndPrefix(tableID uint8, fieldName string) []byte {
+	var key []byte
+	key = append(key, indexNSSecondary)
+	nextID := tableID + 1
+	key = append(key, nextID)
+	key = embedcore.EncodeUvarint(key, uint64(len(fieldName)))
+	key = append(key, fieldName...)
 	return key
 }
 
@@ -80,22 +90,6 @@ func encodeVersionKey(tableID uint8, recordID uint32, version uint32) []byte {
 	key = embedcore.EncodeUvarint(key, uint64(recordID))
 	key = embedcore.EncodeUvarint(key, uint64(version))
 	return key
-}
-
-func encodeVersionValue(recordOffset uint64, createdAt int64) []byte {
-	var val []byte
-	val = binary.BigEndian.AppendUint64(val, recordOffset)
-	val = binary.BigEndian.AppendUint64(val, uint64(createdAt))
-	return val
-}
-
-func decodeVersionValue(val []byte) (recordOffset uint64, createdAt int64) {
-	if len(val) < 16 {
-		return 0, 0
-	}
-	recordOffset = binary.BigEndian.Uint64(val[0:8])
-	createdAt = int64(binary.BigEndian.Uint64(val[8:16]))
-	return
 }
 
 func parsePrimaryKey(key []byte) (tableID uint8, pkValue []byte) {

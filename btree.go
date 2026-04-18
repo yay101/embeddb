@@ -30,22 +30,16 @@ const (
 
 var ErrKeyNotFound = errors.New("key not found")
 
-var pagePool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, PageSize)
-		return &buf
-	},
-}
-
 type BTree struct {
 	db        *database
 	alloc     *allocator
 	rootOff   uint64
 	mu        sync.RWMutex
 	cache     map[uint64]*BTreeNode
-	cacheMu   sync.Mutex
+	cacheMu   sync.RWMutex
 	cacheRing []uint64
 	cacheHead int
+	cacheSize int
 	count     int
 }
 
@@ -62,13 +56,18 @@ type BTreeNode struct {
 }
 
 func (db *database) openBTree(rootOff uint64) (*BTree, error) {
+	cacheSize := 4096
+	if db.parent != nil && db.parent.cachePages > 0 {
+		cacheSize = db.parent.cachePages
+	}
 	bt := &BTree{
 		db:        db,
 		alloc:     db.alloc,
 		rootOff:   rootOff,
-		cache:     make(map[uint64]*BTreeNode, 2048),
-		cacheRing: make([]uint64, 2048),
+		cache:     make(map[uint64]*BTreeNode, cacheSize),
+		cacheRing: make([]uint64, cacheSize),
 		cacheHead: 0,
+		cacheSize: cacheSize,
 	}
 
 	if bt.rootOff == 0 {
@@ -228,9 +227,7 @@ func (bt *BTree) serializeNode(node *BTreeNode) []byte {
 	checksum := crc32.ChecksumIEEE(buf[:PageFooterOff])
 	binary.LittleEndian.PutUint32(buf[PageFooterOff:], checksum)
 
-	result := make([]byte, PageSize)
-	copy(result, buf)
-	return result
+	return buf
 }
 
 func (bt *BTree) encodeLeafCell(buf []byte, end uint16, key []byte, value uint64) uint16 {
@@ -282,12 +279,12 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 		return nil, errors.New("invalid offset")
 	}
 
-	bt.cacheMu.Lock()
+	bt.cacheMu.RLock()
 	if node, ok := bt.cache[offset]; ok {
-		bt.cacheMu.Unlock()
+		bt.cacheMu.RUnlock()
 		return node, nil
 	}
-	bt.cacheMu.Unlock()
+	bt.cacheMu.RUnlock()
 
 	if err := bt.db.ensureRegion(int64(offset) + PageSize); err != nil {
 		return nil, fmt.Errorf("btree readNode ensureRegion: %w", err)
@@ -389,9 +386,22 @@ func (bt *BTree) cacheNode(node *BTreeNode) {
 		bt.cache[node.Offset] = node
 		return
 	}
-	old := bt.cacheRing[bt.cacheHead]
-	if old != 0 {
-		delete(bt.cache, old)
+	if node.Offset == bt.rootOff {
+		bt.cache[node.Offset] = node
+		return
+	}
+	if len(bt.cache) >= bt.cacheSize {
+		for i := 0; i < bt.cacheSize; i++ {
+			idx := (bt.cacheHead + i) % bt.cacheSize
+			old := bt.cacheRing[idx]
+			if old != 0 && old != bt.rootOff {
+				delete(bt.cache, old)
+				bt.cacheRing[idx] = node.Offset
+				bt.cache[node.Offset] = node
+				bt.cacheHead = (idx + 1) % bt.cacheSize
+				return
+			}
+		}
 	}
 	bt.cacheRing[bt.cacheHead] = node.Offset
 	bt.cache[node.Offset] = node
@@ -402,8 +412,6 @@ func (bt *BTree) Insert(key []byte, value uint64) error {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
 
-	_, searchErr := bt.searchUnlocked(key)
-
 	root, err := bt.readNode(bt.rootOff)
 	if err != nil {
 		return err
@@ -422,11 +430,12 @@ func (bt *BTree) Insert(key []byte, value uint64) error {
 		root = newRoot
 	}
 
-	if err := bt.insertNonFull(root, key, value); err != nil {
+	inserted, err := bt.insertNonFull(root, key, value)
+	if err != nil {
 		return err
 	}
 
-	if searchErr != nil {
+	if inserted {
 		bt.count++
 	}
 
@@ -437,8 +446,6 @@ func (bt *BTree) Put(key []byte, value uint64) error {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
 
-	_, existsErr := bt.searchUnlocked(key)
-
 	root, err := bt.readNode(bt.rootOff)
 	if err != nil {
 		return err
@@ -457,25 +464,18 @@ func (bt *BTree) Put(key []byte, value uint64) error {
 		root = newRoot
 	}
 
-	if err := bt.insertNonFull(root, key, value); err != nil {
-		return err
-	}
-
-	if existsErr != nil {
-		bt.count++
-	}
-
-	return nil
+	_, err = bt.insertNonFull(root, key, value)
+	return err
 }
 
-func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) error {
+func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) (bool, error) {
 	if node.IsLeaf {
 		i := sort.Search(node.Count, func(j int) bool {
 			return bytes.Compare(node.Keys[j], key) >= 0
 		})
 		if i < node.Count && bytes.Equal(node.Keys[i], key) {
 			node.Values[i] = value
-			return bt.writeNode(node)
+			return false, bt.writeNode(node)
 		}
 		node.Keys = append(node.Keys, nil)
 		node.Values = append(node.Values, 0)
@@ -485,7 +485,7 @@ func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) error 
 		copy(node.Keys[i], key)
 		node.Values[i] = value
 		node.Count++
-		return bt.writeNode(node)
+		return true, bt.writeNode(node)
 	}
 
 	i := sort.Search(node.Count, func(j int) bool {
@@ -494,19 +494,19 @@ func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) error 
 
 	child, err := bt.readNode(node.Children[i])
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if bt.wouldOverflow(child, len(key)) {
 		if err := bt.splitChild(node, i, child); err != nil {
-			return err
+			return false, err
 		}
 		if i < node.Count && bytes.Compare(key, node.Keys[i]) >= 0 {
 			i++
 		}
 		child, err = bt.readNode(node.Children[i])
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 	return bt.insertNonFull(child, key, value)
@@ -913,6 +913,68 @@ func (bt *BTree) Scan(fn func(key []byte, value uint64) bool) error {
 	return nil
 }
 
+func (bt *BTree) ScanRange(startKey, endKey []byte, fn func(key []byte, value uint64) bool) error {
+	bt.mu.RLock()
+	defer bt.mu.RUnlock()
+
+	root, err := bt.readNode(bt.rootOff)
+	if err != nil {
+		return fmt.Errorf("scan range: read root: %w", err)
+	}
+
+	node, startIdx, err := bt.findLeafPosition(root, startKey)
+	if err != nil {
+		return fmt.Errorf("scan range: find start: %w", err)
+	}
+
+	for node != nil {
+		for i := startIdx; i < node.Count; i++ {
+			if i >= len(node.Keys) || i >= len(node.Values) {
+				break
+			}
+			cmp := bytes.Compare(node.Keys[i], endKey)
+			if cmp > 0 {
+				return nil
+			}
+			if !fn(node.Keys[i], node.Values[i]) {
+				return nil
+			}
+		}
+		startIdx = 0
+		if node.NextLeaf == 0 {
+			break
+		}
+		node, err = bt.readNode(node.NextLeaf)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (bt *BTree) findLeafPosition(node *BTreeNode, key []byte) (*BTreeNode, int, error) {
+	for !node.IsLeaf {
+		i := sort.Search(node.Count, func(j int) bool {
+			return bytes.Compare(node.Keys[j], key) > 0
+		})
+		if i >= len(node.Children) {
+			return nil, 0, fmt.Errorf("findLeafPosition: internal node at %d has Count=%d but Children=%d, i=%d", node.Offset, node.Count, len(node.Children), i)
+		}
+		child, err := bt.readNode(node.Children[i])
+		if err != nil {
+			return nil, 0, err
+		}
+		node = child
+	}
+
+	i := sort.Search(node.Count, func(j int) bool {
+		return bytes.Compare(node.Keys[j], key) >= 0
+	})
+
+	return node, i, nil
+}
+
 func (bt *BTree) Close() error {
 	return nil
 }
@@ -959,172 +1021,4 @@ func (bt *BTree) Verify() error {
 		return fmt.Errorf("btree verify: %d/%d keys not found via Get", missingCount, len(entries))
 	}
 	return nil
-}
-
-// btreeMapIndex wraps BTree to implement pkIndexInterface
-type btreeMapIndex struct {
-	bt *BTree
-}
-
-func newBtreeMapIndex(db *database, rootOff uint64) (*btreeMapIndex, error) {
-	bt, err := db.openBTree(rootOff)
-	if err != nil {
-		return nil, err
-	}
-	return &btreeMapIndex{bt: bt}, nil
-}
-
-func (b *btreeMapIndex) Set(key []byte, value []byte) {
-	off := binary.BigEndian.Uint64(value)
-	b.bt.Insert(key, off)
-}
-
-func (b *btreeMapIndex) Get(key []byte) ([]byte, bool) {
-	off, err := b.bt.Get(key)
-	if err != nil {
-		return nil, false
-	}
-	val := make([]byte, 8)
-	binary.BigEndian.PutUint64(val, off)
-	return val, true
-}
-
-func (b *btreeMapIndex) Delete(key []byte) {
-	b.bt.Delete(key)
-}
-
-func (b *btreeMapIndex) Range(fn func(k []byte, v []byte) bool) {
-	b.bt.Scan(func(key []byte, value uint64) bool {
-		val := make([]byte, 8)
-		binary.BigEndian.PutUint64(val, value)
-		return fn(key, val)
-	})
-}
-
-func (b *btreeMapIndex) Size() int {
-	return b.bt.count
-}
-
-func (b *btreeMapIndex) RootOffset() uint64 {
-	return b.bt.RootOffset()
-}
-
-func (b *btreeMapIndex) SetRootOffset(off uint64) {
-	b.bt.SetRootOffset(off)
-}
-
-// btreeOffsetMapIndex wraps BTree to implement offsetIndexInterface
-type btreeOffsetMapIndex struct {
-	bt *BTree
-}
-
-func newBtreeOffsetMapIndex(db *database, rootOff uint64) (*btreeOffsetMapIndex, error) {
-	bt, err := db.openBTree(rootOff)
-	if err != nil {
-		return nil, err
-	}
-	return &btreeOffsetMapIndex{bt: bt}, nil
-}
-
-func (b *btreeOffsetMapIndex) Set(key string, value uint64) {
-	k := make([]byte, len(key)+8)
-	copy(k, key)
-	binary.BigEndian.PutUint64(k[len(key):], value)
-	b.bt.Insert(k, value)
-}
-
-func (b *btreeOffsetMapIndex) Get(key string) (uint64, bool) {
-	prefix := []byte(key)
-	var result uint64
-	found := false
-	b.bt.Scan(func(k []byte, v uint64) bool {
-		if len(k) >= len(prefix)+8 && bytes.Equal(k[:len(prefix)], prefix) {
-			result = v
-			found = true
-			return false
-		}
-		if bytes.Compare(k[:min(len(k), len(prefix))], prefix) > 0 {
-			return false
-		}
-		return true
-	})
-	return result, found
-}
-
-func (b *btreeOffsetMapIndex) GetAll(key string) ([]uint64, bool) {
-	prefix := []byte(key)
-	var results []uint64
-	b.bt.Scan(func(k []byte, v uint64) bool {
-		if len(k) >= len(prefix)+8 && bytes.Equal(k[:len(prefix)], prefix) {
-			results = append(results, v)
-			return true
-		}
-		if bytes.Compare(k[:min(len(k), len(prefix))], prefix) > 0 {
-			return false
-		}
-		return true
-	})
-	if len(results) == 0 {
-		return nil, false
-	}
-	return results, true
-}
-
-func (b *btreeOffsetMapIndex) Delete(key string) {
-	prefix := []byte(key)
-	var toDelete [][]byte
-	b.bt.Scan(func(k []byte, v uint64) bool {
-		if len(k) >= len(prefix)+8 && bytes.Equal(k[:len(prefix)], prefix) {
-			keyCopy := make([]byte, len(k))
-			copy(keyCopy, k)
-			toDelete = append(toDelete, keyCopy)
-			return true
-		}
-		if bytes.Compare(k[:min(len(k), len(prefix))], prefix) > 0 {
-			return false
-		}
-		return true
-	})
-	for _, k := range toDelete {
-		b.bt.Delete(k)
-	}
-}
-
-func (b *btreeOffsetMapIndex) Range(fn func(k string, v uint64) bool) {
-	b.bt.Scan(func(key []byte, v uint64) bool {
-		if len(key) < 8 {
-			return true
-		}
-		origKey := string(key[:len(key)-8])
-		return fn(origKey, v)
-	})
-}
-
-func (b *btreeOffsetMapIndex) SortedKeys() []string {
-	seen := make(map[string]struct{})
-	keys := make([]string, 0)
-	b.bt.Scan(func(key []byte, v uint64) bool {
-		if len(key) < 8 {
-			return true
-		}
-		origKey := string(key[:len(key)-8])
-		if _, exists := seen[origKey]; !exists {
-			seen[origKey] = struct{}{}
-			keys = append(keys, origKey)
-		}
-		return true
-	})
-	return keys
-}
-
-func (b *btreeOffsetMapIndex) Size() int {
-	return b.bt.count
-}
-
-func (b *btreeOffsetMapIndex) RootOffset() uint64 {
-	return b.bt.RootOffset()
-}
-
-func (b *btreeOffsetMapIndex) SetRootOffset(off uint64) {
-	b.bt.SetRootOffset(off)
 }
