@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 )
 
 type User struct {
@@ -958,5 +959,101 @@ func TestGetIndexedFields(t *testing.T) {
 	fields := users.GetIndexedFields()
 	if len(fields) != 2 {
 		t.Errorf("expected 2 indexed fields, got %d", len(fields))
+	}
+}
+
+func TestPKUniquenessError(t *testing.T) {
+	os.Remove("/tmp/pk_unique.db")
+	defer os.Remove("/tmp/pk_unique.db")
+
+	db, _ := Open("/tmp/pk_unique.db")
+	defer db.Close()
+
+	users, _ := Use[User](db, "users")
+
+	_, err := users.Insert(&User{ID: 1, Name: "Alice", Age: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = users.Insert(&User{ID: 1, Name: "Alice2", Age: 31})
+	if err == nil {
+		t.Fatal("expected error for duplicate primary key")
+	}
+}
+
+func TestFilterPaged(t *testing.T) {
+	os.Remove("/tmp/filter_paged.db")
+	defer os.Remove("/tmp/filter_paged.db")
+
+	db, _ := Open("/tmp/filter_paged.db")
+	defer db.Close()
+
+	users, _ := Use[User](db, "users")
+
+	for i := 0; i < 20; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("user%d", i), Age: i})
+	}
+
+	result, err := users.FilterPaged(func(u User) bool {
+		return u.Age >= 10
+	}, 0, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Records) != 5 {
+		t.Errorf("expected 5 records on page, got %d", len(result.Records))
+	}
+	if result.TotalCount != 10 {
+		t.Errorf("expected total 10, got %d", result.TotalCount)
+	}
+	if !result.HasMore {
+		t.Error("expected HasMore=true")
+	}
+
+	result2, err := users.FilterPaged(func(u User) bool {
+		return u.Age >= 10
+	}, 5, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result2.Records) != 5 {
+		t.Errorf("expected 5 records on page 2, got %d", len(result2.Records))
+	}
+	if result2.HasMore {
+		t.Error("expected HasMore=false on last page")
+	}
+}
+
+func TestAutoSync(t *testing.T) {
+	os.Remove("/tmp/autosync.db")
+	defer os.Remove("/tmp/autosync.db")
+
+	db, err := Open("/tmp/autosync.db", OpenOptions{
+		SyncThreshold: 5,
+		IdleThreshold: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	users, _ := Use[User](db, "users")
+	for i := 0; i < 10; i++ {
+		users.Insert(&User{Name: fmt.Sprintf("user%d", i), Age: i})
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	db.Close()
+
+	db2, err := Open("/tmp/autosync.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	users2, _ := Use[User](db2, "users")
+	if users2.Count() < 10 {
+		t.Errorf("expected at least 10 records after auto-sync reopen, got %d", users2.Count())
 	}
 }

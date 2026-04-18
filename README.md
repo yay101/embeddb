@@ -378,7 +378,7 @@ results, _ := users.Filter(func(u User) bool {
 
 ## File Format
 
-- Header: 64 bytes (magic, version, catalog offset, B-tree roots)
+- Header: 128 bytes (magic, version, catalog offset, B-tree roots) — all offsets uint64
 - Records: stored sequentially after header
 - Catalog: table definitions at end of file
 - Primary Index: Persistent B-tree with mmap, Copy-on-Write transactions

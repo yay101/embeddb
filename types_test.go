@@ -826,3 +826,140 @@ func TestSliceOfStructsWithTime(t *testing.T) {
 		t.Errorf("Blocks[0].End: got %v, want %v", got.Blocks[0].End, end1)
 	}
 }
+
+type EveryTypeRecord struct {
+	ID       uint32 `db:"id,primary"`
+	I        int
+	I8       int8
+	I16      int16
+	I32      int32
+	I64      int64
+	U        uint
+	U8       uint8
+	U16      uint16
+	U32      uint32
+	U64      uint64
+	F32      float32
+	F64      float64
+	S        string
+	B        bool
+	Data     []byte
+	StrSlice []string
+	IntSlice []int
+}
+
+func TestEveryTypeRoundTrip(t *testing.T) {
+	os.Remove("/tmp/test_every_type.db")
+	defer os.Remove("/tmp/test_every_type.db")
+
+	db, err := Open("/tmp/test_every_type.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[EveryTypeRecord](db, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &EveryTypeRecord{
+		I:        -42,
+		I8:       -8,
+		I16:      -32768,
+		I32:      -2147483648,
+		I64:      -9223372036854775807,
+		U:        42,
+		U8:       255,
+		U16:      65535,
+		U32:      4294967295,
+		U64:      18446744073709551615,
+		F32:      3.14,
+		F64:      2.718281828,
+		S:        "hello",
+		B:        true,
+		Data:     []byte{0xDE, 0xAD, 0xBE, 0xEF},
+		StrSlice: []string{"a", "b", "c"},
+		IntSlice: []int{1, 2, 3},
+	}
+
+	id, err := tbl.Insert(rec)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	got, err := tbl.Get(id)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if got.I != rec.I {
+		t.Errorf("I: got %d, want %d", got.I, rec.I)
+	}
+	if got.I8 != rec.I8 {
+		t.Errorf("I8: got %d, want %d", got.I8, rec.I8)
+	}
+	if got.I16 != rec.I16 {
+		t.Errorf("I16: got %d, want %d", got.I16, rec.I16)
+	}
+	if got.I32 != rec.I32 {
+		t.Errorf("I32: got %d, want %d", got.I32, rec.I32)
+	}
+	if got.I64 != rec.I64 {
+		t.Errorf("I64: got %d, want %d", got.I64, rec.I64)
+	}
+	if got.U != rec.U {
+		t.Errorf("U: got %d, want %d", got.U, rec.U)
+	}
+	if got.U8 != rec.U8 {
+		t.Errorf("U8: got %d, want %d", got.U8, rec.U8)
+	}
+	if got.U16 != rec.U16 {
+		t.Errorf("U16: got %d, want %d", got.U16, rec.U16)
+	}
+	if got.U32 != rec.U32 {
+		t.Errorf("U32: got %d, want %d", got.U32, rec.U32)
+	}
+	if got.U64 != rec.U64 {
+		t.Errorf("U64: got %d, want %d", got.U64, rec.U64)
+	}
+	if got.F32 != rec.F32 {
+		t.Errorf("F32: got %f, want %f", got.F32, rec.F32)
+	}
+	if got.F64 != rec.F64 {
+		t.Errorf("F64: got %f, want %f", got.F64, rec.F64)
+	}
+	if got.S != rec.S {
+		t.Errorf("S: got %q, want %q", got.S, rec.S)
+	}
+	if got.B != rec.B {
+		t.Errorf("B: got %v, want %v", got.B, rec.B)
+	}
+	if len(got.Data) != len(rec.Data) {
+		t.Errorf("Data: got len %d, want len %d", len(got.Data), len(rec.Data))
+	} else {
+		for i := range got.Data {
+			if got.Data[i] != rec.Data[i] {
+				t.Errorf("Data[%d]: got 0x%02x, want 0x%02x", i, got.Data[i], rec.Data[i])
+			}
+		}
+	}
+	if len(got.StrSlice) != len(rec.StrSlice) {
+		t.Errorf("StrSlice: got len %d, want len %d", len(got.StrSlice), len(rec.StrSlice))
+	} else {
+		for i := range got.StrSlice {
+			if got.StrSlice[i] != rec.StrSlice[i] {
+				t.Errorf("StrSlice[%d]: got %q, want %q", i, got.StrSlice[i], rec.StrSlice[i])
+			}
+		}
+	}
+	if len(got.IntSlice) != len(rec.IntSlice) {
+		t.Errorf("IntSlice: got len %d, want len %d", len(got.IntSlice), len(rec.IntSlice))
+	} else {
+		for i := range got.IntSlice {
+			if got.IntSlice[i] != rec.IntSlice[i] {
+				t.Errorf("IntSlice[%d]: got %d, want %d", i, got.IntSlice[i], rec.IntSlice[i])
+			}
+		}
+	}
+}
