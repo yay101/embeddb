@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbcore"
 	"github.com/yay101/embeddbmmap"
 )
 
@@ -55,7 +55,7 @@ func (db *database) Vacuum() error {
 				return true
 			}
 
-			hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+			hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 			db.readAt(hdrBuf, int64(value))
 
 			if hdrBuf[0] != V2RecordVersion {
@@ -73,11 +73,11 @@ func (db *database) Vacuum() error {
 
 			totalLen := recordTotalSize(hdr)
 
-			if totalLen >= embedcore.RecordHeaderSize+embedcore.RecordFooterSize {
+			if totalLen >= embeddbcore.RecordHeaderSize+embeddbcore.RecordFooterSize {
 				recData := make([]byte, totalLen)
 				copy(recData, hdrBuf)
-				if totalLen > embedcore.RecordHeaderSize {
-					db.readAt(recData[embedcore.RecordHeaderSize:], int64(value)+int64(embedcore.RecordHeaderSize))
+				if totalLen > embeddbcore.RecordHeaderSize {
+					db.readAt(recData[embeddbcore.RecordHeaderSize:], int64(value)+int64(embeddbcore.RecordHeaderSize))
 				}
 
 				if _, err := newFile.Write(recData); err != nil {
@@ -133,9 +133,6 @@ func (db *database) Vacuum() error {
 		vacSize = stat.Size()
 	}
 	db.ensureRegion(pageAlign(vacSize))
-	db.alloc.SetFile(db.file)
-	db.alloc.region.Store(db.region.Load())
-
 	db.index.Close()
 	newIndex, err := db.openBTree(0)
 	if err != nil {

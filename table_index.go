@@ -3,7 +3,7 @@ package embeddb
 import (
 	"bytes"
 
-	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbcore"
 )
 
 func (t *Table[T]) insertSecondaryKeys(record *T, recordID uint32, offset uint64) {
@@ -27,7 +27,7 @@ func (t *Table[T]) insertSecondaryKeys(record *T, recordID uint32, offset uint64
 				if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][field.Name] {
 					continue
 				}
-				key := embedcore.GetFieldAsString(record, field)
+				key := embeddbcore.GetFieldAsString(record, field)
 				if key != "" {
 					secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
 					t.db.index.Insert(secKey, offset)
@@ -41,7 +41,7 @@ func (t *Table[T]) insertSecondaryKeys(record *T, recordID uint32, offset uint64
 			if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][field.Name] {
 				continue
 			}
-			key := embedcore.GetFieldAsString(record, field)
+			key := embeddbcore.GetFieldAsString(record, field)
 			if key != "" {
 				secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
 				t.db.index.Insert(secKey, offset)
@@ -56,7 +56,7 @@ func (t *Table[T]) deleteSecondaryKeys(record *T, recordID uint32, offset uint64
 	}
 	for _, field := range t.layout.Fields {
 		if field.Name != "" && !field.Primary && field.Offset > 0 && !field.IsSlice {
-			key := embedcore.GetFieldAsString(record, field)
+			key := embeddbcore.GetFieldAsString(record, field)
 			if key != "" {
 				secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
 				t.db.index.Delete(secKey)
@@ -110,7 +110,7 @@ func (t *Table[T]) CreateIndex(fieldName string) error {
 		if err != nil {
 			continue
 		}
-		key := embedcore.GetFieldAsString(record, field)
+		key := embeddbcore.GetFieldAsString(record, field)
 		if key != "" {
 			pkVal, _ := t.getPKValue(record)
 			pkBytes := encodePrimaryKey(t.tableID, t.normalizePK(pkVal))

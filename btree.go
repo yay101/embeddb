@@ -144,9 +144,11 @@ func (bt *BTree) newNode(isLeaf bool) (*BTreeNode, error) {
 	}
 
 	r := bt.db.region.Load()
-	regionSize := r.Size()
-	if int64(off)+PageSize > regionSize {
-		return nil, fmt.Errorf("btree newNode: offset %d + PageSize %d > regionSize %d", off, PageSize, regionSize)
+	if r == nil {
+		return nil, fmt.Errorf("btree newNode: region is nil after ensureRegion")
+	}
+	if int64(off)+PageSize > r.Size() {
+		return nil, fmt.Errorf("btree newNode: offset %d + PageSize %d > regionSize %d", off, PageSize, r.Size())
 	}
 
 	buf := make([]byte, PageSize)

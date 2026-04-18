@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"fmt"
 
-	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbcore"
 )
 
-func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.StructLayout) error {
+func migrateTable(db *database, table *tableCatalogEntry, newLayout *embeddbcore.StructLayout) error {
 	type migrateRecord struct {
 		key    []byte
 		offset uint64
@@ -43,7 +43,7 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 	var maxOffset uint64 = FileHeaderSize
 
 	for _, rec := range records {
-		hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+		hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 		if err := db.readAt(hdrBuf, int64(rec.offset)); err != nil {
 			continue
 		}
@@ -63,7 +63,7 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 		totalLen := recordTotalSize(hdr)
 		recData := make([]byte, totalLen)
 		copy(recData, hdrBuf)
-		if err := db.readAt(recData[embedcore.RecordHeaderSize:], int64(rec.offset)+int64(embedcore.RecordHeaderSize)); err != nil {
+		if err := db.readAt(recData[embeddbcore.RecordHeaderSize:], int64(rec.offset)+int64(embeddbcore.RecordHeaderSize)); err != nil {
 			continue
 		}
 
@@ -74,7 +74,7 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 
 		var newPayload []byte
 		for len(payload) > 0 {
-			name, value, remaining, err := embedcore.DecodeTLVField(payload)
+			name, value, remaining, err := embeddbcore.DecodeTLVField(payload)
 			if err != nil {
 				break
 			}
@@ -88,7 +88,7 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 				}
 			}
 			if found {
-				newPayload = embedcore.EncodeTLVField(newPayload, name, value)
+				newPayload = embeddbcore.EncodeTLVField(newPayload, name, value)
 			}
 		}
 
@@ -123,9 +123,9 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embedcore.S
 	}
 
 	for _, pw := range pending {
-		deactivateBuf := make([]byte, embedcore.RecordHeaderSize)
+		deactivateBuf := make([]byte, embeddbcore.RecordHeaderSize)
 		db.readAt(deactivateBuf, int64(pw.oldOffset))
-		deactivateBuf[1] &^= embedcore.FlagsActive
+		deactivateBuf[1] &^= embeddbcore.FlagsActive
 		db.writeAt(deactivateBuf, int64(pw.oldOffset))
 
 		db.index.Insert(pw.key, pw.newOffset)

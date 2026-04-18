@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbcore"
 )
 
 func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
@@ -412,16 +412,16 @@ func valueToIndexKeyReverse(data []byte) string {
 	if len(data) == 0 {
 		return ""
 	}
-	s, _, err := embedcore.DecodeString(data)
+	s, _, err := embeddbcore.DecodeString(data)
 	if err == nil {
 		return s
 	}
 	var buf []byte
-	v, _, err2 := embedcore.DecodeVarint(data)
+	v, _, err2 := embeddbcore.DecodeVarint(data)
 	if err2 == nil {
 		buf = strconv.AppendInt(buf, v, 10)
 	} else {
-		uv, _, err3 := embedcore.DecodeUvarint(data)
+		uv, _, err3 := embeddbcore.DecodeUvarint(data)
 		if err3 == nil {
 			buf = strconv.AppendUint(buf, uv, 10)
 		}
@@ -444,7 +444,7 @@ func (t *Table[T]) filterByField(fieldName string, fn func(interface{}) bool) ([
 		if err != nil {
 			continue
 		}
-		fieldVal, err := embedcore.GetFieldValue(record, field)
+		fieldVal, err := embeddbcore.GetFieldValue(record, field)
 		if err != nil {
 			continue
 		}
@@ -455,7 +455,7 @@ func (t *Table[T]) filterByField(fieldName string, fn func(interface{}) bool) ([
 	return results, nil
 }
 
-func (t *Table[T]) filterPagedByField(field embedcore.FieldOffset, fn func(interface{}) bool, offset, limit int) (*PagedResult[T], error) {
+func (t *Table[T]) filterPagedByField(field embeddbcore.FieldOffset, fn func(interface{}) bool, offset, limit int) (*PagedResult[T], error) {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
 
@@ -468,7 +468,7 @@ func (t *Table[T]) filterPagedByField(field embedcore.FieldOffset, fn func(inter
 		if err != nil {
 			continue
 		}
-		fieldVal, err := embedcore.GetFieldValue(record, field)
+		fieldVal, err := embeddbcore.GetFieldValue(record, field)
 		if err != nil {
 			continue
 		}
@@ -496,13 +496,13 @@ func (t *Table[T]) filterPagedByField(field embedcore.FieldOffset, fn func(inter
 	}, nil
 }
 
-func (t *Table[T]) findField(fieldName string) (embedcore.FieldOffset, error) {
+func (t *Table[T]) findField(fieldName string) (embeddbcore.FieldOffset, error) {
 	for _, f := range t.layout.Fields {
 		if f.Name == fieldName {
 			return f, nil
 		}
 	}
-	return embedcore.FieldOffset{}, fmt.Errorf("field %s not found", fieldName)
+	return embeddbcore.FieldOffset{}, fmt.Errorf("field %s not found", fieldName)
 }
 
 func compareValues(a, b interface{}) int {

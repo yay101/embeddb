@@ -3,7 +3,7 @@ package embeddb
 import (
 	"reflect"
 
-	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbcore"
 )
 
 type scanEntry struct {
@@ -28,16 +28,16 @@ func (t *Table[T]) ScanRecords() *Scanner[T] {
 			var pkVal any
 			switch t.layout.PKType {
 			case reflect.String:
-				s, _, _ := embedcore.DecodeString(pkBytes)
+				s, _, _ := embeddbcore.DecodeString(pkBytes)
 				pkVal = s
 			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-				v, _, _ := embedcore.DecodeVarint(pkBytes)
+				v, _, _ := embeddbcore.DecodeVarint(pkBytes)
 				pkVal = int(v)
 			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-				v, _, _ := embedcore.DecodeUvarint(pkBytes)
+				v, _, _ := embeddbcore.DecodeUvarint(pkBytes)
 				pkVal = uint64(v)
 			default:
-				v, _, _ := embedcore.DecodeUvarint(pkBytes)
+				v, _, _ := embeddbcore.DecodeUvarint(pkBytes)
 				pkVal = uint64(v)
 			}
 			entries = append(entries, scanEntry{pkValue: pkVal})

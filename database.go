@@ -11,7 +11,7 @@ import (
 	"time"
 	"unsafe"
 
-	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbcore"
 	"github.com/yay101/embeddbmmap"
 )
 
@@ -135,8 +135,6 @@ func (db *database) ensureRegion(size int64) error {
 	db.fileTruncatedTo = alignedSize
 	if relocated {
 		db.region.Store(currentRegion)
-		db.alloc.region.Store(currentRegion)
-
 	}
 	return nil
 }
@@ -270,8 +268,6 @@ func openDatabase(filename string, migrate bool, parent *DB) (*database, error) 
 		file.Close()
 		return nil, err
 	}
-	db.alloc.region.Store(db.region.Load())
-
 	db.index, err = db.openBTree(db.indexRoot)
 	if err != nil {
 		unlockFile(file)
@@ -373,10 +369,10 @@ func (db *database) rebuildIndexFromScan() error {
 	skipBuf := make([]byte, 4096)
 
 	offset := int64(FileHeaderSize)
-	for offset < scanLimit-embedcore.RecordHeaderSize {
-		hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	for offset < scanLimit-embeddbcore.RecordHeaderSize {
+		hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 		n, err := db.file.ReadAt(hdrBuf, offset)
-		if err != nil || n < embedcore.RecordHeaderSize {
+		if err != nil || n < embeddbcore.RecordHeaderSize {
 			offset++
 			continue
 		}
@@ -411,14 +407,14 @@ func (db *database) rebuildIndexFromScan() error {
 
 		totalLen := recordTotalSize(hdr)
 
-		if totalLen < embedcore.RecordHeaderSize+embedcore.RecordFooterSize || offset+int64(totalLen) > fileSize {
+		if totalLen < embeddbcore.RecordHeaderSize+embeddbcore.RecordFooterSize || offset+int64(totalLen) > fileSize {
 			offset++
 			continue
 		}
 
 		recData := make([]byte, totalLen)
 		copy(recData, hdrBuf)
-		db.readAt(recData[embedcore.RecordHeaderSize:], offset+int64(embedcore.RecordHeaderSize))
+		db.readAt(recData[embeddbcore.RecordHeaderSize:], offset+int64(embeddbcore.RecordHeaderSize))
 
 		_, _, parseErr := parseV2Record(recData)
 		if parseErr != nil {
@@ -443,11 +439,11 @@ func (db *database) rebuildIndexFromScan() error {
 				db.index.Insert(verKey, uint64(offset))
 			}
 
-			payloadEnd := totalLen - embedcore.RecordFooterSize
-			if payloadEnd > embedcore.RecordHeaderSize {
-				payload := recData[embedcore.RecordHeaderSize:payloadEnd]
+			payloadEnd := totalLen - embeddbcore.RecordFooterSize
+			if payloadEnd > embeddbcore.RecordHeaderSize {
+				payload := recData[embeddbcore.RecordHeaderSize:payloadEnd]
 				for len(payload) > 0 {
-					fieldName, fieldValue, remaining, err := embedcore.DecodeTLVField(payload)
+					fieldName, fieldValue, remaining, err := embeddbcore.DecodeTLVField(payload)
 					if err != nil {
 						break
 					}
@@ -594,7 +590,7 @@ func (db *database) flush() error {
 	updatedOffsets := make(map[string]uint64)
 
 	for _, rec := range records {
-		hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+		hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 		if err := db.readAt(hdrBuf, int64(rec.offset)); err != nil {
 			return fmt.Errorf("failed to read record at offset %d: %w", rec.offset, err)
 		}
@@ -611,8 +607,8 @@ func (db *database) flush() error {
 
 		recData := make([]byte, totalLen)
 		copy(recData, hdrBuf)
-		if totalLen > embedcore.RecordHeaderSize {
-			db.readAt(recData[embedcore.RecordHeaderSize:], int64(rec.offset)+int64(embedcore.RecordHeaderSize))
+		if totalLen > embeddbcore.RecordHeaderSize {
+			db.readAt(recData[embeddbcore.RecordHeaderSize:], int64(rec.offset)+int64(embeddbcore.RecordHeaderSize))
 		}
 
 		compacted = append(compacted, compactedRecord{
@@ -644,8 +640,6 @@ func (db *database) flush() error {
 	db.file.Sync()
 
 	db.alloc.Reset(btreeStart, nil)
-	db.alloc.SetFile(db.file)
-	db.alloc.region.Store(db.region.Load())
 
 	newIndex, err := db.openBTree(0)
 	if err != nil {

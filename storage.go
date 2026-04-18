@@ -6,7 +6,6 @@ import (
 	"hash/crc32"
 	"os"
 	"sync"
-	"sync/atomic"
 
 	"github.com/yay101/embeddbmmap"
 )
@@ -16,53 +15,30 @@ func pageAlign(n int64) int64 {
 	return ((n + ps - 1) / ps) * ps
 }
 
-// allocator manages free space in the database file.
 type allocator struct {
-	file        *os.File
-	region      atomic.Pointer[embeddbmmap.MappedRegion]
-	nextOffset  uint64
-	freeList    []freeBlock
-	actualSize  uint64
-	truncatedTo uint64
-	mu          sync.Mutex
+	nextOffset uint64
+	freeList   []freeBlock
+	actualSize uint64
+	mu         sync.Mutex
 }
 
-// freeBlock represents a free region in the file.
 type freeBlock struct {
 	offset uint64
 	length uint64
 }
 
-// newAllocator creates a new allocator for the given file.
 func newAllocator(file *os.File) *allocator {
-	info, _ := file.Stat()
 	sz := uint64(0)
-	if info != nil {
+	if info, err := file.Stat(); err == nil {
 		sz = uint64(info.Size())
 	}
 	return &allocator{
-		file:        file,
-		nextOffset:  4096,
-		freeList:    nil,
-		actualSize:  sz,
-		truncatedTo: sz,
+		nextOffset: 4096,
+		freeList:   nil,
+		actualSize: sz,
 	}
 }
 
-// SetFile updates the allocator to use a new file handle (after file reopen).
-func (a *allocator) SetFile(file *os.File) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.file = file
-	info, _ := file.Stat()
-	if info != nil {
-		a.actualSize = uint64(info.Size())
-		a.truncatedTo = a.actualSize
-	}
-}
-
-// Allocate returns a free region of at least size bytes.
-// It prefers to reuse a free block; if none is large enough, it extends the file.
 func (a *allocator) Allocate(size uint64) (offset uint64, length uint64, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -80,47 +56,6 @@ func (a *allocator) Allocate(size uint64) (offset uint64, length uint64, err err
 	offset = a.actualSize
 	a.actualSize += size
 	a.nextOffset = a.actualSize
-	if r := a.region.Load(); r != nil {
-		r.RLock()
-		regionSize := r.Size()
-		r.RUnlock()
-		needed := pageAlign(int64(a.actualSize))
-		if uint64(needed) > uint64(regionSize) {
-			growBy := uint64(needed) - uint64(regionSize) + 4*1024*1024
-			newSize := uint64(regionSize) + growBy
-			a.mu.Unlock()
-			if err := a.file.Truncate(int64(newSize)); err != nil {
-				a.mu.Lock()
-				a.actualSize = offset
-				a.nextOffset = offset
-				return 0, 0, fmt.Errorf("allocate: truncate failed: %w", err)
-			}
-			a.mu.Lock()
-			a.truncatedTo = newSize
-			relocated, err := r.Resize(int64(newSize))
-			if err != nil {
-				a.actualSize = offset
-				a.nextOffset = offset
-				return 0, 0, fmt.Errorf("allocate: mmap resize failed: %w", err)
-			}
-			if relocated {
-				a.region.Store(r)
-			}
-		} else {
-			minFile := uint64(needed)
-			if uint64(regionSize) > minFile {
-				minFile = uint64(regionSize)
-			}
-			if minFile > a.truncatedTo {
-				if err := a.file.Truncate(int64(minFile)); err != nil {
-					a.actualSize = offset
-					a.nextOffset = offset
-					return 0, 0, fmt.Errorf("allocate: truncate to %d failed: %w", minFile, err)
-				}
-				a.truncatedTo = minFile
-			}
-		}
-	}
 	return offset, size, nil
 }
 

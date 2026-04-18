@@ -3,8 +3,6 @@ package embeddb
 import (
 	"os"
 	"testing"
-
-	"github.com/yay101/embeddbmmap"
 )
 
 func TestAllocateBasic(t *testing.T) {
@@ -84,33 +82,6 @@ func TestAllocateFreesCoalesce(t *testing.T) {
 	f.Close()
 }
 
-func TestAllocateTruncateError(t *testing.T) {
-	f, err := os.CreateTemp("", "alloc_trunc_*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	filename := f.Name()
-	defer os.Remove(filename)
-
-	f.Truncate(4096)
-
-	a := newAllocator(f)
-
-	region, err := embeddbmmap.Map(int(f.Fd()), 0, 4096, embeddbmmap.ProtRead|embeddbmmap.ProtWrite, embeddbmmap.MapShared)
-	if err != nil {
-		t.Skipf("mmap not available: %v", err)
-	}
-	a.region.Store(region)
-
-	f.Close()
-	os.Remove(f.Name())
-
-	_, _, err = a.Allocate(1024 * 1024)
-	if err == nil {
-		t.Error("expected allocate to fail when file backing mmap is deleted")
-	}
-}
-
 func TestAllocateFromFreeList(t *testing.T) {
 	f, err := os.CreateTemp("", "alloc_freelist_*.db")
 	if err != nil {
@@ -145,35 +116,6 @@ func TestAllocateFromFreeList(t *testing.T) {
 	}
 
 	f.Close()
-}
-
-func TestAllocateRollbackOnTruncateFail(t *testing.T) {
-	f, err := os.CreateTemp("", "alloc_rollback_*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	filename := f.Name()
-	defer os.Remove(filename)
-
-	f.Truncate(4096)
-	a := newAllocator(f)
-
-	region, err := embeddbmmap.Map(int(f.Fd()), 0, 4096, embeddbmmap.ProtRead|embeddbmmap.ProtWrite, embeddbmmap.MapShared)
-	if err != nil {
-		t.Skipf("mmap not available: %v", err)
-	}
-	a.region.Store(region)
-
-	a.Allocate(100)
-	_ = a.CopyFreeList()
-
-	f.Close()
-	os.Remove(f.Name())
-
-	_, _, err = a.Allocate(8 * 1024 * 1024)
-	if err == nil {
-		t.Fatal("expected error from allocate after file removed")
-	}
 }
 
 func TestAllocateExactFitFreeBlock(t *testing.T) {

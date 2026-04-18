@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbcore"
 )
 
 func (t *Table[T]) Insert(record *T) (uint32, error) {
@@ -29,7 +29,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		}
 	}
 
-	recordBuf, err := t.encodeRecord(record, recordID, embedcore.FlagsActive, 0)
+	recordBuf, err := t.encodeRecord(record, recordID, embeddbcore.FlagsActive, 0)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode record: %w", err)
 	}
@@ -97,7 +97,7 @@ func (t *Table[T]) isZeroPK(val any) bool {
 func (t *Table[T]) setPKValue(record *T, val any) {
 	for _, field := range t.layout.Fields {
 		if field.Primary {
-			embedcore.SetFieldValue(record, field, val)
+			embeddbcore.SetFieldValue(record, field, val)
 			return
 		}
 	}
@@ -106,7 +106,7 @@ func (t *Table[T]) setPKValue(record *T, val any) {
 func (t *Table[T]) getPKValue(record *T) (any, error) {
 	for _, field := range t.layout.Fields {
 		if field.Primary {
-			val, err := embedcore.GetFieldValue(record, field)
+			val, err := embeddbcore.GetFieldValue(record, field)
 			if err != nil {
 				return nil, err
 			}
@@ -145,7 +145,7 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 		return nil, fmt.Errorf("record not found")
 	}
 
-	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 		return nil, fmt.Errorf("failed to read record header: %w", err)
 	}
@@ -175,7 +175,7 @@ func (t *Table[T]) ListVersions(id any) ([]VersionMetadata, error) {
 		return nil, fmt.Errorf("record not found")
 	}
 
-	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 		return nil, fmt.Errorf("failed to read record header: %w", err)
 	}
@@ -207,7 +207,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 		return fmt.Errorf("record not found")
 	}
 
-	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 		return fmt.Errorf("failed to read record for update: %w", err)
 	}
@@ -226,7 +226,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 	totalLen := recordTotalSize(hdr)
 	oldRecordBuf := make([]byte, totalLen)
 	copy(oldRecordBuf, hdrBuf)
-	if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
+	if err := t.db.readAt(oldRecordBuf[embeddbcore.RecordHeaderSize:], int64(offset)+int64(embeddbcore.RecordHeaderSize)); err != nil {
 		return fmt.Errorf("failed to read old record data: %w", err)
 	}
 
@@ -235,10 +235,10 @@ func (t *Table[T]) Update(id any, record *T) error {
 
 	t.deleteSecondaryKeys(&oldRecord, recordID, offset)
 
-	var flags byte = embedcore.FlagsActive
+	var flags byte = embeddbcore.FlagsActive
 	var prevVersionOff uint64
 	if t.maxVersions > 0 {
-		flags |= embedcore.FlagsHasPrevVersion
+		flags |= embeddbcore.FlagsHasPrevVersion
 		prevVersionOff = offset
 	}
 
@@ -321,7 +321,7 @@ func (t *Table[T]) Delete(id any) error {
 	}
 
 	var recordID uint32
-	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 		return fmt.Errorf("failed to read record header: %w", err)
 	}
@@ -332,7 +332,7 @@ func (t *Table[T]) Delete(id any) error {
 			totalLen := recordTotalSize(hdr)
 			oldRecordBuf := make([]byte, totalLen)
 			copy(oldRecordBuf, hdrBuf)
-			if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
+			if err := t.db.readAt(oldRecordBuf[embeddbcore.RecordHeaderSize:], int64(offset)+int64(embeddbcore.RecordHeaderSize)); err != nil {
 				return fmt.Errorf("failed to read record data: %w", err)
 			}
 
@@ -385,7 +385,7 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 			continue
 		}
 
-		hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+		hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 		if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 		}
 		if hdrBuf[0] == V2RecordVersion {
@@ -394,7 +394,7 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 				totalLen := recordTotalSize(hdr)
 				oldRecordBuf := make([]byte, totalLen)
 				copy(oldRecordBuf, hdrBuf)
-				if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
+				if err := t.db.readAt(oldRecordBuf[embeddbcore.RecordHeaderSize:], int64(offset)+int64(embeddbcore.RecordHeaderSize)); err != nil {
 					continue
 				}
 
@@ -489,7 +489,7 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 		}
 	}
 
-	recordBuf, err := t.encodeRecord(record, recordID, embedcore.FlagsActive, 0)
+	recordBuf, err := t.encodeRecord(record, recordID, embeddbcore.FlagsActive, 0)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode record: %w", err)
 	}
@@ -527,7 +527,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 
 	oldOffset := offset
 
-	hdrBuf := make([]byte, embedcore.RecordHeaderSize)
+	hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 	if err := t.db.readAt(hdrBuf, int64(oldOffset)); err != nil {
 		return fmt.Errorf("failed to read record header at offset %d: %w", oldOffset, err)
 	}
@@ -542,7 +542,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	totalLen := recordTotalSize(hdr)
 	oldRecordBuf := make([]byte, totalLen)
 	copy(oldRecordBuf, hdrBuf)
-	if err := t.db.readAt(oldRecordBuf[embedcore.RecordHeaderSize:], int64(oldOffset)+int64(embedcore.RecordHeaderSize)); err != nil {
+	if err := t.db.readAt(oldRecordBuf[embeddbcore.RecordHeaderSize:], int64(oldOffset)+int64(embeddbcore.RecordHeaderSize)); err != nil {
 		return fmt.Errorf("failed to read old record data: %w", err)
 	}
 
@@ -551,10 +551,10 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 
 	t.deleteSecondaryKeys(&oldRecord, recordID, oldOffset)
 
-	var flags byte = embedcore.FlagsActive
+	var flags byte = embeddbcore.FlagsActive
 	var prevVersionOff uint64
 	if t.maxVersions > 0 {
-		flags |= embedcore.FlagsHasPrevVersion
+		flags |= embeddbcore.FlagsHasPrevVersion
 		prevVersionOff = oldOffset
 	}
 
@@ -631,7 +631,7 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 
 	t.setPKValue(record, t.normalizePK(id))
 
-	recordBuf, err := t.encodeRecord(record, recordID, embedcore.FlagsActive, 0)
+	recordBuf, err := t.encodeRecord(record, recordID, embeddbcore.FlagsActive, 0)
 	if err != nil {
 		return 0, true, fmt.Errorf("failed to encode record: %w", err)
 	}

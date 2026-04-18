@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbcore"
 )
 
 const (
@@ -60,7 +60,7 @@ func encodeSecondaryKey(tableID uint8, fieldName string, fieldValue any, recordI
 	key := (*bp)[:0]
 	key = append(key, indexNSSecondary)
 	key = append(key, tableID)
-	key = embedcore.EncodeUvarint(key, uint64(len(fieldName)))
+	key = embeddbcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
 	key = append(key, truncIndexValue(encodeIndexValueBytes(fieldValue))...)
 	key = binary.BigEndian.AppendUint32(key, recordID)
@@ -76,7 +76,7 @@ func encodeSecondaryKeyPrefix(tableID uint8, fieldName string) []byte {
 	prefix := (*bp)[:0]
 	prefix = append(prefix, indexNSSecondary)
 	prefix = append(prefix, tableID)
-	prefix = embedcore.EncodeUvarint(prefix, uint64(len(fieldName)))
+	prefix = embeddbcore.EncodeUvarint(prefix, uint64(len(fieldName)))
 	prefix = append(prefix, fieldName...)
 	out := make([]byte, len(prefix))
 	copy(out, prefix)
@@ -90,7 +90,7 @@ func encodeSecondaryKeyPrefixWithValue(tableID uint8, fieldName string, fieldVal
 	key := (*bp)[:0]
 	key = append(key, indexNSSecondary)
 	key = append(key, tableID)
-	key = embedcore.EncodeUvarint(key, uint64(len(fieldName)))
+	key = embeddbcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
 	key = append(key, truncIndexValue(encodeIndexValueBytes(fieldValue))...)
 	out := make([]byte, len(key))
@@ -106,7 +106,7 @@ func encodeSecondaryKeyEndPrefix(tableID uint8, fieldName string) []byte {
 	key = append(key, indexNSSecondary)
 	nextID := tableID + 1
 	key = append(key, nextID)
-	key = embedcore.EncodeUvarint(key, uint64(len(fieldName)))
+	key = embeddbcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
 	out := make([]byte, len(key))
 	copy(out, key)
@@ -120,7 +120,7 @@ func encodeVersionKeyPrefix(tableID uint8, recordID uint32) []byte {
 	key := (*bp)[:0]
 	key = append(key, indexNSVersion)
 	key = append(key, tableID)
-	key = embedcore.EncodeUvarint(key, uint64(recordID))
+	key = embeddbcore.EncodeUvarint(key, uint64(recordID))
 	out := make([]byte, len(key))
 	copy(out, key)
 	*bp = key
@@ -133,8 +133,8 @@ func encodeVersionKey(tableID uint8, recordID uint32, version uint32) []byte {
 	key := (*bp)[:0]
 	key = append(key, indexNSVersion)
 	key = append(key, tableID)
-	key = embedcore.EncodeUvarint(key, uint64(recordID))
-	key = embedcore.EncodeUvarint(key, uint64(version))
+	key = embeddbcore.EncodeUvarint(key, uint64(recordID))
+	key = embeddbcore.EncodeUvarint(key, uint64(version))
 	out := make([]byte, len(key))
 	copy(out, key)
 	*bp = key
@@ -193,38 +193,38 @@ func parseVersionKey(key []byte) (tableID uint8, recordID uint32, version uint32
 func encodeIndexValue(buf []byte, value any) []byte {
 	switch v := value.(type) {
 	case int:
-		return embedcore.EncodeVarint(buf, int64(v))
+		return embeddbcore.EncodeVarint(buf, int64(v))
 	case int8:
-		return embedcore.EncodeVarint(buf, int64(v))
+		return embeddbcore.EncodeVarint(buf, int64(v))
 	case int16:
-		return embedcore.EncodeVarint(buf, int64(v))
+		return embeddbcore.EncodeVarint(buf, int64(v))
 	case int32:
-		return embedcore.EncodeVarint(buf, int64(v))
+		return embeddbcore.EncodeVarint(buf, int64(v))
 	case int64:
-		return embedcore.EncodeVarint(buf, v)
+		return embeddbcore.EncodeVarint(buf, v)
 	case uint:
-		return embedcore.EncodeUvarint(buf, uint64(v))
+		return embeddbcore.EncodeUvarint(buf, uint64(v))
 	case uint8:
-		return embedcore.EncodeUvarint(buf, uint64(v))
+		return embeddbcore.EncodeUvarint(buf, uint64(v))
 	case uint16:
-		return embedcore.EncodeUvarint(buf, uint64(v))
+		return embeddbcore.EncodeUvarint(buf, uint64(v))
 	case uint32:
-		return embedcore.EncodeUvarint(buf, uint64(v))
+		return embeddbcore.EncodeUvarint(buf, uint64(v))
 	case uint64:
-		return embedcore.EncodeUvarint(buf, v)
+		return embeddbcore.EncodeUvarint(buf, v)
 	case float32:
-		return embedcore.EncodeUvarint(buf, uint64(math.Float64bits(float64(v))))
+		return embeddbcore.EncodeUvarint(buf, uint64(math.Float64bits(float64(v))))
 	case float64:
-		return embedcore.EncodeUvarint(buf, uint64(math.Float64bits(v)))
+		return embeddbcore.EncodeUvarint(buf, uint64(math.Float64bits(v)))
 	case string:
-		return embedcore.EncodeString(buf, v)
+		return embeddbcore.EncodeString(buf, v)
 	case bool:
 		if v {
-			return embedcore.EncodeUvarint(buf, 1)
+			return embeddbcore.EncodeUvarint(buf, 1)
 		}
-		return embedcore.EncodeUvarint(buf, 0)
+		return embeddbcore.EncodeUvarint(buf, 0)
 	case time.Time:
-		return embedcore.EncodeVarint(buf, v.UnixNano())
+		return embeddbcore.EncodeVarint(buf, v.UnixNano())
 	}
-	return embedcore.EncodeUvarint(buf, 0)
+	return embeddbcore.EncodeUvarint(buf, 0)
 }

@@ -378,13 +378,14 @@ results, _ := users.Filter(func(u User) bool {
 
 ## File Format
 
-- Header: 128 bytes (magic, version, catalog offset, B-tree roots) — all offsets uint64
-- Records: stored sequentially after header
+- Header: 128 bytes (magic, version, catalog offset, B-tree roots)
+- Records: TLV-encoded with CRC verification, stored sequentially after header
 - Catalog: table definitions at end of file
 - Primary Index: Persistent B-tree with mmap, Copy-on-Write transactions
-- Secondary Indexes: In-memory maps with automatic recovery
-- B-tree nodes: 4096 bytes per node, LRU cache (2048 nodes)
-- 51+ bytes per record overhead + field data
+- Secondary Indexes: Persistent B-tree indexes with automatic recovery
+- Version Index: B-tree tracking record version history
+- B-tree nodes: 4096 bytes per node, LRU cache with configurable size
+- Record IDs: uint32 (4 bytes) in secondary key suffix for compact storage
 
 ## Why EmbedDB?
 

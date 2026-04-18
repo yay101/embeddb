@@ -9,13 +9,13 @@ import (
 	"sync"
 	"time"
 
-	embedcore "github.com/yay101/embeddbcore"
+	"github.com/yay101/embeddbcore"
 	"github.com/yay101/embeddbmmap"
 )
 
 var hdrBufPool = sync.Pool{
 	New: func() any {
-		return make([]byte, embedcore.RecordHeaderSize)
+		return make([]byte, embeddbcore.RecordHeaderSize)
 	},
 }
 
@@ -24,27 +24,27 @@ func encodePKForIndex(tableID uint8, pkValue any) []byte {
 	key = append(key, tableID)
 	switch v := pkValue.(type) {
 	case int:
-		key = embedcore.EncodeUvarint(key, uint64(int64(v)))
+		key = embeddbcore.EncodeUvarint(key, uint64(int64(v)))
 	case int8:
-		key = embedcore.EncodeUvarint(key, uint64(int64(v)))
+		key = embeddbcore.EncodeUvarint(key, uint64(int64(v)))
 	case int16:
-		key = embedcore.EncodeUvarint(key, uint64(int64(v)))
+		key = embeddbcore.EncodeUvarint(key, uint64(int64(v)))
 	case int32:
-		key = embedcore.EncodeUvarint(key, uint64(int64(v)))
+		key = embeddbcore.EncodeUvarint(key, uint64(int64(v)))
 	case int64:
-		key = embedcore.EncodeUvarint(key, uint64(v))
+		key = embeddbcore.EncodeUvarint(key, uint64(v))
 	case uint:
-		key = embedcore.EncodeUvarint(key, uint64(v))
+		key = embeddbcore.EncodeUvarint(key, uint64(v))
 	case uint8:
-		key = embedcore.EncodeUvarint(key, uint64(v))
+		key = embeddbcore.EncodeUvarint(key, uint64(v))
 	case uint16:
-		key = embedcore.EncodeUvarint(key, uint64(v))
+		key = embeddbcore.EncodeUvarint(key, uint64(v))
 	case uint32:
-		key = embedcore.EncodeUvarint(key, uint64(v))
+		key = embeddbcore.EncodeUvarint(key, uint64(v))
 	case uint64:
-		key = embedcore.EncodeUvarint(key, v)
+		key = embeddbcore.EncodeUvarint(key, v)
 	case string:
-		key = embedcore.EncodeString(key, v)
+		key = embeddbcore.EncodeString(key, v)
 	}
 	return key
 }
@@ -389,9 +389,9 @@ func resolveTableName[T any](name ...string) string {
 	return t.String()
 }
 
-func computeLayout[T any]() *embedcore.StructLayout {
+func computeLayout[T any]() *embeddbcore.StructLayout {
 	var instance T
-	layout, _ := embedcore.ComputeStructLayout(instance)
+	layout, _ := embeddbcore.ComputeStructLayout(instance)
 	return layout
 }
 
@@ -399,7 +399,7 @@ type Table[T any] struct {
 	db          *database
 	name        string
 	tableID     uint8
-	layout      *embedcore.StructLayout
+	layout      *embeddbcore.StructLayout
 	maxVersions uint8
 }
 
@@ -407,7 +407,7 @@ func (t *Table[T]) deactivateRecord(offset uint64) {
 	deactivateBuf := hdrBufPool.Get().([]byte)
 	defer hdrBufPool.Put(deactivateBuf)
 	t.db.readAt(deactivateBuf, int64(offset))
-	deactivateBuf[1] &^= embedcore.FlagsActive
+	deactivateBuf[1] &^= embeddbcore.FlagsActive
 	t.db.writeAt(deactivateBuf, int64(offset))
 }
 
@@ -551,11 +551,11 @@ func (t *Table[T]) readRecordAt(offset uint64) (*T, error) {
 
 	totalLen := recordTotalSize(hdr)
 	recordBuf := make([]byte, totalLen)
-	copy(recordBuf[:embedcore.RecordHeaderSize], hdrBuf[:embedcore.RecordHeaderSize])
+	copy(recordBuf[:embeddbcore.RecordHeaderSize], hdrBuf[:embeddbcore.RecordHeaderSize])
 	hdrBufPool.Put(hdrBuf)
 
-	if totalLen > embedcore.RecordHeaderSize {
-		if err := t.db.readAt(recordBuf[embedcore.RecordHeaderSize:], int64(offset)+int64(embedcore.RecordHeaderSize)); err != nil {
+	if totalLen > embeddbcore.RecordHeaderSize {
+		if err := t.db.readAt(recordBuf[embeddbcore.RecordHeaderSize:], int64(offset)+int64(embeddbcore.RecordHeaderSize)); err != nil {
 			return nil, fmt.Errorf("failed to read record data at offset %d: %w", offset, err)
 		}
 	}
