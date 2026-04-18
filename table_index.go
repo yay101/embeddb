@@ -6,7 +6,7 @@ import (
 	embedcore "github.com/yay101/embeddbcore"
 )
 
-func (t *Table[T]) insertSecondaryKeys(record *T, offset uint64) {
+func (t *Table[T]) insertSecondaryKeys(record *T, recordID uint32, offset uint64) {
 	if t.db.parent == nil {
 		return
 	}
@@ -29,7 +29,7 @@ func (t *Table[T]) insertSecondaryKeys(record *T, offset uint64) {
 				}
 				key := embedcore.GetFieldAsString(record, field)
 				if key != "" {
-					secKey := encodeSecondaryKey(t.tableID, field.Name, key, offset)
+					secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
 					t.db.index.Insert(secKey, offset)
 				}
 			}
@@ -43,14 +43,14 @@ func (t *Table[T]) insertSecondaryKeys(record *T, offset uint64) {
 			}
 			key := embedcore.GetFieldAsString(record, field)
 			if key != "" {
-				secKey := encodeSecondaryKey(t.tableID, field.Name, key, offset)
+				secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
 				t.db.index.Insert(secKey, offset)
 			}
 		}
 	}
 }
 
-func (t *Table[T]) deleteSecondaryKeys(record *T, offset uint64) {
+func (t *Table[T]) deleteSecondaryKeys(record *T, recordID uint32, offset uint64) {
 	if t.db.parent == nil || !t.db.parent.autoIndex {
 		return
 	}
@@ -58,7 +58,7 @@ func (t *Table[T]) deleteSecondaryKeys(record *T, offset uint64) {
 		if field.Name != "" && !field.Primary && field.Offset > 0 && !field.IsSlice {
 			key := embedcore.GetFieldAsString(record, field)
 			if key != "" {
-				secKey := encodeSecondaryKey(t.tableID, field.Name, key, offset)
+				secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
 				t.db.index.Delete(secKey)
 			}
 		}
@@ -113,11 +113,16 @@ func (t *Table[T]) CreateIndex(fieldName string) error {
 		key := embedcore.GetFieldAsString(record, field)
 		if key != "" {
 			pkVal, _ := t.getPKValue(record)
-			offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(pkVal)))
+			pkBytes := encodePrimaryKey(t.tableID, t.normalizePK(pkVal))
+			offset, err := t.db.index.Get(pkBytes)
 			if err != nil {
 				continue
 			}
-			secKey := encodeSecondaryKey(t.tableID, fieldName, key, offset)
+			recordID, err := t.getRecordIDAt(offset)
+			if err != nil {
+				continue
+			}
+			secKey := encodeSecondaryKey(t.tableID, fieldName, key, recordID)
 			t.db.index.Insert(secKey, offset)
 		}
 	}

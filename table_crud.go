@@ -56,7 +56,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		entry.RecordCount++
 	}
 
-	t.insertSecondaryKeys(record, offset)
+	t.insertSecondaryKeys(record, recordID, offset)
 
 	t.db.autoSync()
 
@@ -233,7 +233,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 	var oldRecord T
 	t.decodeRecord(oldRecordBuf, &oldRecord)
 
-	t.deleteSecondaryKeys(&oldRecord, offset)
+	t.deleteSecondaryKeys(&oldRecord, recordID, offset)
 
 	var flags byte = embedcore.FlagsActive
 	var prevVersionOff uint64
@@ -302,7 +302,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 
 	t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset)
 
-	t.insertSecondaryKeys(record, newOffset)
+	t.insertSecondaryKeys(record, recordID, newOffset)
 
 	t.db.autoSync()
 
@@ -339,7 +339,7 @@ func (t *Table[T]) Delete(id any) error {
 			var oldRecord T
 			t.decodeRecord(oldRecordBuf, &oldRecord)
 
-			t.deleteSecondaryKeys(&oldRecord, offset)
+			t.deleteSecondaryKeys(&oldRecord, recordID, offset)
 		}
 	}
 
@@ -401,7 +401,7 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 				var oldRecord T
 				t.decodeRecord(oldRecordBuf, &oldRecord)
 
-				t.deleteSecondaryKeys(&oldRecord, offset)
+				t.deleteSecondaryKeys(&oldRecord, hdr.RecordID, offset)
 			}
 		}
 
@@ -514,7 +514,7 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 		entry.RecordCount++
 	}
 
-	t.insertSecondaryKeys(record, offset)
+	t.insertSecondaryKeys(record, recordID, offset)
 
 	return recordID, nil
 }
@@ -549,7 +549,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	var oldRecord T
 	t.decodeRecord(oldRecordBuf, &oldRecord)
 
-	t.deleteSecondaryKeys(&oldRecord, oldOffset)
+	t.deleteSecondaryKeys(&oldRecord, recordID, oldOffset)
 
 	var flags byte = embedcore.FlagsActive
 	var prevVersionOff uint64
@@ -603,7 +603,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 
 	t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset)
 
-	t.insertSecondaryKeys(record, newOffset)
+	t.insertSecondaryKeys(record, recordID, newOffset)
 
 	return nil
 }
@@ -647,7 +647,7 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	pkVal, _ := t.getPKValue(record)
 	t.db.index.Insert(encodePrimaryKey(t.tableID, pkVal), offset)
 
-	t.insertSecondaryKeys(record, offset)
+	t.insertSecondaryKeys(record, recordID, offset)
 
 	if t.db.tx != nil {
 		t.db.tx.recordCounts[t.name]++

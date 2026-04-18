@@ -616,3 +616,17 @@ func (t *Table[T]) Drop() error {
 
 	return nil
 }
+
+func (t *Table[T]) getRecordIDAt(offset uint64) (uint32, error) {
+	hdrBuf := hdrBufPool.Get().([]byte)
+	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
+		hdrBufPool.Put(hdrBuf)
+		return 0, fmt.Errorf("failed to read record header: %w", err)
+	}
+	hdr, err := decodeRecordHeader(hdrBuf)
+	hdrBufPool.Put(hdrBuf)
+	if err != nil {
+		return 0, fmt.Errorf("invalid record header: %w", err)
+	}
+	return hdr.RecordID, nil
+}

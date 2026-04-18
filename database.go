@@ -457,7 +457,7 @@ func (db *database) rebuildIndexFromScan() error {
 						continue
 					}
 
-					secKey := encodeSecondaryKey(hdr.TableID, fieldName, fieldValue, uint64(offset))
+					secKey := encodeSecondaryKey(hdr.TableID, fieldName, fieldValue, hdr.RecordID)
 					db.index.Insert(secKey, uint64(offset))
 				}
 			}

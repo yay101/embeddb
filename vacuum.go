@@ -176,18 +176,7 @@ func (db *database) Vacuum() error {
 			if !ok {
 				return true
 			}
-			_, _, _, oldRecordOffset, parsed := parseSecondaryKey(key)
-			if !parsed {
-				return true
-			}
-			newRecordOffset, ok := offsetMap[oldRecordOffset]
-			if !ok {
-				return true
-			}
-			newKey := make([]byte, len(key))
-			copy(newKey, key)
-			binary.BigEndian.PutUint64(newKey[len(newKey)-8:], newRecordOffset)
-			newIndex.Insert(newKey, newValue)
+			newIndex.Insert(key, newValue)
 			return true
 		})
 	}
