@@ -187,6 +187,34 @@ func (a *allocator) Reset(nextOffset uint64, freeList []freeBlock) {
 	}
 }
 
+// Snapshot returns a snapshot of the allocator state that can be restored later.
+func (a *allocator) Snapshot() allocatorSnapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	freeListCopy := make([]freeBlock, len(a.freeList))
+	copy(freeListCopy, a.freeList)
+	return allocatorSnapshot{
+		nextOffset: a.nextOffset,
+		actualSize: a.actualSize,
+		freeList:   freeListCopy,
+	}
+}
+
+// Restore restores the allocator to a previously saved snapshot.
+func (a *allocator) Restore(snap allocatorSnapshot) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.nextOffset = snap.nextOffset
+	a.actualSize = snap.actualSize
+	a.freeList = snap.freeList
+}
+
+type allocatorSnapshot struct {
+	nextOffset uint64
+	actualSize uint64
+	freeList   []freeBlock
+}
+
 // Save writes the free list to the file at the given offset.
 func (a *allocator) Save(file *os.File, offset int64) error {
 	a.mu.Lock()

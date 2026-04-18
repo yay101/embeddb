@@ -337,12 +337,24 @@ func TestTransactionRollbackWithBTree(t *testing.T) {
 		t.Errorf("expected 1 record after rollback, got %d", count)
 	}
 
-	// Note: Rollback without CoW doesn't fully remove records yet.
-	// This test documents current behavior. Full rollback requires CoW implementation.
-	// _, err = tbl.Get(2)
-	// if err == nil {
-	// 	t.Error("expected error getting rolled back record")
-	// }
+	// Verify the original record is still accessible
+	rec, err := tbl.Get(1)
+	if err != nil {
+		t.Fatalf("expected to get record ID 1, got error: %v", err)
+	}
+	if rec.Name != "Alice" {
+		t.Errorf("expected Name=Alice, got %s", rec.Name)
+	}
+
+	// Verify allocator was restored — inserting a new record should work
+	// and reuse the rolled-back record ID since NextRecordID is restored
+	newID, err := tbl.Insert(&User{ID: 0, Name: "Dave", Age: 28})
+	if err != nil {
+		t.Fatalf("expected insert after rollback to succeed, got: %v", err)
+	}
+	if newID < 2 {
+		t.Errorf("expected ID >= 2, got %d", newID)
+	}
 }
 
 func TestVacuumDuringWrites(t *testing.T) {
