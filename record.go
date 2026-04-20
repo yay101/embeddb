@@ -110,6 +110,39 @@ func encodeFieldPayload(record interface{}, layout *embeddbcore.StructLayout) ([
 			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int {
 				sliceVal := embeddbcore.GetIntSlice(record, field)
 				valBuf = embeddbcore.EncodeIntSlice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int8 {
+				sliceVal := embeddbcore.GetInt8Slice(record, field)
+				valBuf = embeddbcore.EncodeInt8Slice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int16 {
+				sliceVal := embeddbcore.GetInt16Slice(record, field)
+				valBuf = embeddbcore.EncodeInt16Slice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int32 {
+				sliceVal := embeddbcore.GetInt32Slice(record, field)
+				valBuf = embeddbcore.EncodeInt32Slice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int64 {
+				sliceVal := embeddbcore.GetInt64Slice(record, field)
+				valBuf = embeddbcore.EncodeInt64Slice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Uint {
+				sliceVal := embeddbcore.GetUintSlice(record, field)
+				valBuf = embeddbcore.EncodeUintSlice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Uint16 {
+				sliceVal := embeddbcore.GetUint16Slice(record, field)
+				valBuf = embeddbcore.EncodeUint16Slice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Uint32 {
+				sliceVal := embeddbcore.GetUint32Slice(record, field)
+				valBuf = embeddbcore.EncodeUint32Slice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Uint64 {
+				sliceVal := embeddbcore.GetUint64Slice(record, field)
+				valBuf = embeddbcore.EncodeUint64Slice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Float32 {
+				sliceVal := embeddbcore.GetFloat32Slice(record, field)
+				valBuf = embeddbcore.EncodeFloat32Slice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Float64 {
+				sliceVal := embeddbcore.GetFloat64Slice(record, field)
+				valBuf = embeddbcore.EncodeFloat64Slice(nil, sliceVal)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Bool {
+				sliceVal := embeddbcore.GetBoolSlice(record, field)
+				valBuf = embeddbcore.EncodeBoolSlice(nil, sliceVal)
 			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Struct {
 				valBuf, err = encodeSliceOfStructs(record, field)
 				if err != nil {
@@ -231,6 +264,28 @@ func decodeFieldPayload(data []byte, record interface{}, layout *embeddbcore.Str
 				val, _, decodeErr = embeddbcore.DecodeSlice(value)
 			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int {
 				val, _, decodeErr = embeddbcore.DecodeIntSlice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int8 {
+				val, _, decodeErr = embeddbcore.DecodeInt8Slice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int16 {
+				val, _, decodeErr = embeddbcore.DecodeInt16Slice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int32 {
+				val, _, decodeErr = embeddbcore.DecodeInt32Slice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Int64 {
+				val, _, decodeErr = embeddbcore.DecodeInt64Slice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Uint {
+				val, _, decodeErr = embeddbcore.DecodeUintSlice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Uint16 {
+				val, _, decodeErr = embeddbcore.DecodeUint16Slice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Uint32 {
+				val, _, decodeErr = embeddbcore.DecodeUint32Slice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Uint64 {
+				val, _, decodeErr = embeddbcore.DecodeUint64Slice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Float32 {
+				val, _, decodeErr = embeddbcore.DecodeFloat32Slice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Float64 {
+				val, _, decodeErr = embeddbcore.DecodeFloat64Slice(value)
+			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Bool {
+				val, _, decodeErr = embeddbcore.DecodeBoolSlice(value)
 			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Struct {
 				sliceVal, sliceErr := decodeSliceOfStructs(value, field)
 				if sliceErr != nil {
@@ -326,6 +381,39 @@ func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset) ([]
 				fieldVal = embeddbcore.EncodeFloat64(nil, embeddbcore.GetFloat64Field(elemPtr, f))
 			case reflect.Float32:
 				fieldVal = embeddbcore.EncodeFloat64(nil, float64(embeddbcore.GetFloat32Field(elemPtr, f)))
+			case reflect.Slice:
+				if f.IsBytes {
+					bytesVal, _ := embeddbcore.GetBytesField(elemPtr, f)
+					fieldVal = embeddbcore.EncodeBytes(nil, bytesVal)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.String {
+					fieldVal = embeddbcore.EncodeSlice(nil, embeddbcore.GetStringSlice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int {
+					fieldVal = embeddbcore.EncodeIntSlice(nil, embeddbcore.GetIntSlice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int8 {
+					fieldVal = embeddbcore.EncodeInt8Slice(nil, embeddbcore.GetInt8Slice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int16 {
+					fieldVal = embeddbcore.EncodeInt16Slice(nil, embeddbcore.GetInt16Slice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int32 {
+					fieldVal = embeddbcore.EncodeInt32Slice(nil, embeddbcore.GetInt32Slice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int64 {
+					fieldVal = embeddbcore.EncodeInt64Slice(nil, embeddbcore.GetInt64Slice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint {
+					fieldVal = embeddbcore.EncodeUintSlice(nil, embeddbcore.GetUintSlice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint16 {
+					fieldVal = embeddbcore.EncodeUint16Slice(nil, embeddbcore.GetUint16Slice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint32 {
+					fieldVal = embeddbcore.EncodeUint32Slice(nil, embeddbcore.GetUint32Slice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint64 {
+					fieldVal = embeddbcore.EncodeUint64Slice(nil, embeddbcore.GetUint64Slice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Float32 {
+					fieldVal = embeddbcore.EncodeFloat32Slice(nil, embeddbcore.GetFloat32Slice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Float64 {
+					fieldVal = embeddbcore.EncodeFloat64Slice(nil, embeddbcore.GetFloat64Slice(elemPtr, f))
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Bool {
+					fieldVal = embeddbcore.EncodeBoolSlice(nil, embeddbcore.GetBoolSlice(elemPtr, f))
+				} else {
+					continue
+				}
 			case reflect.Struct:
 				if f.IsTime {
 					fieldVal = embeddbcore.EncodeVarint(nil, embeddbcore.GetTimeField(elemPtr, f).UnixNano())
@@ -438,6 +526,36 @@ func decodeSliceOfStructs(data []byte, field embeddbcore.FieldOffset) (interface
 				v, _, decodeErr = embeddbcore.DecodeFloat64(value)
 				if decodeErr == nil {
 					val = float32(v)
+				}
+			case reflect.Slice:
+				if f.IsBytes {
+					val, _, decodeErr = embeddbcore.DecodeBytes(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.String {
+					val, _, decodeErr = embeddbcore.DecodeSlice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int {
+					val, _, decodeErr = embeddbcore.DecodeIntSlice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int8 {
+					val, _, decodeErr = embeddbcore.DecodeInt8Slice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int16 {
+					val, _, decodeErr = embeddbcore.DecodeInt16Slice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int32 {
+					val, _, decodeErr = embeddbcore.DecodeInt32Slice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int64 {
+					val, _, decodeErr = embeddbcore.DecodeInt64Slice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint {
+					val, _, decodeErr = embeddbcore.DecodeUintSlice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint16 {
+					val, _, decodeErr = embeddbcore.DecodeUint16Slice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint32 {
+					val, _, decodeErr = embeddbcore.DecodeUint32Slice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint64 {
+					val, _, decodeErr = embeddbcore.DecodeUint64Slice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Float32 {
+					val, _, decodeErr = embeddbcore.DecodeFloat32Slice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Float64 {
+					val, _, decodeErr = embeddbcore.DecodeFloat64Slice(value)
+				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Bool {
+					val, _, decodeErr = embeddbcore.DecodeBoolSlice(value)
 				}
 			case reflect.Struct:
 				if f.IsTime {

@@ -367,7 +367,61 @@ results, _ := users.Filter(func(u User) bool {
 })
 ```
 
+### Slices
+
+All basic Go slice types are supported inside structs:
+
+```go
+type Order struct {
+    ID        uint32  `db:"id,primary"`
+    Items     []string
+    Prices    []float64
+    Flags     []bool
+    Tags      []int
+}
+
+db, _ := embeddb.Open("/tmp/app.db")
+defer db.Close()
+
+orders, _ := embeddb.Use[Order](db, "orders")
+
+orders.Insert(&Order{
+    Items:  []string{"widget", "gadget"},
+    Prices: []float64{9.99, 19.99},
+    Flags:  []bool{true, false},
+    Tags:   []int{1, 2, 3},
+})
+
+// Filter on records with slices
+results, _ := orders.Filter(func(o Order) bool {
+    return len(o.Items) > 0
+})
+
+// Slices of structs are also supported
+type Item struct {
+    Name  string
+    Price float64
+}
+
+type Cart struct {
+    ID    uint32 `db:"id,primary"`
+    Owner string
+    Items []Item
+}
+
+carts, _ := embeddb.Use[Cart](db, "carts")
+carts.Insert(&Cart{
+    Owner: "Alice",
+    Items: []Item{
+        {Name: "Widget", Price: 9.99},
+        {Name: "Gadget", Price: 19.99},
+    },
+})
+```
+
 ## Supported Types
+
+### Scalars (indexed, queryable, sortable)
 
 - `string` - indexed, encoded efficiently
 - `int`, `int8`, `int16`, `int32`, `int64`
@@ -375,6 +429,20 @@ results, _ := users.Filter(func(u User) bool {
 - `float32`, `float64`
 - `bool`
 - `time.Time` - full timestamp support
+
+### Slices (stored, round-tripped, filterable)
+
+- `[]byte` - binary data
+- `[]string` - string arrays
+- `[]int`, `[]int8`, `[]int16`, `[]int32`, `[]int64`
+- `[]uint`, `[]uint8` (same as `[]byte`), `[]uint16`, `[]uint32`, `[]uint64`
+- `[]float32`, `[]float64`
+- `[]bool`
+- `[]struct` - slices of structs (all scalar and slice fields supported recursively)
+
+### Nested structs
+
+- Named and embedded structs are flattened and their fields become queryable with dot notation (e.g., `Address.City`)
 
 ## File Format
 
