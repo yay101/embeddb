@@ -55,6 +55,7 @@ type OpenOptions struct {
 	SyncThreshold uint64
 	IdleThreshold time.Duration
 	CachePages    int
+	EncryptionKey []byte
 }
 
 type UseOptions struct {
@@ -73,6 +74,7 @@ type DB struct {
 	syncThreshold uint64
 	idleThreshold time.Duration
 	cachePages    int
+	encryptionKey []byte
 	writeCount    uint64
 	lastSync      time.Time
 	lock          sync.Mutex
@@ -91,6 +93,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	syncThreshold := uint64(1000)
 	idleThreshold := 10 * time.Second
 	cachePages := 0
+	var encryptionKey []byte
 	if len(opts) > 0 {
 		migrate = opts[0].Migrate
 		autoIndex = opts[0].AutoIndex
@@ -103,6 +106,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		if opts[0].CachePages > 0 {
 			cachePages = opts[0].CachePages
 		}
+		encryptionKey = opts[0].EncryptionKey
 	}
 
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
@@ -113,6 +117,12 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		return nil, fmt.Errorf("failed to close file handle: %w", err)
 	}
 
+	if len(encryptionKey) > 0 {
+		if _, err := newFieldCipher(encryptionKey); err != nil {
+			return nil, fmt.Errorf("invalid encryption key: %w", err)
+		}
+	}
+
 	return &DB{
 		filename:      filename,
 		migrate:       migrate,
@@ -120,6 +130,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		syncThreshold: syncThreshold,
 		idleThreshold: idleThreshold,
 		cachePages:    cachePages,
+		encryptionKey: encryptionKey,
 		writeCount:    0,
 		lastSync:      time.Now(),
 		tables:        make(map[string]*database),
@@ -162,12 +173,17 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 			return nil, fmt.Errorf("table not found")
 		}
 		layout := computeLayout[T]()
+		var cipher *fieldCipher
+		if len(db.encryptionKey) > 0 {
+			cipher, _ = newFieldCipher(db.encryptionKey)
+		}
 		return &Table[T]{
 			db:          existing,
 			name:        tableName,
 			tableID:     existingTable.ID,
 			layout:      layout,
 			maxVersions: existingTable.MaxVersions,
+			cipher:      cipher,
 		}, nil
 	}
 
@@ -237,12 +253,18 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 	}
 	typedDB.mu.Unlock()
 
+	var cipher *fieldCipher
+	if len(db.encryptionKey) > 0 {
+		cipher, _ = newFieldCipher(db.encryptionKey)
+	}
+
 	typedTable := &Table[T]{
 		db:          typedDB,
 		name:        tableName,
 		tableID:     table.ID,
 		layout:      layout,
 		maxVersions: table.MaxVersions,
+		cipher:      cipher,
 	}
 
 	db.tables[tableName] = typedDB
@@ -401,6 +423,7 @@ type Table[T any] struct {
 	tableID     uint8
 	layout      *embeddbcore.StructLayout
 	maxVersions uint8
+	cipher      *fieldCipher
 }
 
 func (t *Table[T]) deactivateRecord(offset uint64) {
@@ -569,7 +592,7 @@ func (t *Table[T]) readRecordAt(offset uint64) (*T, error) {
 }
 
 func (t *Table[T]) encodeRecord(record *T, recordID uint32, flags byte, prevVersionOff uint64) ([]byte, error) {
-	payload, err := encodeFieldPayload(record, t.layout)
+	payload, err := encodeFieldPayload(record, t.layout, t.cipher)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode field payload: %w", err)
 	}
@@ -581,7 +604,7 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse v2 record: %w", err)
 	}
-	return decodeFieldPayload(payload, result, t.layout)
+	return decodeFieldPayload(payload, result, t.layout, t.cipher)
 }
 
 func (t *Table[T]) Name() string {

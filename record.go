@@ -52,7 +52,7 @@ func (h RecordHeader) HasPrevVersion() bool {
 	return h.Flags&embeddbcore.FlagsHasPrevVersion != 0
 }
 
-func encodeFieldPayload(record interface{}, layout *embeddbcore.StructLayout) ([]byte, error) {
+func encodeFieldPayload(record interface{}, layout *embeddbcore.StructLayout, cipher *fieldCipher) ([]byte, error) {
 	var buf []byte
 	for _, field := range layout.Fields {
 		if field.IsStruct && !field.IsTime && !field.IsSlice {
@@ -144,7 +144,7 @@ func encodeFieldPayload(record interface{}, layout *embeddbcore.StructLayout) ([
 				sliceVal := embeddbcore.GetBoolSlice(record, field)
 				valBuf = embeddbcore.EncodeBoolSlice(nil, sliceVal)
 			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Struct {
-				valBuf, err = encodeSliceOfStructs(record, field)
+				valBuf, err = encodeSliceOfStructs(record, field, cipher)
 				if err != nil {
 					continue
 				}
@@ -158,12 +158,20 @@ func encodeFieldPayload(record interface{}, layout *embeddbcore.StructLayout) ([
 		if err != nil {
 			continue
 		}
+
+		if field.Encrypted && cipher != nil {
+			valBuf, err = cipher.encrypt(nil, valBuf)
+			if err != nil {
+				continue
+			}
+		}
+
 		buf = embeddbcore.EncodeTLVField(buf, field.Name, valBuf)
 	}
 	return buf, nil
 }
 
-func decodeFieldPayload(data []byte, record interface{}, layout *embeddbcore.StructLayout) error {
+func decodeFieldPayload(data []byte, record interface{}, layout *embeddbcore.StructLayout, cipher *fieldCipher) error {
 	fieldMap := make(map[string]embeddbcore.FieldOffset)
 	for _, f := range layout.Fields {
 		fieldMap[f.Name] = f
@@ -179,6 +187,14 @@ func decodeFieldPayload(data []byte, record interface{}, layout *embeddbcore.Str
 		field, ok := fieldMap[name]
 		if !ok {
 			continue
+		}
+
+		if field.Encrypted && cipher != nil {
+			decrypted, decryptErr := cipher.decrypt(value)
+			if decryptErr != nil {
+				continue
+			}
+			value = decrypted
 		}
 
 		var val interface{}
@@ -287,7 +303,7 @@ func decodeFieldPayload(data []byte, record interface{}, layout *embeddbcore.Str
 			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Bool {
 				val, _, decodeErr = embeddbcore.DecodeBoolSlice(value)
 			} else if field.IsSlice && field.SliceElem.Kind() == reflect.Struct {
-				sliceVal, sliceErr := decodeSliceOfStructs(value, field)
+				sliceVal, sliceErr := decodeSliceOfStructs(value, field, cipher)
 				if sliceErr != nil {
 					decodeErr = sliceErr
 				} else {
@@ -305,7 +321,7 @@ func decodeFieldPayload(data []byte, record interface{}, layout *embeddbcore.Str
 	return nil
 }
 
-func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset) ([]byte, error) {
+func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset, cipher *fieldCipher) ([]byte, error) {
 	rootVal := reflect.ValueOf(record).Elem()
 
 	var val reflect.Value
@@ -423,6 +439,13 @@ func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset) ([]
 			default:
 				continue
 			}
+			if f.Encrypted && cipher != nil {
+				var encErr error
+				fieldVal, encErr = cipher.encrypt(nil, fieldVal)
+				if encErr != nil {
+					continue
+				}
+			}
 			elemData = embeddbcore.EncodeTLVField(elemData, f.Name, fieldVal)
 		}
 		elemBuf = append(elemBuf, embeddbcore.EncodeUvarint(nil, uint64(len(elemData)))...)
@@ -432,7 +455,7 @@ func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset) ([]
 	return elemBuf, nil
 }
 
-func decodeSliceOfStructs(data []byte, field embeddbcore.FieldOffset) (interface{}, error) {
+func decodeSliceOfStructs(data []byte, field embeddbcore.FieldOffset, cipher *fieldCipher) (interface{}, error) {
 	length, n := binary.Uvarint(data)
 	if n <= 0 {
 		return nil, errors.New("invalid slice length")
@@ -475,6 +498,14 @@ func decodeSliceOfStructs(data []byte, field embeddbcore.FieldOffset) (interface
 			f, ok := fieldMap[name]
 			if !ok {
 				continue
+			}
+
+			if f.Encrypted && cipher != nil {
+				decrypted, decryptErr := cipher.decrypt(value)
+				if decryptErr != nil {
+					continue
+				}
+				value = decrypted
 			}
 
 			var val interface{}
