@@ -21,6 +21,7 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **Index recovery** - Automatically rebuilds indexes on startup if corrupted
 - **Auto-sync** - Periodic disk flush (every N writes or idle timeout)
 - **FastSync** - Quick fsync without defragmentation
+- **Storage modes** - Memory-mapped (default) or file-only I/O
 - **PK uniqueness** - Error on duplicate primary keys
 - **Versioning** - Keep N previous versions of records with timestamps
 
@@ -133,6 +134,7 @@ db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
     Migrate:       false,
     SyncThreshold: 1000,         // fsync every N writes (default 1000)
     IdleThreshold: 10 * time.Second,  // fsync after idle (default 10s)
+    StorageMode:   embeddb.StorageMmap, // or StorageFile for no mmap overhead
 })
 
 // Get table handle (versioning disabled by default)
@@ -174,6 +176,26 @@ for _, v := range versions {
 ```
 
 **Note:** When `MaxVersions > 0`, old versions are marked as deleted during `Vacuum()`. The current version is always accessible via `Get()`.
+
+### Storage Modes
+
+EmbedDB supports two storage backends:
+
+```go
+// Memory-mapped I/O (default) - zero-copy reads, kernel-managed caching
+db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
+    StorageMode: embeddb.StorageMmap,
+})
+
+// File-only I/O - no mmap overhead, uses ReadAt/WriteAt directly
+db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
+    StorageMode: embeddb.StorageFile,
+})
+```
+
+**StorageMmap** (default): Uses memory-mapped files for zero-copy page access. Best for most workloads.
+
+**StorageFile**: Uses direct file I/O (`ReadAt`/`WriteAt`). Avoids mmap overhead and virtual memory reservation. Useful on constrained systems or when you want explicit I/O control. Performance difference is minimal (~10% on inserts at small scale, converges to equal at scale).
 
 ### CRUD Operations
 
@@ -449,7 +471,7 @@ carts.Insert(&Cart{
 - Header: 128 bytes (magic, version, catalog offset, B-tree roots)
 - Records: TLV-encoded with CRC verification, stored sequentially after header
 - Catalog: table definitions at end of file
-- Primary Index: Persistent B-tree with mmap, Copy-on-Write transactions
+- Primary Index: Persistent B-tree with mmap or file I/O (configurable), Copy-on-Write transactions
 - Secondary Indexes: Persistent B-tree indexes with automatic recovery
 - Version Index: B-tree tracking record version history
 - B-tree nodes: 4096 bytes per node, LRU cache with configurable size

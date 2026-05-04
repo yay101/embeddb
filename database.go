@@ -89,25 +89,6 @@ type database struct {
 func (db *database) ensureRegion(size int64) error {
 	currentRegion := db.region.Load()
 	if currentRegion == nil {
-		alignedSize := pageAlign(size)
-		if stat, err := db.file.Stat(); err == nil {
-			if stat.Size() > alignedSize {
-				alignedSize = pageAlign(stat.Size())
-			}
-		}
-		if err := db.file.Truncate(alignedSize); err != nil {
-			return err
-		}
-		db.fileTruncatedTo = alignedSize
-		region, err := embeddbmmap.Map(int(db.file.Fd()), 0, alignedSize, embeddbmmap.ProtRead|embeddbmmap.ProtWrite, embeddbmmap.MapShared)
-		if err != nil {
-			region, err = embeddbmmap.Map(int(db.file.Fd()), 0, alignedSize, embeddbmmap.ProtRead, embeddbmmap.MapShared)
-			if err != nil {
-				return err
-			}
-		}
-		db.region.Store(region)
-		region.Advise(embeddbmmap.AdviceRandom)
 		return nil
 	}
 
@@ -201,7 +182,7 @@ func (db *database) readAtFn() func([]byte, int64) {
 	}
 }
 
-func openDatabase(filename string, migrate bool, parent *DB) (*database, error) {
+func openDatabase(filename string, migrate bool, parent *DB, storageMode StorageMode) (*database, error) {
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
@@ -247,26 +228,28 @@ func openDatabase(filename string, migrate bool, parent *DB) (*database, error) 
 		db.alloc.Reset(FileHeaderSize, nil)
 	}
 
-	mmapSize := pageAlign(stat.Size() + 1024*1024)
-	if mmapSize < pageAlign(4*1024*1024) {
-		mmapSize = pageAlign(4 * 1024 * 1024)
-	}
-	if err := file.Truncate(mmapSize); err != nil {
-		mmapSize = pageAlign(stat.Size() + 1024*1024)
-		if mmapSize < pageAlign(1024*1024) {
-			mmapSize = pageAlign(1024 * 1024)
+	if storageMode == StorageMmap {
+		mmapSize := pageAlign(stat.Size() + 1024*1024)
+		if mmapSize < pageAlign(4*1024*1024) {
+			mmapSize = pageAlign(4 * 1024 * 1024)
 		}
 		if err := file.Truncate(mmapSize); err != nil {
+			mmapSize = pageAlign(stat.Size() + 1024*1024)
+			if mmapSize < pageAlign(1024*1024) {
+				mmapSize = pageAlign(1024 * 1024)
+			}
+			if err := file.Truncate(mmapSize); err != nil {
+				unlockFile(file)
+				file.Close()
+				return nil, fmt.Errorf("failed to truncate file to %d: %w", mmapSize, err)
+			}
+		}
+		db.fileTruncatedTo = mmapSize
+		if err := db.ensureRegion(mmapSize); err != nil {
 			unlockFile(file)
 			file.Close()
-			return nil, fmt.Errorf("failed to truncate file to %d: %w", mmapSize, err)
+			return nil, err
 		}
-	}
-	db.fileTruncatedTo = mmapSize
-	if err := db.ensureRegion(mmapSize); err != nil {
-		unlockFile(file)
-		file.Close()
-		return nil, err
 	}
 	db.index, err = db.openBTree(db.indexRoot)
 	if err != nil {

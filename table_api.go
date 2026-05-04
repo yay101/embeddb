@@ -49,6 +49,13 @@ func encodePKForIndex(tableID uint8, pkValue any) []byte {
 	return key
 }
 
+type StorageMode int
+
+const (
+	StorageMmap StorageMode = iota
+	StorageFile
+)
+
 type OpenOptions struct {
 	Migrate       bool
 	AutoIndex     bool
@@ -56,6 +63,7 @@ type OpenOptions struct {
 	IdleThreshold time.Duration
 	CachePages    int
 	EncryptionKey []byte
+	StorageMode   StorageMode
 }
 
 type UseOptions struct {
@@ -75,6 +83,7 @@ type DB struct {
 	idleThreshold time.Duration
 	cachePages    int
 	encryptionKey []byte
+	storageMode   StorageMode
 	writeCount    uint64
 	lastSync      time.Time
 	lock          sync.Mutex
@@ -93,6 +102,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	syncThreshold := uint64(1000)
 	idleThreshold := 10 * time.Second
 	cachePages := 0
+	storageMode := StorageMmap
 	var encryptionKey []byte
 	if len(opts) > 0 {
 		migrate = opts[0].Migrate
@@ -107,6 +117,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 			cachePages = opts[0].CachePages
 		}
 		encryptionKey = opts[0].EncryptionKey
+		storageMode = opts[0].StorageMode
 	}
 
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
@@ -131,6 +142,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		idleThreshold: idleThreshold,
 		cachePages:    cachePages,
 		encryptionKey: encryptionKey,
+		storageMode:   storageMode,
 		writeCount:    0,
 		lastSync:      time.Now(),
 		tables:        make(map[string]*database),
@@ -192,7 +204,7 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 		typedDB = db.database
 	} else {
 		var err error
-		typedDB, err = openDatabase(db.filename, false, db)
+		typedDB, err = openDatabase(db.filename, false, db, db.storageMode)
 		if err != nil {
 			return nil, err
 		}

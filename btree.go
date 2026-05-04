@@ -98,16 +98,27 @@ func (db *database) openBTree(rootOff uint64) (*BTree, error) {
 func (bt *BTree) readCount(node *BTreeNode) int {
 	if node.Offset == bt.rootOff {
 		r := bt.db.region.Load()
-		r.RLock()
-		page := bt.pageData(node.Offset)
-		isRoot := page[0] == PageTypeRootLeaf || page[0] == PageTypeRootInternal
-		var count uint32
-		if isRoot {
-			count = binary.LittleEndian.Uint32(page[RootCountOff : RootCountOff+4])
-		}
-		r.RUnlock()
-		if isRoot {
-			return int(count)
+		if r != nil {
+			r.RLock()
+			page := bt.pageData(node.Offset)
+			isRoot := page[0] == PageTypeRootLeaf || page[0] == PageTypeRootInternal
+			var count uint32
+			if isRoot {
+				count = binary.LittleEndian.Uint32(page[RootCountOff : RootCountOff+4])
+			}
+			r.RUnlock()
+			if isRoot {
+				return int(count)
+			}
+		} else {
+			buf := make([]byte, PageSize)
+			if err := bt.db.readAt(buf, int64(node.Offset)); err == nil {
+				isRoot := buf[0] == PageTypeRootLeaf || buf[0] == PageTypeRootInternal
+				if isRoot {
+					count := binary.LittleEndian.Uint32(buf[RootCountOff : RootCountOff+4])
+					return int(count)
+				}
+			}
 		}
 	}
 	return 0
@@ -115,6 +126,11 @@ func (bt *BTree) readCount(node *BTreeNode) int {
 
 func (bt *BTree) pageData(offset uint64) []byte {
 	r := bt.db.region.Load()
+	if r == nil {
+		buf := make([]byte, PageSize)
+		bt.db.readAt(buf, int64(offset))
+		return buf
+	}
 	base := r.Pointer()
 	return unsafe.Slice((*byte)(unsafe.Add(base, int(offset))), PageSize)
 }
@@ -143,14 +159,6 @@ func (bt *BTree) newNode(isLeaf bool) (*BTreeNode, error) {
 		return nil, fmt.Errorf("btree newNode ensureRegion: %w", err)
 	}
 
-	r := bt.db.region.Load()
-	if r == nil {
-		return nil, fmt.Errorf("btree newNode: region is nil after ensureRegion")
-	}
-	if int64(off)+PageSize > r.Size() {
-		return nil, fmt.Errorf("btree newNode: offset %d + PageSize %d > regionSize %d", off, PageSize, r.Size())
-	}
-
 	buf := make([]byte, PageSize)
 	if isLeaf {
 		buf[0] = PageTypeLeaf
@@ -160,10 +168,20 @@ func (bt *BTree) newNode(isLeaf bool) (*BTreeNode, error) {
 	checksum := crc32.ChecksumIEEE(buf[:PageFooterOff])
 	binary.LittleEndian.PutUint32(buf[PageFooterOff:], checksum)
 
-	r.RLock()
-	base := r.Pointer()
-	copy(unsafe.Slice((*byte)(unsafe.Add(base, int(off))), PageSize), buf)
-	r.RUnlock()
+	r := bt.db.region.Load()
+	if r != nil {
+		if int64(off)+PageSize > r.Size() {
+			return nil, fmt.Errorf("btree newNode: offset %d + PageSize %d > regionSize %d", off, PageSize, r.Size())
+		}
+		r.RLock()
+		base := r.Pointer()
+		copy(unsafe.Slice((*byte)(unsafe.Add(base, int(off))), PageSize), buf)
+		r.RUnlock()
+	} else {
+		if err := bt.db.writeAt(buf, int64(off)); err != nil {
+			return nil, fmt.Errorf("btree newNode writeAt: %w", err)
+		}
+	}
 
 	return node, nil
 }
@@ -276,9 +294,15 @@ func (bt *BTree) writeNode(node *BTreeNode) error {
 
 	data := bt.serializeNode(node)
 	r := bt.db.region.Load()
-	r.RLock()
-	copy(bt.pageData(node.Offset), data)
-	r.RUnlock()
+	if r != nil {
+		r.RLock()
+		copy(bt.pageData(node.Offset), data)
+		r.RUnlock()
+	} else {
+		if err := bt.db.writeAt(data, int64(node.Offset)); err != nil {
+			return fmt.Errorf("btree writeNode writeAt: %w", err)
+		}
+	}
 	bt.cacheNode(node)
 	return nil
 }
@@ -299,14 +323,21 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 		return nil, fmt.Errorf("btree readNode ensureRegion: %w", err)
 	}
 
-	r := bt.db.region.Load()
-	r.RLock()
-	page := bt.pageData(offset)
-
 	pageBufPtr := pageBufPool.Get().(*[]byte)
 	pageCopy := *pageBufPtr
-	copy(pageCopy, page)
-	r.RUnlock()
+
+	r := bt.db.region.Load()
+	if r != nil {
+		r.RLock()
+		page := bt.pageData(offset)
+		copy(pageCopy, page)
+		r.RUnlock()
+	} else {
+		if err := bt.db.readAt(pageCopy, int64(offset)); err != nil {
+			pageBufPool.Put(pageBufPtr)
+			return nil, fmt.Errorf("btree readNode readAt: %w", err)
+		}
+	}
 
 	storedCRC := binary.LittleEndian.Uint32(pageCopy[PageFooterOff:])
 	computedCRC := crc32.ChecksumIEEE(pageCopy[:PageFooterOff])
