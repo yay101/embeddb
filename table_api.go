@@ -362,6 +362,20 @@ func (db *DB) Sync() error {
 	return firstErr
 }
 
+type DBStats struct {
+	CacheStats map[string]CacheStats
+}
+
+func (db *DB) Stats() DBStats {
+	stats := DBStats{
+		CacheStats: make(map[string]CacheStats),
+	}
+	if db.database != nil && db.database.index != nil {
+		stats.CacheStats["primary"] = db.database.index.GetCacheStats()
+	}
+	return stats
+}
+
 func (db *DB) FastSync() error {
 	if db == nil {
 		return nil

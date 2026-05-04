@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"sort"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/yay101/embeddbmmap"
@@ -47,7 +48,13 @@ type BTree struct {
 	cacheRing []uint64
 	cacheHead int
 	cacheSize int
+	minSize   int
+	maxSize   int
 	count     int
+	hits      uint64
+	misses    uint64
+	lastAdjust time.Time
+	adjustInterval time.Duration
 }
 
 type BTreeNode struct {
@@ -67,14 +74,30 @@ func (db *database) openBTree(rootOff uint64) (*BTree, error) {
 	if db.parent != nil && db.parent.cachePages > 0 {
 		cacheSize = db.parent.cachePages
 	}
+	minSize := 64
+	maxSize := 16384
+	if cacheSize > 0 {
+		minSize = cacheSize / 4
+		if minSize < 64 {
+			minSize = 64
+		}
+		maxSize = cacheSize * 4
+		if maxSize > 16384 {
+			maxSize = 16384
+		}
+	}
 	bt := &BTree{
-		db:        db,
-		alloc:     db.alloc,
-		rootOff:   rootOff,
-		cache:     make(map[uint64]*BTreeNode, cacheSize),
-		cacheRing: make([]uint64, cacheSize),
-		cacheHead: 0,
-		cacheSize: cacheSize,
+		db:             db,
+		alloc:          db.alloc,
+		rootOff:        rootOff,
+		cache:          make(map[uint64]*BTreeNode, cacheSize),
+		cacheRing:      make([]uint64, cacheSize),
+		cacheHead:      0,
+		cacheSize:      cacheSize,
+		minSize:        minSize,
+		maxSize:        maxSize,
+		lastAdjust:     time.Now(),
+		adjustInterval: 5 * time.Second,
 	}
 
 	if bt.rootOff == 0 {
@@ -315,9 +338,11 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 	bt.cacheMu.RLock()
 	if node, ok := bt.cache[offset]; ok {
 		bt.cacheMu.RUnlock()
+		bt.trackAccess(true)
 		return node, nil
 	}
 	bt.cacheMu.RUnlock()
+	bt.trackAccess(false)
 
 	if err := bt.db.ensureRegion(int64(offset) + PageSize); err != nil {
 		return nil, fmt.Errorf("btree readNode ensureRegion: %w", err)
@@ -455,6 +480,88 @@ func (bt *BTree) cacheNode(node *BTreeNode) {
 	bt.cacheRing[bt.cacheHead] = node.Offset
 	bt.cache[node.Offset] = node
 	bt.cacheHead = (bt.cacheHead + 1) % len(bt.cacheRing)
+}
+
+func (bt *BTree) trackAccess(hit bool) {
+	if hit {
+		bt.hits++
+	} else {
+		bt.misses++
+	}
+
+	if time.Since(bt.lastAdjust) < bt.adjustInterval {
+		return
+	}
+
+	total := bt.hits + bt.misses
+	if total < 100 {
+		return
+	}
+
+	hitRate := float64(bt.hits) / float64(total)
+
+	if hitRate > 0.90 && bt.cacheSize < bt.maxSize {
+		newSize := bt.cacheSize * 3 / 2
+		if newSize > bt.maxSize {
+			newSize = bt.maxSize
+		}
+		bt.resizeCache(newSize)
+	} else if hitRate < 0.30 && bt.cacheSize > bt.minSize {
+		newSize := bt.cacheSize / 2
+		if newSize < bt.minSize {
+			newSize = bt.minSize
+		}
+		bt.resizeCache(newSize)
+	}
+
+	bt.hits = 0
+	bt.misses = 0
+	bt.lastAdjust = time.Now()
+}
+
+func (bt *BTree) resizeCache(newSize int) {
+	if newSize == bt.cacheSize {
+		return
+	}
+
+	oldCache := bt.cache
+	oldRing := bt.cacheRing
+	oldSize := bt.cacheSize
+
+	bt.cache = make(map[uint64]*BTreeNode, newSize)
+	bt.cacheRing = make([]uint64, newSize)
+	bt.cacheSize = newSize
+	bt.cacheHead = 0
+
+	keep := newSize
+	if keep > len(oldCache) {
+		keep = len(oldCache)
+	}
+
+	n := 0
+	for i := 0; i < oldSize && n < keep; i++ {
+		idx := (oldSize - 1 - i)
+		if idx < 0 || idx >= len(oldRing) {
+			continue
+		}
+		off := oldRing[idx]
+		if off == 0 || off == bt.rootOff {
+			continue
+		}
+		if node, ok := oldCache[off]; ok {
+			bt.cache[off] = node
+			bt.cacheRing[n] = off
+			n++
+		}
+	}
+
+	if bt.rootOff != 0 {
+		if node, ok := oldCache[bt.rootOff]; ok {
+			bt.cache[bt.rootOff] = node
+		}
+	}
+
+	bt.cacheHead = n
 }
 
 func (bt *BTree) Insert(key []byte, value uint64) error {
@@ -1026,6 +1133,31 @@ func (bt *BTree) findLeafPosition(node *BTreeNode, key []byte) (*BTreeNode, int,
 
 func (bt *BTree) Close() error {
 	return nil
+}
+
+type CacheStats struct {
+	Size    int
+	Filled  int
+	Hits    uint64
+	Misses  uint64
+	HitRate float64
+}
+
+func (bt *BTree) GetCacheStats() CacheStats {
+	bt.cacheMu.RLock()
+	defer bt.cacheMu.RUnlock()
+	total := bt.hits + bt.misses
+	hitRate := 0.0
+	if total > 0 {
+		hitRate = float64(bt.hits) / float64(total)
+	}
+	return CacheStats{
+		Size:    bt.cacheSize,
+		Filled:  len(bt.cache),
+		Hits:    bt.hits,
+		Misses:  bt.misses,
+		HitRate: hitRate,
+	}
 }
 
 func (bt *BTree) BulkInsert(entries []struct{ key []byte; value uint64 }) error {
