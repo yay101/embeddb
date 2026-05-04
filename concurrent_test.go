@@ -178,8 +178,111 @@ func BenchmarkConcurrentWrites(b *testing.B) {
 
 	b.StopTimer()
 	db.Close()
+}
 
-	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "inserts/sec")
+func BenchmarkConcurrentReadWrite(b *testing.B) {
+	dbPath := "/tmp/bench_concurrent.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, _ := Open(dbPath)
+	users, _ := Use[User](db, "users")
+
+	for i := 0; i < 1000; i++ {
+		users.Insert(&User{
+			Name:  fmt.Sprintf("User%d", i),
+			Email: fmt.Sprintf("user%d@test.com", i),
+			Age:   20 + i%50,
+		})
+	}
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < 100; j++ {
+					users.Get(uint32(id*100 + j%1000 + 1))
+				}
+			}(i)
+		}
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < 50; j++ {
+					users.Insert(&User{
+						Name:  fmt.Sprintf("New%d_%d", id, j),
+						Email: fmt.Sprintf("new%d_%d@test.com", id, j),
+						Age:   30,
+					})
+				}
+			}(i)
+		}
+		wg.Wait()
+	}
+
+	db.Close()
+}
+
+func BenchmarkConcurrentMultiTable(b *testing.B) {
+	dbPath := "/tmp/bench_multitable.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	type Order struct {
+		ID      uint32 `db:"id,primary"`
+		UserID  uint32 `db:"index"`
+		Product string
+		Amount  float64
+		Status  string `db:"index"`
+	}
+
+	db, _ := Open(dbPath)
+	users, _ := Use[User](db, "users")
+	orders, _ := Use[Order](db, "orders")
+
+	for i := 0; i < 500; i++ {
+		users.Insert(&User{
+			Name:  fmt.Sprintf("User%d", i),
+			Email: fmt.Sprintf("user%d@test.com", i),
+			Age:   20 + i%50,
+		})
+		orders.Insert(&Order{
+			UserID:  uint32(i + 1),
+			Product: fmt.Sprintf("Product%d", i%100),
+			Amount:  float64(10 + i%90),
+			Status:  "pending",
+		})
+	}
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < 100; j++ {
+					users.Query("Name", fmt.Sprintf("User%d", id*100+j%500))
+				}
+			}(i)
+		}
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < 100; j++ {
+					orders.Query("Status", "pending")
+				}
+			}(i)
+		}
+		wg.Wait()
+	}
+
+	db.Close()
 }
 
 func BenchmarkConcurrentReads(b *testing.B) {

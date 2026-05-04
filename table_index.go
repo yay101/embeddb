@@ -91,14 +91,12 @@ func (t *Table[T]) CreateIndex(fieldName string) error {
 
 	prefix := encodeSecondaryKeyPrefix(t.tableID, fieldName)
 	var existing int
-	t.db.mu.RLock()
 	t.db.index.Scan(func(key []byte, value uint64) bool {
 		if bytes.HasPrefix(key, prefix) {
 			existing++
 		}
 		return true
 	})
-	t.db.mu.RUnlock()
 	if existing > 0 {
 		return nil
 	}

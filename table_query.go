@@ -45,14 +45,12 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 			slices.Sort(offsets)
 			results := make([]T, 0, len(offsets))
 
-			t.db.mu.RLock()
 			for _, off := range offsets {
 				record, err := t.readRecordAt(off)
 				if err == nil && record != nil {
 					results = append(results, *record)
 				}
 			}
-			t.db.mu.RUnlock()
 
 			return results, nil
 		}
@@ -206,7 +204,6 @@ func (t *Table[T]) rangeQueryFromField(fieldName string, startValue interface{},
 	}
 
 	var offsets []uint64
-	t.db.mu.RLock()
 	_ = t.db.index.Scan(func(key []byte, val uint64) bool {
 		if bytes.HasPrefix(key, prefix) {
 			_, _, fv, _, parsed := parseSecondaryKey(key)
@@ -219,18 +216,15 @@ func (t *Table[T]) rangeQueryFromField(fieldName string, startValue interface{},
 		}
 		return true
 	})
-	t.db.mu.RUnlock()
 
 	slices.Sort(offsets)
 	results := make([]T, 0, len(offsets))
-	t.db.mu.RLock()
 	for _, off := range offsets {
 		record, err := t.readRecordAt(off)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
 	}
-	t.db.mu.RUnlock()
 
 	return results, nil
 }
@@ -248,7 +242,6 @@ func (t *Table[T]) rangeQueryToField(fieldName string, endValue interface{}, inc
 	}
 
 	var offsets []uint64
-	t.db.mu.RLock()
 	_ = t.db.index.Scan(func(key []byte, val uint64) bool {
 		if bytes.HasPrefix(key, prefix) {
 			_, _, fv, _, parsed := parseSecondaryKey(key)
@@ -261,18 +254,15 @@ func (t *Table[T]) rangeQueryToField(fieldName string, endValue interface{}, inc
 		}
 		return true
 	})
-	t.db.mu.RUnlock()
 
 	slices.Sort(offsets)
 	results := make([]T, 0, len(offsets))
-	t.db.mu.RLock()
 	for _, off := range offsets {
 		record, err := t.readRecordAt(off)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
 	}
-	t.db.mu.RUnlock()
 
 	return results, nil
 }
@@ -294,7 +284,6 @@ func (t *Table[T]) rangeQueryBetween(fieldName string, min, max interface{}, inc
 	}
 
 	var offsets []uint64
-	t.db.mu.RLock()
 	_ = t.db.index.Scan(func(key []byte, val uint64) bool {
 		if bytes.HasPrefix(key, prefix) {
 			_, _, fv, _, parsed := parseSecondaryKey(key)
@@ -307,18 +296,15 @@ func (t *Table[T]) rangeQueryBetween(fieldName string, min, max interface{}, inc
 		}
 		return true
 	})
-	t.db.mu.RUnlock()
 
 	slices.Sort(offsets)
 	results := make([]T, 0, len(offsets))
-	t.db.mu.RLock()
 	for _, off := range offsets {
 		record, err := t.readRecordAt(off)
 		if err == nil && record != nil {
 			results = append(results, *record)
 		}
 	}
-	t.db.mu.RUnlock()
 
 	return results, nil
 }

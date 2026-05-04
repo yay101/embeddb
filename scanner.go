@@ -20,7 +20,6 @@ type Scanner[T any] struct {
 }
 
 func (t *Table[T]) ScanRecords() *Scanner[T] {
-	t.db.mu.RLock()
 	var entries []scanEntry
 	_ = t.db.index.Scan(func(key []byte, value uint64) bool {
 		if len(key) >= 2 && key[0] == indexNSPrimary && key[1] == t.tableID {
@@ -49,7 +48,7 @@ func (t *Table[T]) ScanRecords() *Scanner[T] {
 		table:   t,
 		entries: entries,
 		pos:     0,
-		locked:  true,
+		locked:  false,
 	}
 }
 
@@ -82,10 +81,6 @@ func (s *Scanner[T]) Err() error {
 }
 
 func (s *Scanner[T]) Close() {
-	if s.locked {
-		s.table.db.mu.RUnlock()
-		s.locked = false
-	}
 	s.entries = nil
 }
 
@@ -145,8 +140,6 @@ func (t *Table[T]) Scan(fn func(T) bool) error {
 }
 
 func (t *Table[T]) Count() int {
-	t.db.mu.RLock()
-	defer t.db.mu.RUnlock()
 	entry := t.db.tableCat[t.name]
 	if entry != nil {
 		return int(entry.RecordCount)

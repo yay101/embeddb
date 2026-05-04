@@ -117,9 +117,6 @@ func (t *Table[T]) getPKValue(record *T) (any, error) {
 }
 
 func (t *Table[T]) Get(id any) (*T, error) {
-	t.db.mu.RLock()
-	defer t.db.mu.RUnlock()
-
 	return t.getLocked(t.normalizePK(id))
 }
 
@@ -136,9 +133,6 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 	if t.maxVersions == 0 {
 		return nil, fmt.Errorf("versioning not enabled for this table")
 	}
-
-	t.db.mu.RLock()
-	defer t.db.mu.RUnlock()
 
 	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
 	if err != nil {
@@ -166,9 +160,6 @@ func (t *Table[T]) ListVersions(id any) ([]VersionMetadata, error) {
 	if t.maxVersions == 0 {
 		return nil, fmt.Errorf("versioning not enabled for this table")
 	}
-
-	t.db.mu.RLock()
-	defer t.db.mu.RUnlock()
 
 	offset, err := t.db.index.Get(encodePrimaryKey(t.tableID, t.normalizePK(id)))
 	if err != nil {
