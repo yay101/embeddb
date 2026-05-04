@@ -745,6 +745,16 @@ func (db *database) encodeTableCatalog() []byte {
 	return buf
 }
 
+func (db *database) writeHeader() error {
+	header := make([]byte, FileHeaderSize)
+	header[0] = V2RecordVersion
+	copy(header[1:33], []byte(FileMagic))
+	binary.LittleEndian.PutUint32(header[32:36], uint32(len(db.tableCat)))
+	binary.LittleEndian.PutUint64(header[48:56], db.alloc.nextOffset)
+	binary.LittleEndian.PutUint64(header[56:64], db.index.RootOffset())
+	return db.writeAt(header, 0)
+}
+
 func (db *database) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()

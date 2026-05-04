@@ -430,6 +430,103 @@ func (t *Table[T]) InsertMany(records []*T) ([]uint32, error) {
 	return ids, firstErr
 }
 
+func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
+	t.db.mu.Lock()
+	defer t.db.mu.Unlock()
+
+	entry := t.db.tableCat[t.name]
+	if entry == nil {
+		return nil, fmt.Errorf("table not found")
+	}
+
+	type bulkEntry struct {
+		record   *T
+		recordID uint32
+		offset   uint64
+		pkVal    any
+		pkKey    []byte
+	}
+
+	bulk := make([]bulkEntry, 0, len(records))
+	var totalSize uint64
+
+	for _, record := range records {
+		recordID := entry.NextRecordID
+		entry.NextRecordID++
+
+		pkVal, _ := t.getPKValue(record)
+		if t.isZeroPK(pkVal) {
+			t.setPKValue(record, recordID)
+			pkVal = recordID
+		}
+
+		recordBuf, err := t.encodeRecord(record, recordID, embeddbcore.FlagsActive, 0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode record: %w", err)
+		}
+
+		bulk = append(bulk, bulkEntry{
+			record:   record,
+			recordID: recordID,
+			pkVal:    pkVal,
+			pkKey:    encodePrimaryKey(t.tableID, pkVal),
+		})
+		totalSize += uint64(len(recordBuf))
+	}
+
+	baseOffset, _, err := t.db.alloc.Allocate(totalSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate space: %w", err)
+	}
+
+	offset := baseOffset
+	var encodedRecords [][]byte
+	for i := range bulk {
+		recordBuf, err := t.encodeRecord(bulk[i].record, bulk[i].recordID, embeddbcore.FlagsActive, 0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode record: %w", err)
+		}
+		encodedRecords = append(encodedRecords, recordBuf)
+		bulk[i].offset = offset
+		if err := t.db.writeAt(recordBuf, int64(offset)); err != nil {
+			return nil, fmt.Errorf("failed to write record: %w", err)
+		}
+		offset += uint64(len(recordBuf))
+	}
+
+	btEntries := make([]struct{ key []byte; value uint64 }, len(bulk))
+	for i, b := range bulk {
+		btEntries[i] = struct{ key []byte; value uint64 }{key: b.pkKey, value: b.offset}
+	}
+
+	if err := t.db.index.BulkInsert(btEntries); err != nil {
+		return nil, fmt.Errorf("failed to bulk insert primary keys: %w", err)
+	}
+
+	for _, b := range bulk {
+		if t.maxVersions > 0 {
+			t.db.index.Insert(encodeVersionKey(t.tableID, b.recordID, 1), b.offset)
+		}
+		t.insertSecondaryKeys(b.record, b.recordID, b.offset)
+		entry.RecordCount++
+	}
+
+	t.db.autoSync()
+
+	ids := make([]uint32, len(bulk))
+	for i, b := range bulk {
+		ids[i] = b.recordID
+	}
+
+	if err := t.db.writeHeader(); err != nil {
+		return nil, fmt.Errorf("failed to write header after bulk insert: %w", err)
+	}
+
+	t.db.file.Sync()
+
+	return ids, nil
+}
+
 func (t *Table[T]) UpdateMany(ids []any, updater func(*T) error) (int, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()

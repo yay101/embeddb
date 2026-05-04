@@ -1028,6 +1028,140 @@ func (bt *BTree) Close() error {
 	return nil
 }
 
+func (bt *BTree) BulkInsert(entries []struct{ key []byte; value uint64 }) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	bt.mu.Lock()
+	defer bt.mu.Unlock()
+
+	sorted := make([]struct{ key []byte; value uint64 }, len(entries))
+	copy(sorted, entries)
+	sort.Slice(sorted, func(i, j int) bool {
+		return bytes.Compare(sorted[i].key, sorted[j].key) < 0
+	})
+
+	deduped := sorted[:0]
+	for i, e := range sorted {
+		if i > 0 && bytes.Equal(e.key, sorted[i-1].key) {
+			continue
+		}
+		deduped = append(deduped, e)
+	}
+
+	bt.count += len(deduped)
+
+	leafNodes, err := bt.buildLeafNodes(deduped)
+	if err != nil {
+		return err
+	}
+
+	if len(leafNodes) == 1 {
+		bt.rootOff = leafNodes[0].Offset
+		bt.writeNode(leafNodes[0])
+		return nil
+	}
+
+	root, err := bt.buildInternalNodes(leafNodes)
+	if err != nil {
+		return err
+	}
+	bt.rootOff = root.Offset
+	bt.writeNode(root)
+
+	return nil
+}
+
+func (bt *BTree) buildLeafNodes(entries []struct{ key []byte; value uint64 }) ([]*BTreeNode, error) {
+	var nodes []*BTreeNode
+	var current *BTreeNode
+
+	for _, e := range entries {
+		if current == nil {
+			var err error
+			current, err = bt.newNode(true)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if current.Count > 0 && bt.wouldOverflow(current, len(e.key)) {
+			nodes = append(nodes, current)
+			var err error
+			current, err = bt.newNode(true)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		current.Keys = append(current.Keys, e.key)
+		current.Values = append(current.Values, e.value)
+		current.Count++
+	}
+
+	if current != nil && current.Count > 0 {
+		nodes = append(nodes, current)
+	}
+
+	for i, n := range nodes {
+		if i > 0 {
+			n.PrevLeaf = nodes[i-1].Offset
+		}
+		if i < len(nodes)-1 {
+			n.NextLeaf = nodes[i+1].Offset
+		}
+		bt.writeNode(n)
+	}
+
+	return nodes, nil
+}
+
+func (bt *BTree) buildInternalNodes(children []*BTreeNode) (*BTreeNode, error) {
+	if len(children) <= 1 {
+		return children[0], nil
+	}
+
+	var nextLevel []*BTreeNode
+	for i := 0; i < len(children); {
+		node, err := bt.newNode(false)
+		if err != nil {
+			return nil, err
+		}
+
+		node.Children = append(node.Children, children[i].Offset)
+		i++
+
+		for i < len(children) && !bt.wouldOverflowInternal(node, len(children[i].Keys[0])) {
+			promoteKey := make([]byte, len(children[i].Keys[0]))
+			copy(promoteKey, children[i].Keys[0])
+			node.Keys = append(node.Keys, promoteKey)
+			node.Children = append(node.Children, children[i].Offset)
+			node.Count++
+			i++
+		}
+
+		bt.writeNode(node)
+		nextLevel = append(nextLevel, node)
+	}
+
+	if len(nextLevel) == 1 {
+		return nextLevel[0], nil
+	}
+
+	return bt.buildInternalNodes(nextLevel)
+}
+
+func (bt *BTree) wouldOverflowInternal(node *BTreeNode, extraKeyLen int) bool {
+	cellOverhead := 2 + extraKeyLen + 8
+	currentUsed := PageHeaderSize
+	for i := 0; i < node.Count; i++ {
+		currentUsed += 2 + len(node.Keys[i]) + 8
+	}
+	currentUsed += 8 + PageCRCSize
+	return currentUsed+cellOverhead > PageSize
+}
+
 func (bt *BTree) Sync() error {
 	if r := bt.db.region.Load(); r != nil {
 		return r.Sync(embeddbmmap.SyncSync)
