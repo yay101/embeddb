@@ -64,6 +64,7 @@ type OpenOptions struct {
 	CachePages    int
 	EncryptionKey []byte
 	StorageMode   StorageMode
+	WAL           bool
 }
 
 type UseOptions struct {
@@ -84,6 +85,7 @@ type DB struct {
 	cachePages    int
 	encryptionKey []byte
 	storageMode   StorageMode
+	wal           bool
 	writeCount    uint64
 	lastSync      time.Time
 	lock          sync.Mutex
@@ -103,6 +105,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	idleThreshold := 10 * time.Second
 	cachePages := 0
 	storageMode := StorageMmap
+	wal := false
 	var encryptionKey []byte
 	if len(opts) > 0 {
 		migrate = opts[0].Migrate
@@ -118,6 +121,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		}
 		encryptionKey = opts[0].EncryptionKey
 		storageMode = opts[0].StorageMode
+		wal = opts[0].WAL
 	}
 
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
@@ -143,6 +147,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		cachePages:    cachePages,
 		encryptionKey: encryptionKey,
 		storageMode:   storageMode,
+		wal:           wal,
 		writeCount:    0,
 		lastSync:      time.Now(),
 		tables:        make(map[string]*database),
@@ -204,7 +209,7 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 		typedDB = db.database
 	} else {
 		var err error
-		typedDB, err = openDatabase(db.filename, false, db, db.storageMode)
+		typedDB, err = openDatabase(db.filename, false, db, db.storageMode, db.wal)
 		if err != nil {
 			return nil, err
 		}

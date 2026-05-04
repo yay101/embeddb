@@ -74,6 +74,7 @@ type database struct {
 	file            *os.File
 	filename        string
 	region          atomic.Pointer[embeddbmmap.MappedRegion]
+	wal             *wal
 	index           *BTree
 	indexRoot       uint64
 	alloc           *allocator
@@ -144,6 +145,12 @@ func (db *database) readAt(buf []byte, offset int64) error {
 }
 
 func (db *database) writeAt(buf []byte, offset int64) error {
+	if db.wal != nil {
+		if err := db.wal.Write(uint64(offset), buf); err != nil {
+			return fmt.Errorf("writeAt wal: %w", err)
+		}
+	}
+
 	for {
 		currentRegion := db.region.Load()
 		if currentRegion == nil {
@@ -182,7 +189,7 @@ func (db *database) readAtFn() func([]byte, int64) {
 	}
 }
 
-func openDatabase(filename string, migrate bool, parent *DB, storageMode StorageMode) (*database, error) {
+func openDatabase(filename string, migrate bool, parent *DB, storageMode StorageMode, useWAL bool) (*database, error) {
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
@@ -222,6 +229,31 @@ func openDatabase(filename string, migrate bool, parent *DB, storageMode Storage
 		migrate:         true,
 		droppedIndexes:  make(map[string]map[string]bool),
 		explicitIndexes: make(map[string][]string),
+	}
+
+	if useWAL {
+		var walErr error
+		db.wal, walErr = openWAL(filename)
+		if walErr != nil {
+			unlockFile(file)
+			file.Close()
+			return nil, fmt.Errorf("failed to open WAL: %w", walErr)
+		}
+
+		if stat, err := db.wal.file.Stat(); err == nil && stat.Size() > WALHeaderSz {
+			if err := db.wal.Replay(file); err != nil {
+				unlockFile(file)
+				file.Close()
+				return nil, fmt.Errorf("failed to replay WAL: %w", err)
+			}
+
+			stat, err = file.Stat()
+			if err != nil {
+				unlockFile(file)
+				file.Close()
+				return nil, fmt.Errorf("failed to stat file after WAL replay: %v", err)
+			}
+		}
 	}
 
 	if stat.Size() == 0 {
@@ -674,6 +706,12 @@ func (db *database) flush() error {
 	db.index = newIndex
 	db.indexRoot = btreeRoot
 
+	if db.wal != nil {
+		if err := db.wal.Checkpoint(db.file); err != nil {
+			return err
+		}
+	}
+
 	if r := db.region.Load(); r != nil {
 		return r.Sync(embeddbmmap.SyncSync)
 	}
@@ -712,6 +750,10 @@ func (db *database) Close() error {
 	defer db.mu.Unlock()
 
 	flushErr := db.flush()
+
+	if db.wal != nil {
+		db.wal.Checkpoint(db.file)
+	}
 
 	if r := db.region.Load(); r != nil {
 		r.Unmap()

@@ -22,13 +22,14 @@ func measureMem() uint64 {
 	return ms.TotalAlloc
 }
 
-func benchInsert(mode StorageMode, label string, count int) (time.Duration, uint64, int64) {
+func benchInsert(mode StorageMode, label string, count int, useWAL bool) (time.Duration, uint64, int64) {
 	dbPath := fmt.Sprintf("/tmp/bench_%s_%d.db", label, count)
 	os.Remove(dbPath)
+	os.Remove(dbPath + ".wal")
 
 	memBefore := measureMem()
 
-	db, err := Open(dbPath, OpenOptions{StorageMode: mode})
+	db, err := Open(dbPath, OpenOptions{StorageMode: mode, WAL: useWAL})
 	if err != nil {
 		panic(err)
 	}
@@ -60,15 +61,17 @@ func benchInsert(mode StorageMode, label string, count int) (time.Duration, uint
 	fileSize := fileInfo.Size()
 
 	os.Remove(dbPath)
+	os.Remove(dbPath + ".wal")
 
 	return elapsed, heapAlloc, fileSize
 }
 
-func benchRead(mode StorageMode, label string, count int) time.Duration {
+func benchRead(mode StorageMode, label string, count int, useWAL bool) time.Duration {
 	dbPath := fmt.Sprintf("/tmp/bench_%s_%d.db", label, count)
 	os.Remove(dbPath)
+	os.Remove(dbPath + ".wal")
 
-	db, _ := Open(dbPath, OpenOptions{StorageMode: mode})
+	db, _ := Open(dbPath, OpenOptions{StorageMode: mode, WAL: useWAL})
 	tbl, _ := Use[BenchRecord](db, "bench")
 	for i := 0; i < count; i++ {
 		tbl.Insert(&BenchRecord{
@@ -79,7 +82,7 @@ func benchRead(mode StorageMode, label string, count int) time.Duration {
 	}
 	db.Close()
 
-	db, _ = Open(dbPath, OpenOptions{StorageMode: mode})
+	db, _ = Open(dbPath, OpenOptions{StorageMode: mode, WAL: useWAL})
 	tbl, _ = Use[BenchRecord](db, "bench")
 
 	start := time.Now()
@@ -90,15 +93,17 @@ func benchRead(mode StorageMode, label string, count int) time.Duration {
 
 	db.Close()
 	os.Remove(dbPath)
+	os.Remove(dbPath + ".wal")
 
 	return elapsed
 }
 
-func benchQuery(mode StorageMode, label string, count int) time.Duration {
+func benchQuery(mode StorageMode, label string, count int, useWAL bool) time.Duration {
 	dbPath := fmt.Sprintf("/tmp/bench_%s_%d.db", label, count)
 	os.Remove(dbPath)
+	os.Remove(dbPath + ".wal")
 
-	db, _ := Open(dbPath, OpenOptions{StorageMode: mode})
+	db, _ := Open(dbPath, OpenOptions{StorageMode: mode, WAL: useWAL})
 	tbl, _ := Use[BenchRecord](db, "bench")
 	for i := 0; i < count; i++ {
 		tbl.Insert(&BenchRecord{
@@ -109,7 +114,7 @@ func benchQuery(mode StorageMode, label string, count int) time.Duration {
 	}
 	db.Close()
 
-	db, _ = Open(dbPath, OpenOptions{StorageMode: mode})
+	db, _ = Open(dbPath, OpenOptions{StorageMode: mode, WAL: useWAL})
 	tbl, _ = Use[BenchRecord](db, "bench")
 
 	start := time.Now()
@@ -120,34 +125,46 @@ func benchQuery(mode StorageMode, label string, count int) time.Duration {
 
 	db.Close()
 	os.Remove(dbPath)
+	os.Remove(dbPath + ".wal")
 
 	return elapsed
 }
 
 func TestStorageBenchmark(t *testing.T) {
-	counts := []int{10_000, 100_000, 300_000}
-
-	t.Logf("\n%-20s | %-12s | %-12s | %-12s | %-12s | %-12s | %-12s | %-12s",
-		"Operation", "10k Mmap", "10k File", "100k Mmap", "100k File", "300k Mmap", "300k File", "Delta")
-	t.Logf("%s", "-------------------|--------------|--------------|--------------|--------------|--------------|--------------|--------------")
+	counts := []int{10_000, 100_000}
 
 	for _, count := range counts {
 		label := fmt.Sprintf("%dk", count/1000)
 
-		mmapInsertTime, mmapInsertMem, mmapFileSize := benchInsert(StorageMmap, "mmap", count)
-		fileInsertTime, fileInsertMem, fileFileSize := benchInsert(StorageFile, "file", count)
+		t.Logf("\n=== [%s entries] ===\n", label)
 
-		mmapReadTime := benchRead(StorageMmap, "mmap", count)
-		fileReadTime := benchRead(StorageFile, "file", count)
+		mmapInsertTime, mmapInsertMem, mmapFileSize := benchInsert(StorageMmap, "mmap", count, false)
+		mmapWalInsertTime, mmapWalInsertMem, mmapWalFileSize := benchInsert(StorageMmap, "mmap_wal", count, true)
+		fileInsertTime, fileInsertMem, fileFileSize := benchInsert(StorageFile, "file", count, false)
+		fileWalInsertTime, fileWalInsertMem, fileWalFileSize := benchInsert(StorageFile, "file_wal", count, true)
 
-		mmapQueryTime := benchQuery(StorageMmap, "mmap", count)
-		fileQueryTime := benchQuery(StorageFile, "file", count)
+		mmapReadTime := benchRead(StorageMmap, "mmap", count, false)
+		mmapWalReadTime := benchRead(StorageMmap, "mmap_wal", count, true)
+		fileReadTime := benchRead(StorageFile, "file", count, false)
+		fileWalReadTime := benchRead(StorageFile, "file_wal", count, true)
 
-		t.Logf("\n[%s entries]\n", label)
-		t.Logf("Insert time:    mmap=%v  file=%v  (file %.1fx)", mmapInsertTime, fileInsertTime, float64(fileInsertTime)/float64(mmapInsertTime))
-		t.Logf("Insert memory:  mmap=%dMB  file=%dMB", mmapInsertMem/1024/1024, fileInsertMem/1024/1024)
-		t.Logf("File size:      mmap=%dMB  file=%dMB", mmapFileSize/1024/1024, fileFileSize/1024/1024)
-		t.Logf("Read all:       mmap=%v  file=%v  (file %.1fx)", mmapReadTime, fileReadTime, float64(fileReadTime)/float64(mmapReadTime))
-		t.Logf("Query 100:      mmap=%v  file=%v  (file %.1fx)", mmapQueryTime, fileQueryTime, float64(fileQueryTime)/float64(mmapQueryTime))
+		mmapQueryTime := benchQuery(StorageMmap, "mmap", count, false)
+		mmapWalQueryTime := benchQuery(StorageMmap, "mmap_wal", count, true)
+		fileQueryTime := benchQuery(StorageFile, "file", count, false)
+		fileWalQueryTime := benchQuery(StorageFile, "file_wal", count, true)
+
+		t.Logf("Insert time:    mmap=%v  mmap+wal=%v(%.1fx)  file=%v  file+wal=%v(%.1fx)",
+			mmapInsertTime, mmapWalInsertTime, float64(mmapWalInsertTime)/float64(mmapInsertTime),
+			fileInsertTime, fileWalInsertTime, float64(fileWalInsertTime)/float64(fileInsertTime))
+		t.Logf("Insert memory:  mmap=%dMB  mmap+wal=%dMB  file=%dMB  file+wal=%dMB",
+			mmapInsertMem/1024/1024, mmapWalInsertMem/1024/1024,
+			fileInsertMem/1024/1024, fileWalInsertMem/1024/1024)
+		t.Logf("File size:      mmap=%dMB(+%dMB wal)  file=%dMB(+%dMB wal)",
+			mmapFileSize/1024/1024, (mmapWalFileSize-mmapFileSize)/1024/1024,
+			fileFileSize/1024/1024, (fileWalFileSize-fileFileSize)/1024/1024)
+		t.Logf("Read all:       mmap=%v  mmap+wal=%v  file=%v  file+wal=%v",
+			mmapReadTime, mmapWalReadTime, fileReadTime, fileWalReadTime)
+		t.Logf("Query 100:      mmap=%v  mmap+wal=%v  file=%v  file+wal=%v",
+			mmapQueryTime, mmapWalQueryTime, fileQueryTime, fileWalQueryTime)
 	}
 }

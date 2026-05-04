@@ -14,6 +14,12 @@ func (db *database) Vacuum() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	if db.wal != nil {
+		if err := db.wal.Checkpoint(db.file); err != nil {
+			return err
+		}
+	}
+
 	newFile, err := os.OpenFile(db.filename+".vacuum", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
@@ -114,6 +120,11 @@ func (db *database) Vacuum() error {
 		db.region.Store(nil)
 	}
 	db.file.Close()
+
+	if db.wal != nil {
+		db.wal.Close()
+		db.wal = nil
+	}
 
 	if err := os.Rename(db.filename+".vacuum", db.filename); err != nil {
 		return err

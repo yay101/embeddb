@@ -22,6 +22,7 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **Auto-sync** - Periodic disk flush (every N writes or idle timeout)
 - **FastSync** - Quick fsync without defragmentation
 - **Storage modes** - Memory-mapped (default) or file-only I/O
+- **Write-Ahead Log (WAL)** - Crash recovery with append-only logging
 - **PK uniqueness** - Error on duplicate primary keys
 - **Versioning** - Keep N previous versions of records with timestamps
 
@@ -196,6 +197,31 @@ db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
 **StorageMmap** (default): Uses memory-mapped files for zero-copy page access. Best for most workloads.
 
 **StorageFile**: Uses direct file I/O (`ReadAt`/`WriteAt`). Avoids mmap overhead and virtual memory reservation. Useful on constrained systems or when you want explicit I/O control. Performance difference is minimal (~10% on inserts at small scale, converges to equal at scale).
+
+### Write-Ahead Log (WAL)
+
+Enable WAL for crash recovery. All writes are logged to a `.wal` file before being applied to the main database. On startup, uncommitted WAL entries are replayed automatically.
+
+```go
+// Enable WAL for crash recovery
+db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
+    WAL: true,
+})
+```
+
+**How it works:**
+- Every write is appended to `<dbname>.wal` before being applied to the main file
+- On `Sync()`, `Close()`, or `Vacuum()`, the WAL is checkpointed (applied to main file and removed)
+- On open, if a WAL file exists, entries are replayed to recover from crashes
+- WAL entries include CRC32 checksums for corruption detection
+
+**Trade-offs:**
+- Insert throughput is ~1.5-1.7x slower with WAL (double-write to WAL + main file)
+- Read performance is similar or slightly better (OS page cache benefits)
+- WAL file grows until checkpointed — call `db.Sync()` periodically for long-running write-heavy workloads
+- Memory usage and final file size are identical
+
+**Crash recovery:** If the process crashes without calling `Close()`, reopening the database automatically replays the WAL to restore all committed writes.
 
 ### CRUD Operations
 
@@ -474,6 +500,7 @@ carts.Insert(&Cart{
 - Primary Index: Persistent B-tree with mmap or file I/O (configurable), Copy-on-Write transactions
 - Secondary Indexes: Persistent B-tree indexes with automatic recovery
 - Version Index: B-tree tracking record version history
+- WAL: Append-only log file (`<dbname>.wal`) for crash recovery, entries have CRC32 checksums
 - B-tree nodes: 4096 bytes per node, LRU cache with configurable size
 - Record IDs: uint32 (4 bytes) in secondary key suffix for compact storage
 
