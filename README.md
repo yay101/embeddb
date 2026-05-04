@@ -23,6 +23,11 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **FastSync** - Quick fsync without defragmentation
 - **Storage modes** - Memory-mapped (default) or file-only I/O
 - **Write-Ahead Log (WAL)** - Crash recovery with append-only logging
+- **Compression** - Optional snappy compression for record payloads
+- **Backup API** - Consistent database file backup with WAL support
+- **Adaptive cache** - B-tree page cache auto-sizes based on hit rate
+- **Bulk insert** - Optimized sorted B-tree build for batch inserts
+- **Fine-grained locking** - Read operations bypass global lock for better concurrency
 - **PK uniqueness** - Error on duplicate primary keys
 - **Versioning** - Keep N previous versions of records with timestamps
 
@@ -222,6 +227,63 @@ db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
 - Memory usage and final file size are identical
 
 **Crash recovery:** If the process crashes without calling `Close()`, reopening the database automatically replays the WAL to restore all committed writes.
+
+### Compression
+
+Optional snappy compression for record payloads. Only activates when compressed size is smaller than original.
+
+```go
+db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
+    Compression:    true,   // Enable compression
+    CompressMinLen: 64,     // Only compress payloads >= 64 bytes (default)
+})
+```
+
+**Trade-offs:**
+- Up to 90% file size reduction on repetitive/compressible data
+- Minimal CPU overhead (snappy is designed for speed)
+- Transparent — decompression happens automatically on read
+- Small payloads (<64 bytes) are not compressed to avoid overhead
+
+### Bulk Insert
+
+Optimized batch insertion that sorts keys and builds the B-tree bottom-up, avoiding per-insert page splits.
+
+```go
+records := []*User{ /* ... */ }
+ids, err := users.InsertManyBulk(records)
+```
+
+**Performance:** ~1.3x faster than `InsertMany` for large batches (50k records: 49k/sec vs 37k/sec).
+
+### Backup API
+
+Creates a consistent copy of the database file, including the WAL if present.
+
+```go
+err := db.Backup("/path/to/backup.db")
+```
+
+- Atomic: removes partial backup on failure
+- Copies both the main database file and WAL file
+- Requires database to be open
+
+### Adaptive Cache
+
+The B-tree page cache auto-sizes based on observed hit rate:
+
+- Grows by 1.5x when hit rate > 90% (working set fits, cache is effective)
+- Shrinks by 2x when hit rate < 30% (cache is thrashing, wasting memory)
+- Clamped between 64 and 16,384 pages
+- Adjusts every 5 seconds after at least 100 accesses
+
+```go
+// Check cache stats
+stats := db.Stats()
+cache := stats.CacheStats["primary"]
+fmt.Printf("size=%d filled=%d hitRate=%.2f\n",
+    cache.Size, cache.Filled, cache.HitRate)
+```
 
 ### CRUD Operations
 
@@ -495,13 +557,13 @@ carts.Insert(&Cart{
 ## File Format
 
 - Header: 128 bytes (magic, version, catalog offset, B-tree roots)
-- Records: TLV-encoded with CRC verification, stored sequentially after header
+- Records: TLV-encoded with CRC verification, optional snappy compression (flagged in record header)
 - Catalog: table definitions at end of file
 - Primary Index: Persistent B-tree with mmap or file I/O (configurable), Copy-on-Write transactions
 - Secondary Indexes: Persistent B-tree indexes with automatic recovery
 - Version Index: B-tree tracking record version history
 - WAL: Append-only log file (`<dbname>.wal`) for crash recovery, entries have CRC32 checksums
-- B-tree nodes: 4096 bytes per node, LRU cache with configurable size
+- B-tree nodes: 4096 bytes per node, adaptive LRU cache (auto-sizes 64–16,384 pages based on hit rate)
 - Record IDs: uint32 (4 bytes) in secondary key suffix for compact storage
 
 ## Why EmbedDB?
