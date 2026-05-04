@@ -9,9 +9,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang/snappy"
 	"github.com/yay101/embeddbcore"
 	"github.com/yay101/embeddbmmap"
 )
+
+const FlagsCompressed byte = 0x04
 
 var hdrBufPool = sync.Pool{
 	New: func() any {
@@ -57,14 +60,16 @@ const (
 )
 
 type OpenOptions struct {
-	Migrate       bool
-	AutoIndex     bool
-	SyncThreshold uint64
-	IdleThreshold time.Duration
-	CachePages    int
-	EncryptionKey []byte
-	StorageMode   StorageMode
-	WAL           bool
+	Migrate        bool
+	AutoIndex      bool
+	SyncThreshold  uint64
+	IdleThreshold  time.Duration
+	CachePages     int
+	EncryptionKey  []byte
+	StorageMode    StorageMode
+	WAL            bool
+	Compression    bool
+	CompressMinLen int
 }
 
 type UseOptions struct {
@@ -77,21 +82,23 @@ type VersionMetadata struct {
 }
 
 type DB struct {
-	filename      string
-	migrate       bool
-	autoIndex     bool
-	syncThreshold uint64
-	idleThreshold time.Duration
-	cachePages    int
-	encryptionKey []byte
-	storageMode   StorageMode
-	wal           bool
-	writeCount    uint64
-	lastSync      time.Time
-	lock          sync.Mutex
-	closed        bool
-	database      *database
-	tables        map[string]*database
+	filename       string
+	migrate        bool
+	autoIndex      bool
+	syncThreshold  uint64
+	idleThreshold  time.Duration
+	cachePages     int
+	encryptionKey  []byte
+	storageMode    StorageMode
+	wal            bool
+	compression    bool
+	compressMinLen int
+	writeCount     uint64
+	lastSync       time.Time
+	lock           sync.Mutex
+	closed         bool
+	database       *database
+	tables         map[string]*database
 }
 
 func Open(filename string, opts ...OpenOptions) (*DB, error) {
@@ -106,6 +113,8 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	cachePages := 0
 	storageMode := StorageMmap
 	wal := false
+	compression := false
+	compressMinLen := 64
 	var encryptionKey []byte
 	if len(opts) > 0 {
 		migrate = opts[0].Migrate
@@ -122,6 +131,10 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		encryptionKey = opts[0].EncryptionKey
 		storageMode = opts[0].StorageMode
 		wal = opts[0].WAL
+		compression = opts[0].Compression
+		if opts[0].CompressMinLen > 0 {
+			compressMinLen = opts[0].CompressMinLen
+		}
 	}
 
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
@@ -139,18 +152,20 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	}
 
 	return &DB{
-		filename:      filename,
-		migrate:       migrate,
-		autoIndex:     autoIndex,
-		syncThreshold: syncThreshold,
-		idleThreshold: idleThreshold,
-		cachePages:    cachePages,
-		encryptionKey: encryptionKey,
-		storageMode:   storageMode,
-		wal:           wal,
-		writeCount:    0,
-		lastSync:      time.Now(),
-		tables:        make(map[string]*database),
+		filename:       filename,
+		migrate:        migrate,
+		autoIndex:      autoIndex,
+		syncThreshold:  syncThreshold,
+		idleThreshold:  idleThreshold,
+		cachePages:     cachePages,
+		encryptionKey:  encryptionKey,
+		storageMode:    storageMode,
+		wal:            wal,
+		compression:    compression,
+		compressMinLen: compressMinLen,
+		writeCount:     0,
+		lastSync:       time.Now(),
+		tables:         make(map[string]*database),
 	}, nil
 }
 
@@ -627,14 +642,31 @@ func (t *Table[T]) encodeRecord(record *T, recordID uint32, flags byte, prevVers
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode field payload: %w", err)
 	}
+
+	if t.db.parent != nil && t.db.parent.compression && len(payload) >= t.db.parent.compressMinLen {
+		compressed := snappy.Encode(nil, payload)
+		if len(compressed) < len(payload) {
+			flags |= FlagsCompressed
+			payload = compressed
+		}
+	}
+
 	return buildV2Record(t.tableID, recordID, t.layout.SchemaVersion, flags, prevVersionOff, payload), nil
 }
 
 func (t *Table[T]) decodeRecord(data []byte, result *T) error {
-	_, payload, err := parseV2Record(data)
+	hdr, payload, err := parseV2Record(data)
 	if err != nil {
 		return fmt.Errorf("failed to parse v2 record: %w", err)
 	}
+
+	if hdr.Flags&FlagsCompressed != 0 {
+		payload, err = snappy.Decode(nil, payload)
+		if err != nil {
+			return fmt.Errorf("failed to decompress record: %w", err)
+		}
+	}
+
 	return decodeFieldPayload(payload, result, t.layout, t.cipher)
 }
 

@@ -7,6 +7,9 @@ require (
 	github.com/yay101/embeddbmmap v0.1.2
 )
 
-require golang.org/x/sys v0.43.0 // indirect
+require (
+	github.com/golang/snappy v1.0.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+)
 
 // v1.8.0 - Migrate to embeddbmmap (fixed: no MREMAP_MAYMOVE), fix flush data loss, fix B-tree readNode)
