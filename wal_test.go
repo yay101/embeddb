@@ -121,6 +121,9 @@ func TestWALUncleanShutdown(t *testing.T) {
 		}
 	}
 
+	// Simulate crash: unlock and close file handles without proper cleanup
+	// In a real crash the kernel releases flock locks when the process dies
+	unlockFile(db.database.file)
 	db.database.file.Close()
 	db.database.region.Store(nil)
 	if db.database.wal != nil {

@@ -293,13 +293,6 @@ func openDatabase(filename string, migrate bool, parent *DB, storageMode Storage
 				file.Close()
 				return nil, fmt.Errorf("failed to replay WAL: %w", err)
 			}
-
-			stat, err = file.Stat()
-			if err != nil {
-				unlockFile(file)
-				file.Close()
-				return nil, fmt.Errorf("failed to stat file after WAL replay: %v", err)
-			}
 		}
 	}
 

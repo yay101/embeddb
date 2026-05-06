@@ -743,6 +743,9 @@ func TestAccountRecordsDebug(t *testing.T) {
 	t.Logf("Count() = %d", count)
 
 	all, err := tbl.All()
+	if err != nil {
+		t.Fatalf("All() failed: %v", err)
+	}
 	t.Logf("All() returned %d records", len(all))
 
 	if count != len(all) {

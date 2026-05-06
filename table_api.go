@@ -139,6 +139,14 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		}
 	}
 
+	if wal && storageMode == StorageMemory {
+		return nil, fmt.Errorf("WAL is not supported with StorageMemory mode")
+	}
+
+	if compression && len(encryptionKey) > 0 {
+		return nil, fmt.Errorf("compression and encryption cannot be used together: encrypted data is incompressible")
+	}
+
 	if storageMode != StorageMemory {
 		if filename == "" {
 			return nil, fmt.Errorf("filename is required")
@@ -167,13 +175,53 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		cachePages:     cachePages,
 		encryptionKey:  encryptionKey,
 		storageMode:    storageMode,
-		wal:            wal && storageMode != StorageMemory,
+		wal:            wal,
 		compression:    compression,
 		compressMinLen: compressMinLen,
 		writeCount:     0,
 		lastSync:       time.Now(),
 		tables:         make(map[string]*database),
 	}, nil
+}
+
+func validateLayout[T any]() error {
+	var instance T
+	t := reflect.TypeOf(instance)
+	if t == nil {
+		return nil
+	}
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		dbTag := f.Tag.Get("db")
+		if dbTag == "" {
+			continue
+		}
+
+		parts := strings.Split(dbTag, ",")
+		hasIndex := false
+		hasEncrypt := false
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "index" {
+				hasIndex = true
+			}
+			if part == "encrypt" {
+				hasEncrypt = true
+			}
+		}
+
+		if hasIndex && hasEncrypt {
+			return fmt.Errorf("field %q cannot have both index and encrypt tags: encrypted fields cannot be indexed", f.Name)
+		}
+	}
+	return nil
 }
 
 func Use[T any](db *DB, args ...any) (*Table[T], error) {
@@ -204,6 +252,12 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 
 	if db.closed {
 		return nil, fmt.Errorf("database is closed")
+	}
+
+	if len(db.encryptionKey) > 0 {
+		if err := validateLayout[T](); err != nil {
+			return nil, err
+		}
 	}
 
 	if existing, ok := db.tables[tableName]; ok {

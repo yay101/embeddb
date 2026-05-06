@@ -222,6 +222,22 @@ db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
 
 Memory mode is competitive on inserts and fastest on reads (no disk I/O). Persistent modes show similar performance at scale, with WAL adding ~20-50% overhead on inserts.
 
+### Feature Compatibility
+
+| Feature | StorageMemory | StorageMmap | StorageFile |
+|---------|:-------------:|:-----------:|:-----------:|
+| WAL | ❌ Error | ✅ | ✅ |
+| Compression | ✅ | ✅ | ✅ |
+| Encryption | ✅ | ✅ | ✅ |
+| Encryption + Compression | ❌ Error | ❌ Error | ❌ Error |
+| Backup | ❌ Error | ✅ | ✅ |
+| Vacuum | No-op | ✅ | ✅ |
+
+**Incompatible combinations (error at Open/Use time):**
+- `WAL + StorageMemory` — WAL requires a file, in-memory has none
+- `Encryption + Compression` — encrypted data is incompressible, compression provides zero benefit
+- `index + encrypt` on same field — encrypted fields cannot be indexed (error at `Use()` time)
+
 ### Write-Ahead Log (WAL)
 
 Enable WAL for crash recovery. All writes are logged to a `.wal` file before being applied to the main database. On startup, uncommitted WAL entries are replayed automatically.
@@ -607,3 +623,7 @@ carts.Insert(&Cart{
 - Complex relational queries (use SQLite)
 - High-concurrency writes (use PostgreSQL)
 - Distributed systems (use a real database)
+
+## License
+
+[GPL-3.0](LICENSE) — This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.

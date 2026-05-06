@@ -133,23 +133,9 @@ func TestEncryptedFieldWithIndexRejected(t *testing.T) {
 	}
 	defer db.Close()
 
-	users, err := Use[User](db, "users")
-	if err != nil {
-		t.Fatalf("Use: %v", err)
-	}
-
-	id, err := users.Insert(&User{Email: "alice@example.com"})
-	if err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-
-	user, err := users.Get(id)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if user.Email != "" {
-		// Email was skipped because index+encrypt is rejected during layout computation
-		t.Errorf("Email should be empty for index+encrypt field, got %q", user.Email)
+	_, err = Use[User](db, "users")
+	if err == nil {
+		t.Fatal("expected error for index+encrypt field")
 	}
 }
 
@@ -204,5 +190,20 @@ func TestEncryptedFieldInSliceOfStructs(t *testing.T) {
 	}
 	if cart.Items[1].Price != 19.99 {
 		t.Errorf("Item 1 price mismatch: got %f", cart.Items[1].Price)
+	}
+}
+
+func TestWALWithMemoryRejected(t *testing.T) {
+	_, err := Open("", OpenOptions{StorageMode: StorageMemory, WAL: true})
+	if err == nil {
+		t.Fatal("expected error for WAL + StorageMemory")
+	}
+}
+
+func TestEncryptionWithCompressionRejected(t *testing.T) {
+	key := []byte("01234567890123456789012345678901")
+	_, err := Open("/tmp/test_enc_comp.db", OpenOptions{EncryptionKey: key, Compression: true})
+	if err == nil {
+		t.Fatal("expected error for encryption + compression")
 	}
 }
