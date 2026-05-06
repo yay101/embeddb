@@ -21,7 +21,7 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **Index recovery** - Automatically rebuilds indexes on startup if corrupted
 - **Auto-sync** - Periodic disk flush (every N writes or idle timeout)
 - **FastSync** - Quick fsync without defragmentation
-- **Storage modes** - Memory-mapped (default) or file-only I/O
+- **Storage modes** - In-memory, memory-mapped (default), or file-only I/O
 - **Write-Ahead Log (WAL)** - Crash recovery with append-only logging
 - **Compression** - Optional snappy compression for record payloads
 - **Backup API** - Consistent database file backup with WAL support
@@ -188,6 +188,11 @@ for _, v := range versions {
 EmbedDB supports two storage backends:
 
 ```go
+// In-memory - no persistence, fastest for ephemeral data
+db, err := embeddb.Open("", embeddb.OpenOptions{
+    StorageMode: embeddb.StorageMemory,
+})
+
 // Memory-mapped I/O (default) - zero-copy reads, kernel-managed caching
 db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
     StorageMode: embeddb.StorageMmap,
@@ -199,9 +204,23 @@ db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
 })
 ```
 
+**StorageMemory**: Pure in-memory storage using anonymous memory mapping. No file I/O, no persistence. Data is lost when the database is closed. WAL is automatically disabled. Best for ephemeral data, testing, or caching.
+
 **StorageMmap** (default): Uses memory-mapped files for zero-copy page access. Best for most workloads.
 
-**StorageFile**: Uses direct file I/O (`ReadAt`/`WriteAt`). Avoids mmap overhead and virtual memory reservation. Useful on constrained systems or when you want explicit I/O control. Performance difference is minimal (~10% on inserts at small scale, converges to equal at scale).
+**StorageFile**: Uses direct file I/O (`ReadAt`/`WriteAt`). Avoids mmap overhead and virtual memory reservation. Useful on constrained systems or when you want explicit I/O control.
+
+### Storage Mode Benchmarks
+
+| Mode | 10k Insert | 50k Insert | 100k Insert | 100k Read | 100k Query(100) |
+|------|-----------|-----------|------------|----------|----------------|
+| Memory | 63ms | 338ms | 714ms | 23ms | 36µs |
+| Mmap | 59ms | 329ms | 820ms | 177ms | 78µs |
+| Mmap+WAL | 81ms | 492ms | 962ms | 157ms | 52µs |
+| File | 59ms | 442ms | 694ms | 159ms | 32µs |
+| File+WAL | 87ms | 457ms | 890ms | 188ms | 31µs |
+
+Memory mode is competitive on inserts and fastest on reads (no disk I/O). Persistent modes show similar performance at scale, with WAL adding ~20-50% overhead on inserts.
 
 ### Write-Ahead Log (WAL)
 

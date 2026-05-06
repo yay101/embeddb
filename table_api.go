@@ -57,6 +57,7 @@ type StorageMode int
 const (
 	StorageMmap StorageMode = iota
 	StorageFile
+	StorageMemory
 )
 
 type OpenOptions struct {
@@ -102,8 +103,9 @@ type DB struct {
 }
 
 func Open(filename string, opts ...OpenOptions) (*DB, error) {
-	if filename == "" {
-		return nil, fmt.Errorf("filename is required")
+	optsCopy := OpenOptions{}
+	if len(opts) > 0 {
+		optsCopy = opts[0]
 	}
 
 	migrate := true
@@ -117,32 +119,37 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	compressMinLen := 64
 	var encryptionKey []byte
 	if len(opts) > 0 {
-		migrate = opts[0].Migrate
-		autoIndex = opts[0].AutoIndex
-		if opts[0].SyncThreshold > 0 {
-			syncThreshold = opts[0].SyncThreshold
+		migrate = optsCopy.Migrate
+		autoIndex = optsCopy.AutoIndex
+		if optsCopy.SyncThreshold > 0 {
+			syncThreshold = optsCopy.SyncThreshold
 		}
-		if opts[0].IdleThreshold > 0 {
-			idleThreshold = opts[0].IdleThreshold
+		if optsCopy.IdleThreshold > 0 {
+			idleThreshold = optsCopy.IdleThreshold
 		}
-		if opts[0].CachePages > 0 {
-			cachePages = opts[0].CachePages
+		if optsCopy.CachePages > 0 {
+			cachePages = optsCopy.CachePages
 		}
-		encryptionKey = opts[0].EncryptionKey
-		storageMode = opts[0].StorageMode
-		wal = opts[0].WAL
-		compression = opts[0].Compression
-		if opts[0].CompressMinLen > 0 {
-			compressMinLen = opts[0].CompressMinLen
+		encryptionKey = optsCopy.EncryptionKey
+		storageMode = optsCopy.StorageMode
+		wal = optsCopy.WAL
+		compression = optsCopy.Compression
+		if optsCopy.CompressMinLen > 0 {
+			compressMinLen = optsCopy.CompressMinLen
 		}
 	}
 
-	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close file handle: %w", err)
+	if storageMode != StorageMemory {
+		if filename == "" {
+			return nil, fmt.Errorf("filename is required")
+		}
+		file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open file: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close file handle: %w", err)
+		}
 	}
 
 	if len(encryptionKey) > 0 {
@@ -160,7 +167,7 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		cachePages:     cachePages,
 		encryptionKey:  encryptionKey,
 		storageMode:    storageMode,
-		wal:            wal,
+		wal:            wal && storageMode != StorageMemory,
 		compression:    compression,
 		compressMinLen: compressMinLen,
 		writeCount:     0,

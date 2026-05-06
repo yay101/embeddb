@@ -90,6 +90,33 @@ type database struct {
 func (db *database) ensureRegion(size int64) error {
 	currentRegion := db.region.Load()
 	if currentRegion == nil {
+		alignedSize := pageAlign(size)
+		if db.file != nil {
+			if stat, err := db.file.Stat(); err == nil {
+				if stat.Size() > alignedSize {
+					alignedSize = pageAlign(stat.Size())
+				}
+			}
+			if err := db.file.Truncate(alignedSize); err != nil {
+				return err
+			}
+			db.fileTruncatedTo = alignedSize
+			region, err := embeddbmmap.Map(int(db.file.Fd()), 0, alignedSize, embeddbmmap.ProtRead|embeddbmmap.ProtWrite, embeddbmmap.MapShared)
+			if err != nil {
+				region, err = embeddbmmap.Map(int(db.file.Fd()), 0, alignedSize, embeddbmmap.ProtRead, embeddbmmap.MapShared)
+				if err != nil {
+					return err
+				}
+			}
+			db.region.Store(region)
+			region.Advise(embeddbmmap.AdviceRandom)
+		} else {
+			region, err := embeddbmmap.MapAnonymous(alignedSize, embeddbmmap.ProtRead|embeddbmmap.ProtWrite)
+			if err != nil {
+				return err
+			}
+			db.region.Store(region)
+		}
 		return nil
 	}
 
@@ -98,7 +125,7 @@ func (db *database) ensureRegion(size int64) error {
 	regionSize := currentRegion.Size()
 	currentRegion.RUnlock()
 	if alignedSize <= regionSize {
-		if db.fileTruncatedTo < regionSize {
+		if db.file != nil && db.fileTruncatedTo < regionSize {
 			if err := db.file.Truncate(regionSize); err != nil {
 				return err
 			}
@@ -107,8 +134,10 @@ func (db *database) ensureRegion(size int64) error {
 		return nil
 	}
 
-	if err := db.file.Truncate(alignedSize); err != nil {
-		return err
+	if db.file != nil {
+		if err := db.file.Truncate(alignedSize); err != nil {
+			return err
+		}
 	}
 	relocated, err := currentRegion.Resize(alignedSize)
 	if err != nil {
@@ -125,6 +154,9 @@ func (db *database) readAt(buf []byte, offset int64) error {
 	for {
 		currentRegion := db.region.Load()
 		if currentRegion == nil {
+			if db.file == nil {
+				return fmt.Errorf("readAt: no region or file")
+			}
 			if _, err := db.file.ReadAt(buf, offset); err != nil {
 				return fmt.Errorf("readAt: %w", err)
 			}
@@ -154,6 +186,9 @@ func (db *database) writeAt(buf []byte, offset int64) error {
 	for {
 		currentRegion := db.region.Load()
 		if currentRegion == nil {
+			if db.file == nil {
+				return fmt.Errorf("writeAt: no region or file")
+			}
 			if _, err := db.file.WriteAt(buf, offset); err != nil {
 				return fmt.Errorf("writeAt: %w", err)
 			}
@@ -185,35 +220,47 @@ func (db *database) readAtFn() func([]byte, int64) {
 		}
 	}
 	return func(buf []byte, offset int64) {
-		db.file.ReadAt(buf, offset)
+		if db.file != nil {
+			db.file.ReadAt(buf, offset)
+		}
 	}
 }
 
 func openDatabase(filename string, migrate bool, parent *DB, storageMode StorageMode, useWAL bool) (*database, error) {
-	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
-	}
+	var file *os.File
+	var stat os.FileInfo
+	var err error
 
-	if err := lockFile(file); err != nil {
-		file.Close()
-		return nil, err
+	if storageMode != StorageMemory {
+		file, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open file: %w", err)
+		}
+
+		if err := lockFile(file); err != nil {
+			file.Close()
+			return nil, err
+		}
+
+		stat, err = file.Stat()
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to stat file: %v", err)
+		}
+	} else {
+		stat = &memFileInfo{size: 0}
 	}
 
 	alloc := newAllocator(file)
 
-	stat, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return nil, fmt.Errorf("failed to stat file: %v", err)
-	}
-
 	var indexRoot uint64
 	if stat.Size() > 0 {
 		headerBuf := make([]byte, FileHeaderSize)
-		if _, err := file.ReadAt(headerBuf, 0); err == nil {
-			if headerBuf[0] == V2RecordVersion {
-				indexRoot = binary.LittleEndian.Uint64(headerBuf[56:64])
+		if file != nil {
+			if _, err := file.ReadAt(headerBuf, 0); err == nil {
+				if headerBuf[0] == V2RecordVersion {
+					indexRoot = binary.LittleEndian.Uint64(headerBuf[56:64])
+				}
 			}
 		}
 	}
@@ -231,7 +278,7 @@ func openDatabase(filename string, migrate bool, parent *DB, storageMode Storage
 		explicitIndexes: make(map[string][]string),
 	}
 
-	if useWAL {
+	if useWAL && file != nil {
 		var walErr error
 		db.wal, walErr = openWAL(filename)
 		if walErr != nil {
@@ -282,19 +329,29 @@ func openDatabase(filename string, migrate bool, parent *DB, storageMode Storage
 			file.Close()
 			return nil, err
 		}
+	} else if storageMode == StorageMemory {
+		memSize := pageAlign(4 * 1024 * 1024)
+		if err := db.ensureRegion(memSize); err != nil {
+			return nil, err
+		}
 	}
+
 	db.index, err = db.openBTree(db.indexRoot)
 	if err != nil {
-		unlockFile(file)
-		file.Close()
+		if file != nil {
+			unlockFile(file)
+			file.Close()
+		}
 		return nil, err
 	}
 	db.indexRoot = db.index.RootOffset()
 
 	if err := db.load(); err != nil {
 		if rebuildErr := db.rebuildIndexFromScan(); rebuildErr != nil {
-			unlockFile(file)
-			file.Close()
+			if file != nil {
+				unlockFile(file)
+				file.Close()
+			}
 			return nil, fmt.Errorf("failed to load index: %w, failed to rebuild: %v", err, rebuildErr)
 		}
 	}
@@ -304,13 +361,35 @@ func openDatabase(filename string, migrate bool, parent *DB, storageMode Storage
 	return db, nil
 }
 
+type memFileInfo struct {
+	size int64
+}
+
+func (m *memFileInfo) Name() string       { return "" }
+func (m *memFileInfo) Size() int64        { return m.size }
+func (m *memFileInfo) Mode() os.FileMode  { return 0 }
+func (m *memFileInfo) ModTime() time.Time { return time.Time{} }
+func (m *memFileInfo) IsDir() bool        { return false }
+func (m *memFileInfo) Sys() any           { return nil }
+
 func (db *database) load() error {
-	stat, err := db.file.Stat()
-	if err != nil {
-		return err
+	var fileSize int64
+	if db.file != nil {
+		stat, err := db.file.Stat()
+		if err != nil {
+			return err
+		}
+		fileSize = stat.Size()
+	} else {
+		r := db.region.Load()
+		if r != nil {
+			r.RLock()
+			fileSize = r.Size()
+			r.RUnlock()
+		}
 	}
 
-	if stat.Size() == 0 {
+	if fileSize == 0 {
 		return nil
 	}
 
@@ -330,10 +409,10 @@ func (db *database) load() error {
 
 	db.alloc.Reset(nextOffset, nil)
 
-	if tableCount > 0 && tocOffset > 0 && int64(tocOffset) < stat.Size() {
+	if tableCount > 0 && tocOffset > 0 && int64(tocOffset) < fileSize {
 		tocEnd := int64(nextOffset)
-		if tocEnd <= 0 || tocEnd > stat.Size() {
-			tocEnd = stat.Size()
+		if tocEnd <= 0 || tocEnd > fileSize {
+			tocEnd = fileSize
 		}
 		tocLen := int(tocEnd - int64(tocOffset))
 		if tocLen > 0 && tocLen < 1024*1024 {
@@ -353,25 +432,36 @@ func (db *database) load() error {
 }
 
 func (db *database) rebuildIndexFromScan() error {
-	stat, err := db.file.Stat()
-	if err != nil {
-		return err
+	var fileSize int64
+	if db.file != nil {
+		stat, err := db.file.Stat()
+		if err != nil {
+			return err
+		}
+		fileSize = stat.Size()
+	} else {
+		r := db.region.Load()
+		if r != nil {
+			r.RLock()
+			fileSize = r.Size()
+			r.RUnlock()
+		}
 	}
 
-	if stat.Size() == 0 {
+	if fileSize == 0 {
 		db.alloc.Reset(FileHeaderSize, nil)
 		return nil
 	}
 
-	fileSize := stat.Size()
-
 	var scanLimit int64 = fileSize
 	var fileHeader [FileHeaderSize]byte
-	if n, err := db.file.ReadAt(fileHeader[:], 0); err == nil && n == FileHeaderSize {
-		if fileHeader[0] == V2RecordVersion {
-			nextOff := int64(binary.LittleEndian.Uint64(fileHeader[48:56]))
-			if nextOff >= FileHeaderSize && nextOff < fileSize {
-				scanLimit = nextOff
+	if db.file != nil {
+		if n, err := db.file.ReadAt(fileHeader[:], 0); err == nil && n == FileHeaderSize {
+			if fileHeader[0] == V2RecordVersion {
+				nextOff := int64(binary.LittleEndian.Uint64(fileHeader[48:56]))
+				if nextOff >= FileHeaderSize && nextOff < fileSize {
+					scanLimit = nextOff
+				}
 			}
 		}
 	}
@@ -386,24 +476,25 @@ func (db *database) rebuildIndexFromScan() error {
 	offset := int64(FileHeaderSize)
 	for offset < scanLimit-embeddbcore.RecordHeaderSize {
 		hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
-		n, err := db.file.ReadAt(hdrBuf, offset)
-		if err != nil || n < embeddbcore.RecordHeaderSize {
+		if err := db.readAt(hdrBuf, offset); err != nil {
 			offset++
 			continue
 		}
 
 		if hdrBuf[0] == 0 {
-			skipN, _ := db.file.ReadAt(skipBuf, offset)
-			allZero := true
-			for i := 0; i < skipN; i++ {
-				if skipBuf[i] != 0 {
-					allZero = false
-					break
+			if db.file != nil {
+				skipN, _ := db.file.ReadAt(skipBuf, offset)
+				allZero := true
+				for i := 0; i < skipN; i++ {
+					if skipBuf[i] != 0 {
+						allZero = false
+						break
+					}
 				}
-			}
-			if allZero && skipN > 0 {
-				offset += int64(skipN)
-				continue
+				if allZero && skipN > 0 {
+					offset += int64(skipN)
+					continue
+				}
 			}
 			offset++
 			continue
@@ -637,13 +728,15 @@ func (db *database) flush() error {
 
 	writeOffset := recordStart
 	for i := range compacted {
-		if _, err := db.file.WriteAt(compacted[i].data, writeOffset); err != nil {
+		if err := db.writeAt(compacted[i].data, writeOffset); err != nil {
 			return err
 		}
 		writeOffset += int64(len(compacted[i].data))
 	}
 
-	db.file.Sync()
+	if db.file != nil {
+		db.file.Sync()
+	}
 
 	db.index.Close()
 
@@ -652,7 +745,9 @@ func (db *database) flush() error {
 		btreeStart = 4096
 	}
 
-	db.file.Sync()
+	if db.file != nil {
+		db.file.Sync()
+	}
 
 	db.alloc.Reset(btreeStart, nil)
 
@@ -697,16 +792,20 @@ func (db *database) flush() error {
 	if alignedKeep > keepSize {
 		keepSize = alignedKeep
 	}
-	db.file.Truncate(keepSize)
+	if db.file != nil {
+		db.file.Truncate(keepSize)
+	}
 	db.fileTruncatedTo = keepSize
-	db.file.Sync()
+	if db.file != nil {
+		db.file.Sync()
+	}
 
 	db.writeAt(header, 0)
 
 	db.index = newIndex
 	db.indexRoot = btreeRoot
 
-	if db.wal != nil {
+	if db.wal != nil && db.file != nil {
 		if err := db.wal.Checkpoint(db.file); err != nil {
 			return err
 		}
@@ -761,7 +860,7 @@ func (db *database) Close() error {
 
 	flushErr := db.flush()
 
-	if db.wal != nil {
+	if db.wal != nil && db.file != nil {
 		db.wal.Checkpoint(db.file)
 	}
 
@@ -769,13 +868,15 @@ func (db *database) Close() error {
 		r.Unmap()
 		db.region.Store(nil)
 	}
-	unlockFile(db.file)
-	closeErr := db.file.Close()
+	if db.file != nil {
+		unlockFile(db.file)
+		db.file.Close()
+	}
 
 	if flushErr != nil {
 		return flushErr
 	}
-	return closeErr
+	return nil
 }
 
 func (db *database) autoSync() {

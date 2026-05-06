@@ -12,4 +12,4 @@ require (
 	golang.org/x/sys v0.43.0 // indirect
 )
 
-// v1.8.0 - Migrate to embeddbmmap (fixed: no MREMAP_MAYMOVE), fix flush data loss, fix B-tree readNode)
+// v1.9.4 - Add in-memory storage backend (StorageMemory), fix mmap region creation bug

@@ -14,6 +14,10 @@ func (db *database) Vacuum() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	if db.file == nil {
+		return nil
+	}
+
 	if db.wal != nil {
 		if err := db.wal.Checkpoint(db.file); err != nil {
 			return err

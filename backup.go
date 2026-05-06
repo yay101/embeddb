@@ -22,6 +22,10 @@ func (db *DB) Backup(destPath string) error {
 		return fmt.Errorf("database not initialized")
 	}
 
+	if db.database.file == nil {
+		return fmt.Errorf("backup not supported for in-memory databases")
+	}
+
 	srcFile := db.database.file
 	srcPath := db.filename
 
