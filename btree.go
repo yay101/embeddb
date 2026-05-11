@@ -390,17 +390,20 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 				} else {
 					pageBufPool.Put(filePageBufPtr)
 					pageBufPool.Put(pageBufPtr)
-					return nil, fmt.Errorf("btree page %d: CRC mismatch (stored=%08x computed=%08x)", offset, storedCRC, computedCRC)
+					diag := bt.diagCRC(offset, pageCopy, filePageCopy)
+					return nil, fmt.Errorf("btree page %d: CRC mismatch (stored=%08x computed=%08x) %s", offset, storedCRC, computedCRC, diag)
 				}
 			} else {
 				pageBufPool.Put(filePageBufPtr)
 				pageBufPool.Put(pageBufPtr)
-				return nil, fmt.Errorf("btree page %d: CRC mismatch (stored=%08x computed=%08x)", offset, storedCRC, computedCRC)
+				diag := bt.diagCRC(offset, pageCopy, nil)
+				return nil, fmt.Errorf("btree page %d: CRC mismatch (stored=%08x computed=%08x) %s", offset, storedCRC, computedCRC, diag)
 			}
 			pageBufPool.Put(filePageBufPtr)
 		} else {
 			pageBufPool.Put(pageBufPtr)
-			return nil, fmt.Errorf("btree page %d: CRC mismatch (stored=%08x computed=%08x)", offset, storedCRC, computedCRC)
+			diag := bt.diagCRC(offset, pageCopy, nil)
+			return nil, fmt.Errorf("btree page %d: CRC mismatch (stored=%08x computed=%08x) %s", offset, storedCRC, computedCRC, diag)
 		}
 	}
 
@@ -1429,4 +1432,58 @@ func (bt *BTree) Count() int {
 	bt.mu.RLock()
 	defer bt.mu.RUnlock()
 	return bt.count
+}
+
+// diagCRC produces a diagnostic string for CRC mismatch errors.
+// It reports the page type, whether the page looks like ASCII record data,
+// the current root offset, and the first bytes of the page.
+func (bt *BTree) diagCRC(offset uint64, mmapData, fileData []byte) string {
+	pageType := mmapData[0]
+	typeStr := "unknown"
+	switch pageType {
+	case PageTypeLeaf:
+		typeStr = "leaf"
+	case PageTypeInternal:
+		typeStr = "internal"
+	case PageTypeRootLeaf:
+		typeStr = "root-leaf"
+	case PageTypeRootInternal:
+		typeStr = "root-internal"
+	}
+
+	// Check if the page data looks like ASCII text (record data)
+	asciiCount := 0
+	zeroCount := 0
+	for i := 0; i < 64 && i < len(mmapData); i++ {
+		b := mmapData[i]
+		if b >= 0x20 && b <= 0x7e {
+			asciiCount++
+		}
+		if b == 0x00 {
+			zeroCount++
+		}
+	}
+
+	looksLikeRecord := ""
+	if asciiCount > 20 {
+		looksLikeRecord = " RECORD_DATA?"
+	} else if zeroCount == 64 {
+		looksLikeRecord = " ALL_ZEROS?"
+	}
+
+	rootOff := bt.rootOff
+
+	fileInfo := ""
+	if fileData != nil {
+		fCRC := binary.LittleEndian.Uint32(fileData[PageFooterOff:])
+		fComp := crc32.ChecksumIEEE(fileData[:PageFooterOff])
+		fileInfo = fmt.Sprintf(" file_crc=%08x:%08x", fCRC, fComp)
+	}
+
+	hex := fmt.Sprintf("%02x%02x%02x%02x%02x%02x%02x%02x",
+		mmapData[0], mmapData[1], mmapData[2], mmapData[3],
+		mmapData[4], mmapData[5], mmapData[6], mmapData[7])
+
+	return fmt.Sprintf("[type=%s root=%d hex=%s%s%s]",
+		typeStr, rootOff, hex, looksLikeRecord, fileInfo)
 }
