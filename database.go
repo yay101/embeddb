@@ -71,6 +71,7 @@ func (tc tableCatalog) AddTable(name string, schemaVersion uint32) uint8 {
 
 type database struct {
 	mu              sync.RWMutex
+	regionMu        sync.Mutex // protects region resizing
 	file            *os.File
 	filename        string
 	region          atomic.Pointer[embeddbmmap.MappedRegion]
@@ -88,6 +89,12 @@ type database struct {
 }
 
 func (db *database) ensureRegion(size int64) error {
+	db.regionMu.Lock()
+	defer db.regionMu.Unlock()
+	return db.ensureRegionLocked(size)
+}
+
+func (db *database) ensureRegionLocked(size int64) error {
 	currentRegion := db.region.Load()
 	if currentRegion == nil {
 		alignedSize := pageAlign(size)
@@ -148,6 +155,25 @@ func (db *database) ensureRegion(size int64) error {
 		db.region.Store(currentRegion)
 	}
 	return nil
+}
+
+func (db *database) withRegion(size int64, fn func(r *embeddbmmap.MappedRegion) error) error {
+	db.regionMu.Lock()
+	if err := db.ensureRegionLocked(size); err != nil {
+		db.regionMu.Unlock()
+		return err
+	}
+	r := db.region.Load()
+	if r != nil {
+		r.RLock()
+	}
+	db.regionMu.Unlock()
+
+	if r == nil {
+		return fn(nil)
+	}
+	defer r.RUnlock()
+	return fn(r)
 }
 
 func (db *database) readAt(buf []byte, offset int64) error {
@@ -301,14 +327,14 @@ func openDatabase(filename string, migrate bool, parent *DB, storageMode Storage
 	}
 
 	if storageMode == StorageMmap {
-		mmapSize := pageAlign(stat.Size() + 1024*1024)
+		mmapSize := pageAlign(stat.Size() + 4*1024*1024)
 		if mmapSize < pageAlign(4*1024*1024) {
 			mmapSize = pageAlign(4 * 1024 * 1024)
 		}
 		if err := file.Truncate(mmapSize); err != nil {
-			mmapSize = pageAlign(stat.Size() + 1024*1024)
-			if mmapSize < pageAlign(1024*1024) {
-				mmapSize = pageAlign(1024 * 1024)
+			mmapSize = pageAlign(stat.Size() + 4*1024*1024)
+			if mmapSize < pageAlign(4*1024*1024) {
+				mmapSize = pageAlign(4 * 1024 * 1024)
 			}
 			if err := file.Truncate(mmapSize); err != nil {
 				unlockFile(file)

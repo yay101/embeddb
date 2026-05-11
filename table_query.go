@@ -12,6 +12,9 @@ import (
 	"github.com/yay101/embeddbcore"
 )
 
+// Query returns all records where the specified field equals the given value.
+// Uses the secondary index if available (auto-index or explicit index), otherwise
+// falls back to a full table scan for nested field queries.
 func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 	if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][fieldName] {
 		return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
@@ -66,6 +69,8 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 	return nil, fmt.Errorf("no index exists for field '%s'", fieldName)
 }
 
+// QueryRangeGreaterThan returns all records where the field value is greater than
+// the given value. If inclusive is true, records equal to the value are also included.
 func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
 	if t.canUseIndex(fieldName) {
 		return t.rangeQueryFromField(fieldName, value, inclusive, true)
@@ -76,6 +81,8 @@ func (t *Table[T]) QueryRangeGreaterThan(fieldName string, value interface{}, in
 	return t.filterByField(fieldName, comparator)
 }
 
+// QueryRangeLessThan returns all records where the field value is less than the given value.
+// If inclusive is true, records equal to the value are also included.
 func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclusive bool) ([]T, error) {
 	if t.canUseIndex(fieldName) {
 		return t.rangeQueryToField(fieldName, value, inclusive)
@@ -86,6 +93,8 @@ func (t *Table[T]) QueryRangeLessThan(fieldName string, value interface{}, inclu
 	return t.filterByField(fieldName, comparator)
 }
 
+// QueryRangeBetween returns all records where the field value is between min and max.
+// inclusiveMin and inclusiveMax control whether the boundary values are included.
 func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]T, error) {
 	if t.canUseIndex(fieldName) {
 		return t.rangeQueryBetween(fieldName, min, max, inclusiveMin, inclusiveMax)
@@ -100,6 +109,8 @@ func (t *Table[T]) QueryRangeBetween(fieldName string, min, max interface{}, inc
 	return t.filterByField(fieldName, comparator)
 }
 
+// QueryNotEqual returns all records where the field value does not equal the given value.
+// This always performs a full table scan as it cannot use an index efficiently.
 func (t *Table[T]) QueryNotEqual(fieldName string, value interface{}) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		return compareValues(fieldValue, value) != 0
@@ -107,6 +118,8 @@ func (t *Table[T]) QueryNotEqual(fieldName string, value interface{}) ([]T, erro
 	return t.filterByField(fieldName, comparator)
 }
 
+// QueryGreaterOrEqual returns all records where the field value is greater than or
+// equal to the given value.
 func (t *Table[T]) QueryGreaterOrEqual(fieldName string, value interface{}) ([]T, error) {
 	if t.canUseIndex(fieldName) {
 		return t.rangeQueryFromField(fieldName, value, true, true)
@@ -117,6 +130,8 @@ func (t *Table[T]) QueryGreaterOrEqual(fieldName string, value interface{}) ([]T
 	return t.filterByField(fieldName, comparator)
 }
 
+// QueryLessOrEqual returns all records where the field value is less than or equal
+// to the given value.
 func (t *Table[T]) QueryLessOrEqual(fieldName string, value interface{}) ([]T, error) {
 	if t.canUseIndex(fieldName) {
 		return t.rangeQueryToField(fieldName, value, true)
@@ -127,6 +142,8 @@ func (t *Table[T]) QueryLessOrEqual(fieldName string, value interface{}) ([]T, e
 	return t.filterByField(fieldName, comparator)
 }
 
+// QueryLike returns all records where the string field matches the SQL LIKE pattern.
+// Supports % (any characters) and _ (single character) wildcards. Case-insensitive.
 func (t *Table[T]) QueryLike(fieldName string, pattern string) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		str, ok := fieldValue.(string)
@@ -138,6 +155,8 @@ func (t *Table[T]) QueryLike(fieldName string, pattern string) ([]T, error) {
 	return t.filterByField(fieldName, comparator)
 }
 
+// QueryNotLike returns all records where the string field does not match the SQL LIKE pattern.
+// Supports % (any characters) and _ (single character) wildcards. Case-insensitive.
 func (t *Table[T]) QueryNotLike(fieldName string, pattern string) ([]T, error) {
 	comparator := func(fieldValue interface{}) bool {
 		str, ok := fieldValue.(string)

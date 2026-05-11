@@ -52,6 +52,9 @@ func encodePKForIndex(tableID uint8, pkValue any) []byte {
 	return key
 }
 
+// StorageMode determines how the database file is accessed.
+// StorageMmap uses memory-mapped I/O (default), StorageFile uses direct file I/O,
+// and StorageMemory keeps the entire database in anonymous memory (no persistence).
 type StorageMode int
 
 const (
@@ -60,6 +63,18 @@ const (
 	StorageMemory
 )
 
+// OpenOptions configures database behavior when opening a file.
+//
+// Migrate enables automatic schema migration when struct layouts change.
+// AutoIndex automatically creates secondary indexes for fields tagged with `db:"index"`.
+// SyncThreshold triggers a sync after this many writes (0 disables count-based sync).
+// IdleThreshold triggers a sync after this duration of inactivity (0 disables time-based sync).
+// CachePages sets a fixed B-tree page cache size (0 uses adaptive sizing).
+// EncryptionKey enables AES-256-GCM field-level encryption (cannot be used with Compression).
+// StorageMode selects the storage backend (mmap, file, or memory).
+// WAL enables write-ahead logging for crash recovery.
+// Compression enables snappy compression for record payloads.
+// CompressMinLen is the minimum payload size before compression is attempted (default 64).
 type OpenOptions struct {
 	Migrate        bool
 	AutoIndex      bool
@@ -73,15 +88,21 @@ type OpenOptions struct {
 	CompressMinLen int
 }
 
+// UseOptions configures table-specific behavior.
+// MaxVersions sets the number of previous record versions to retain (0 disables versioning).
 type UseOptions struct {
 	MaxVersions uint8
 }
 
+// VersionMetadata contains metadata about a specific record version.
 type VersionMetadata struct {
 	Version   uint32
 	CreatedAt time.Time
 }
 
+// DB represents an embedded database instance backed by a single file.
+// It manages multiple typed tables, handles persistence, caching, and synchronization.
+// A DB must be closed with Close() when no longer needed to ensure data is flushed.
 type DB struct {
 	filename       string
 	migrate        bool
@@ -102,6 +123,13 @@ type DB struct {
 	tables         map[string]*database
 }
 
+// Open creates or opens an embedded database at the given filename.
+// If no options are provided, defaults are used: migration enabled, auto-indexing enabled,
+// sync threshold of 1000 writes, idle threshold of 10 seconds, adaptive cache sizing,
+// mmap storage mode, no WAL, no compression.
+//
+// Returns an error if the filename is empty (for non-memory modes), the file cannot be
+// opened, the encryption key is invalid, or compression and encryption are both enabled.
 func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	optsCopy := OpenOptions{}
 	if len(opts) > 0 {
@@ -224,6 +252,18 @@ func validateLayout[T any]() error {
 	return nil
 }
 
+// Use returns a type-safe Table[T] for the given struct type T.
+// The table name is inferred from the type name unless explicitly provided as a string argument.
+// UseOptions can be passed to configure versioning (e.g., UseOptions{MaxVersions: 5}).
+//
+// If the table doesn't exist, it is created. If the struct layout has changed since the table
+// was created, automatic migration is performed (if Migrate is enabled in OpenOptions).
+//
+// Example:
+//
+//	type User struct { ID uint; Name string }
+//	db, _ := embeddb.Open("my.db")
+//	users, _ := embeddb.Use[User](db)
 func Use[T any](db *DB, args ...any) (*Table[T], error) {
 	if db == nil {
 		return nil, fmt.Errorf("db is nil")
@@ -365,6 +405,8 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 	return typedTable, nil
 }
 
+// Close flushes all pending writes, syncs the B-tree index, and releases the file lock.
+// After Close, the DB cannot be used for further operations.
 func (db *DB) Close() error {
 	if db == nil {
 		return nil
@@ -390,6 +432,8 @@ func (db *DB) Close() error {
 	return closeErr
 }
 
+// Begin starts a copy-on-write transaction. All subsequent writes are isolated until
+// Commit or Rollback is called. Only one transaction can be active at a time.
 func (db *DB) Begin() *Transaction {
 	if db == nil || db.database == nil {
 		return nil
@@ -397,6 +441,8 @@ func (db *DB) Begin() *Transaction {
 	return db.database.Begin()
 }
 
+// Commit applies all writes from the current transaction and releases the transaction lock.
+// Returns an error if no transaction is active or the transaction was already committed.
 func (db *DB) Commit() error {
 	if db == nil || db.database == nil {
 		return fmt.Errorf("database not initialized")
@@ -407,6 +453,8 @@ func (db *DB) Commit() error {
 	return db.database.tx.Commit()
 }
 
+// Rollback discards all writes from the current transaction and restores the database
+// to its state before Begin was called. Returns an error if the transaction was already committed.
 func (db *DB) Rollback() error {
 	if db == nil || db.database == nil {
 		return fmt.Errorf("database not initialized")
@@ -417,6 +465,9 @@ func (db *DB) Rollback() error {
 	return db.database.tx.Rollback()
 }
 
+// Sync flushes all pending writes to disk for all open tables. This is a full sync that
+// compacts the B-tree index and ensures durability. It is called automatically based on
+// SyncThreshold and IdleThreshold options.
 func (db *DB) Sync() error {
 	if db == nil {
 		return nil
@@ -438,20 +489,106 @@ func (db *DB) Sync() error {
 	return firstErr
 }
 
-type DBStats struct {
-	CacheStats map[string]CacheStats
+// TableStats contains runtime statistics for a single table.
+type TableStats struct {
+	Name        string // table name
+	RecordCount int    // number of active records
+	TableID     uint8  // internal table identifier
 }
 
+// AllocatorStats contains memory allocation statistics.
+type AllocatorStats struct {
+	NextOffset uint64 // next available offset in the file
+	ActualSize uint64 // total size allocated (including free space)
+	FreeBytes  uint64 // total bytes in the free list
+	FreeBlocks int    // number of free blocks
+}
+
+// DBStats contains runtime statistics for the database, including per-table metrics,
+// file size, allocator state, and B-tree cache performance.
+type DBStats struct {
+	Tables     map[string]TableStats   // per-table statistics
+	FileSize   int64                   // current database file size
+	WALSize    int64                   // WAL file size (0 if WAL not enabled)
+	Allocator  AllocatorStats          // allocator state
+	CacheStats map[string]CacheStats   // per-table B-tree cache stats
+	IndexKeys  int                     // total keys in the primary B-tree index
+	BTreeDepth int                     // height of the B+ tree
+}
+
+// Stats returns runtime statistics for the database, including per-table record counts,
+// file size, WAL size, allocator state, cache hit rates, and total index keys.
 func (db *DB) Stats() DBStats {
 	stats := DBStats{
+		Tables:     make(map[string]TableStats),
 		CacheStats: make(map[string]CacheStats),
 	}
-	if db.database != nil && db.database.index != nil {
+
+	if db.database != nil {
+		db.database.mu.RLock()
+
+		// Per-table stats
+		for name, entry := range db.database.tableCat {
+			if !entry.Dropped {
+				stats.Tables[name] = TableStats{
+					Name:        name,
+					RecordCount: int(entry.RecordCount),
+					TableID:     entry.ID,
+				}
+			}
+		}
+
+		// Allocator stats
+		db.database.alloc.mu.Lock()
+		var freeBytes uint64
+		for _, fb := range db.database.alloc.freeList {
+			freeBytes += fb.length
+		}
+		stats.Allocator = AllocatorStats{
+			NextOffset: db.database.alloc.nextOffset,
+			ActualSize: db.database.alloc.actualSize,
+			FreeBytes:  freeBytes,
+			FreeBlocks: len(db.database.alloc.freeList),
+		}
+		db.database.alloc.mu.Unlock()
+
+		// Index key count
+		stats.IndexKeys = db.database.index.count
+		stats.BTreeDepth = db.database.index.Depth()
+
+		db.database.mu.RUnlock()
+
+		// Cache stats
 		stats.CacheStats["primary"] = db.database.index.GetCacheStats()
+
+		// File size
+		if db.database.file != nil {
+			if fi, err := db.database.file.Stat(); err == nil {
+				stats.FileSize = fi.Size()
+			}
+		} else {
+			r := db.database.region.Load()
+			if r != nil {
+				r.RLock()
+				stats.FileSize = r.Size()
+				r.RUnlock()
+			}
+		}
+
+		// WAL size
+		if db.database.wal != nil && db.database.wal.file != nil {
+			if fi, err := db.database.wal.file.Stat(); err == nil {
+				stats.WALSize = fi.Size()
+			}
+		}
 	}
+
 	return stats
 }
 
+// FastSync performs an asynchronous sync of the memory-mapped region without
+// rebuilding the B-tree index. This is faster than Sync() but provides weaker
+// durability guarantees.
 func (db *DB) FastSync() error {
 	if db == nil {
 		return nil
@@ -478,6 +615,8 @@ func (db *DB) FastSync() error {
 	return nil
 }
 
+// Vacuum compacts the database file by removing dead records and rebuilding all indexes.
+// This reduces file size after many updates/deletes but is an expensive operation.
 func (db *DB) Vacuum() error {
 	if db == nil {
 		return nil
@@ -524,6 +663,9 @@ func computeLayout[T any]() *embeddbcore.StructLayout {
 	return layout
 }
 
+// Table represents a type-safe collection of records of type T.
+// It provides CRUD operations, querying, indexing, and scanning capabilities.
+// Tables are obtained via Use[T](db).
 type Table[T any] struct {
 	db          *database
 	name        string
@@ -731,10 +873,13 @@ func (t *Table[T]) decodeRecord(data []byte, result *T) error {
 	return decodeFieldPayload(payload, result, t.layout, t.cipher)
 }
 
+// Name returns the name of the table.
 func (t *Table[T]) Name() string {
 	return t.name
 }
 
+// Drop marks the table as dropped and removes all its index entries from the B-tree.
+// The records remain in the file until a Vacuum is performed.
 func (t *Table[T]) Drop() error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()

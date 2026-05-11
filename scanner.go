@@ -10,6 +10,9 @@ type scanEntry struct {
 	pkValue any
 }
 
+// Scanner provides sequential iteration over records in a table with early exit support.
+// Use ScanRecords() to create a scanner, then call Next() to advance and Record() to
+// get the current record. Close() should be called when done to release resources.
 type Scanner[T any] struct {
 	table   *Table[T]
 	entries []scanEntry
@@ -19,6 +22,7 @@ type Scanner[T any] struct {
 	locked  bool
 }
 
+// ScanRecords creates a Scanner that iterates over all records in the table.
 func (t *Table[T]) ScanRecords() *Scanner[T] {
 	var entries []scanEntry
 	_ = t.db.index.Scan(func(key []byte, value uint64) bool {
@@ -52,6 +56,8 @@ func (t *Table[T]) ScanRecords() *Scanner[T] {
 	}
 }
 
+// Next advances the scanner to the next valid record. Returns false when no more
+// records are available or an error occurred.
 func (s *Scanner[T]) Next() bool {
 	for {
 		if s.err != nil || s.pos >= len(s.entries) {
@@ -69,6 +75,7 @@ func (s *Scanner[T]) Next() bool {
 	}
 }
 
+// Record returns the current record. Call Next() first to position the scanner.
 func (s *Scanner[T]) Record() (*T, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -76,14 +83,17 @@ func (s *Scanner[T]) Record() (*T, error) {
 	return s.current, nil
 }
 
+// Err returns any error that occurred during scanning.
 func (s *Scanner[T]) Err() error {
 	return s.err
 }
 
+// Close releases the scanner's resources. The scanner should not be used after Close.
 func (s *Scanner[T]) Close() {
 	s.entries = nil
 }
 
+// All returns all records in the table as a slice.
 func (t *Table[T]) All() ([]T, error) {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
@@ -101,6 +111,7 @@ func (t *Table[T]) All() ([]T, error) {
 	return results, scanner.Err()
 }
 
+// Filter returns all records that match the given predicate function.
 func (t *Table[T]) Filter(fn func(T) bool) ([]T, error) {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
@@ -121,6 +132,7 @@ func (t *Table[T]) Filter(fn func(T) bool) ([]T, error) {
 	return results, scanner.Err()
 }
 
+// Scan iterates over all records, calling fn for each. If fn returns false, iteration stops.
 func (t *Table[T]) Scan(fn func(T) bool) error {
 	scanner := t.ScanRecords()
 	defer scanner.Close()
@@ -139,6 +151,7 @@ func (t *Table[T]) Scan(fn func(T) bool) error {
 	return scanner.Err()
 }
 
+// Count returns the number of active records in the table.
 func (t *Table[T]) Count() int {
 	entry := t.db.tableCat[t.name]
 	if entry != nil {

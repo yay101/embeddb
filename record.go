@@ -18,14 +18,16 @@ const (
 
 var ErrInvalidRecord = errors.New("invalid record format")
 
+// RecordHeader contains the metadata for a V2 record stored in the database file.
+// The header is followed by the TLV-encoded payload and a CRC32 footer.
 type RecordHeader struct {
-	Version        byte
-	Flags          byte
-	TableID        uint8
-	RecordID       uint32
-	PrevVersionOff uint64
-	SchemaVersion  uint32
-	PayloadLen     uint32
+	Version        byte   // record format version
+	Flags          byte   // active flag, compression flag, previous version flag
+	TableID        uint8  // table this record belongs to
+	RecordID       uint32 // unique record identifier within the table
+	PrevVersionOff uint64 // file offset of the previous version (0 if none)
+	SchemaVersion  uint32 // schema version at time of write
+	PayloadLen     uint32 // length of the TLV-encoded payload in bytes
 }
 
 func decodeRecordHeader(data []byte) (RecordHeader, error) {
@@ -44,10 +46,12 @@ func decodeRecordHeader(data []byte) (RecordHeader, error) {
 	return h, nil
 }
 
+// IsActive returns true if the record has not been deleted.
 func (h RecordHeader) IsActive() bool {
 	return h.Flags&embeddbcore.FlagsActive != 0
 }
 
+// HasPrevVersion returns true if this record has a previous version stored.
 func (h RecordHeader) HasPrevVersion() bool {
 	return h.Flags&embeddbcore.FlagsHasPrevVersion != 0
 }

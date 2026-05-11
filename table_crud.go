@@ -7,6 +7,9 @@ import (
 	"github.com/yay101/embeddbcore"
 )
 
+// Insert adds a new record to the table. If the primary key is zero-valued, it is
+// auto-assigned the next available ID. Returns the record ID.
+// Returns an error if the primary key already exists or the table is not found.
 func (t *Table[T]) Insert(record *T) (uint32, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -116,6 +119,8 @@ func (t *Table[T]) getPKValue(record *T) (any, error) {
 	return nil, fmt.Errorf("no primary key found")
 }
 
+// Get retrieves a record by its primary key. Returns ErrKeyNotFound if the record
+// does not exist or has been deleted.
 func (t *Table[T]) Get(id any) (*T, error) {
 	return t.getLocked(t.normalizePK(id))
 }
@@ -129,6 +134,9 @@ func (t *Table[T]) getLocked(pkValue any) (*T, error) {
 	return t.readRecordAt(offset)
 }
 
+// GetVersion retrieves a specific version of a record by its primary key and version number.
+// Versioning must be enabled (MaxVersions > 0) for this to work.
+// Version 1 is the first version after the current record.
 func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 	if t.maxVersions == 0 {
 		return nil, fmt.Errorf("versioning not enabled for this table")
@@ -156,6 +164,8 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 	return t.readRecordAt(versionOffset)
 }
 
+// ListVersions returns metadata for all stored versions of a record.
+// Versioning must be enabled (MaxVersions > 0) for this to work.
 func (t *Table[T]) ListVersions(id any) ([]VersionMetadata, error) {
 	if t.maxVersions == 0 {
 		return nil, fmt.Errorf("versioning not enabled for this table")
@@ -189,6 +199,9 @@ func (t *Table[T]) ListVersions(id any) ([]VersionMetadata, error) {
 	return results, nil
 }
 
+// Update replaces an existing record with new values. If versioning is enabled,
+// the old record is preserved as a previous version. The old record is deactivated
+// and a new record is allocated.
 func (t *Table[T]) Update(id any, record *T) error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -300,6 +313,9 @@ func (t *Table[T]) Update(id any, record *T) error {
 	return nil
 }
 
+// Delete removes a record by its primary key. The record is deactivated (not physically
+// removed) and its index entries are deleted. Space is reclaimed on Vacuum.
+// If versioning is enabled, all versions are also deleted.
 func (t *Table[T]) Delete(id any) error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -363,6 +379,8 @@ func (t *Table[T]) Delete(id any) error {
 	return nil
 }
 
+// DeleteMany removes multiple records by their primary keys. Returns the number of
+// records successfully deleted. Non-existent keys are silently skipped.
 func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -408,6 +426,8 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 	return deleted, nil
 }
 
+// InsertMany inserts multiple records sequentially. Returns the IDs of successfully
+// inserted records and the first error encountered (if any).
 func (t *Table[T]) InsertMany(records []*T) ([]uint32, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -430,6 +450,9 @@ func (t *Table[T]) InsertMany(records []*T) ([]uint32, error) {
 	return ids, firstErr
 }
 
+// InsertManyBulk inserts multiple records using a bulk B-tree build for better performance.
+// Records are encoded, allocated contiguously, and inserted into the B-tree in a single
+// bulk operation. This is significantly faster than InsertMany for large batches.
 func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -527,6 +550,9 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 	return ids, nil
 }
 
+// UpdateMany updates multiple records by their primary keys. The updater function is
+// called for each record to modify it in place. Returns the number of successfully
+// updated records and the first error encountered (if any).
 func (t *Table[T]) UpdateMany(ids []any, updater func(*T) error) (int, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -696,6 +722,9 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	return nil
 }
 
+// Upsert inserts a record if it doesn't exist, or updates it if it does.
+// Returns the record ID, a boolean indicating whether the record was inserted (true)
+// or updated (false), and any error that occurred.
 func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()

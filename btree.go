@@ -38,6 +38,9 @@ var pageBufPool = sync.Pool{
 	},
 }
 
+// BTree is a persistent B+ tree index stored in the database file.
+// It supports insert, delete, point lookup, range scan, and bulk insert operations.
+// An adaptive LRU cache is used to reduce disk I/O for frequently accessed pages.
 type BTree struct {
 	db        *database
 	alloc     *allocator
@@ -57,6 +60,9 @@ type BTree struct {
 	adjustInterval time.Duration
 }
 
+// BTreeNode represents a single 4096-byte page in the B+ tree.
+// Leaf nodes store key-value pairs; internal nodes store keys and child pointers.
+// Leaf nodes are linked via PrevLeaf/NextLeaf for efficient range scans.
 type BTreeNode struct {
 	IsLeaf   bool
 	Count    int
@@ -344,12 +350,12 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 	bt.cacheMu.RUnlock()
 	bt.trackAccess(false)
 
+	pageBufPtr := pageBufPool.Get().(*[]byte)
+	pageCopy := *pageBufPtr
+
 	if err := bt.db.ensureRegion(int64(offset) + PageSize); err != nil {
 		return nil, fmt.Errorf("btree readNode ensureRegion: %w", err)
 	}
-
-	pageBufPtr := pageBufPool.Get().(*[]byte)
-	pageCopy := *pageBufPtr
 
 	r := bt.db.region.Load()
 	if r != nil {
@@ -569,6 +575,8 @@ func (bt *BTree) resizeCache(newSize int) {
 	bt.cacheHead = n
 }
 
+// Insert adds a key-value pair to the B+ tree. If the key already exists, the value
+// is updated. The tree is automatically rebalanced on overflow.
 func (bt *BTree) Insert(key []byte, value uint64) error {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
@@ -603,6 +611,8 @@ func (bt *BTree) Insert(key []byte, value uint64) error {
 	return nil
 }
 
+// Put adds or updates a key-value pair in the B+ tree. Unlike Insert, Put always
+// updates the value if the key exists without tracking whether an insert occurred.
 func (bt *BTree) Put(key []byte, value uint64) error {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
@@ -765,6 +775,8 @@ func (bt *BTree) splitChild(parent *BTreeNode, idx int, child *BTreeNode) error 
 	return bt.writeNode(parent)
 }
 
+// Get retrieves the value associated with a key. Returns ErrKeyNotFound if the key
+// does not exist.
 func (bt *BTree) Get(key []byte) (uint64, error) {
 	bt.mu.RLock()
 	defer bt.mu.RUnlock()
@@ -806,6 +818,8 @@ func (bt *BTree) searchNode(node *BTreeNode, key []byte) (uint64, error) {
 	return bt.searchNode(child, key)
 }
 
+// Delete removes a key from the B+ tree. Does nothing if the key doesn't exist.
+// The tree is rebalanced after deletion.
 func (bt *BTree) Delete(key []byte) error {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
@@ -1029,6 +1043,8 @@ func (bt *BTree) findMax(offset uint64) ([]byte, uint64) {
 	return keyCopy, node.Values[node.Count-1]
 }
 
+// Scan iterates over all key-value pairs in sorted order, calling fn for each.
+// If fn returns false, iteration stops. Uses the leaf linked-list for efficiency.
 func (bt *BTree) Scan(fn func(key []byte, value uint64) bool) error {
 	bt.mu.RLock()
 	defer bt.mu.RUnlock()
@@ -1074,6 +1090,8 @@ func (bt *BTree) Scan(fn func(key []byte, value uint64) bool) error {
 	return nil
 }
 
+// ScanRange iterates over key-value pairs where startKey <= key <= endKey.
+// Uses the leaf linked-list for efficient range traversal.
 func (bt *BTree) ScanRange(startKey, endKey []byte, fn func(key []byte, value uint64) bool) error {
 	bt.mu.RLock()
 	defer bt.mu.RUnlock()
@@ -1136,18 +1154,21 @@ func (bt *BTree) findLeafPosition(node *BTreeNode, key []byte) (*BTreeNode, int,
 	return node, i, nil
 }
 
+// Close is a no-op for the B+ tree. Resources are managed by the parent database.
 func (bt *BTree) Close() error {
 	return nil
 }
 
+// CacheStats contains performance metrics for the B-tree page cache.
 type CacheStats struct {
-	Size    int
-	Filled  int
-	Hits    uint64
-	Misses  uint64
-	HitRate float64
+	Size    int     // cache capacity in pages
+	Filled  int     // number of pages currently cached
+	Hits    uint64  // number of cache hits
+	Misses  uint64  // number of cache misses
+	HitRate float64 // ratio of hits to total accesses (0.0 to 1.0)
 }
 
+// GetCacheStats returns the current cache performance metrics.
 func (bt *BTree) GetCacheStats() CacheStats {
 	bt.cacheMu.RLock()
 	defer bt.cacheMu.RUnlock()
@@ -1165,6 +1186,9 @@ func (bt *BTree) GetCacheStats() CacheStats {
 	}
 }
 
+// BulkInsert inserts multiple key-value pairs using a bottom-up tree build.
+// Entries are sorted and deduplicated before building. This is significantly faster
+// than individual Insert calls for large batches.
 func (bt *BTree) BulkInsert(entries []struct{ key []byte; value uint64 }) error {
 	if len(entries) == 0 {
 		return nil
@@ -1299,6 +1323,7 @@ func (bt *BTree) wouldOverflowInternal(node *BTreeNode, extraKeyLen int) bool {
 	return currentUsed+cellOverhead > PageSize
 }
 
+// Sync flushes the memory-mapped region to disk, ensuring all dirty pages are persisted.
 func (bt *BTree) Sync() error {
 	if r := bt.db.region.Load(); r != nil {
 		return r.Sync(embeddbmmap.SyncSync)
@@ -1306,14 +1331,18 @@ func (bt *BTree) Sync() error {
 	return nil
 }
 
+// RootOffset returns the file offset of the root node.
 func (bt *BTree) RootOffset() uint64 {
 	return bt.rootOff
 }
 
+// SetRootOffset sets the file offset of the root node. Used during transaction rollback.
 func (bt *BTree) SetRootOffset(off uint64) {
 	bt.rootOff = off
 }
 
+// Verify checks the integrity of the B+ tree by scanning all entries and verifying
+// that each key can be retrieved via Get. Returns an error if any keys are missing.
 func (bt *BTree) Verify() error {
 	bt.mu.RLock()
 	defer bt.mu.RUnlock()
@@ -1341,4 +1370,38 @@ func (bt *BTree) Verify() error {
 		return fmt.Errorf("btree verify: %d/%d keys not found via Get", missingCount, len(entries))
 	}
 	return nil
+}
+
+// Depth returns the height of the B+ tree (number of levels from root to leaf).
+// A single-node tree has depth 1.
+func (bt *BTree) Depth() int {
+	bt.mu.RLock()
+	defer bt.mu.RUnlock()
+
+	depth := 0
+	node, err := bt.readNode(bt.rootOff)
+	if err != nil {
+		return 0
+	}
+	for {
+		depth++
+		if node.IsLeaf {
+			break
+		}
+		if len(node.Children) == 0 {
+			break
+		}
+		node, err = bt.readNode(node.Children[0])
+		if err != nil {
+			break
+		}
+	}
+	return depth
+}
+
+// Count returns the total number of key-value pairs in the B+ tree.
+func (bt *BTree) Count() int {
+	bt.mu.RLock()
+	defer bt.mu.RUnlock()
+	return bt.count
 }

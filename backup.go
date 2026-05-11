@@ -6,6 +6,9 @@ import (
 	"os"
 )
 
+// Backup creates a copy of the database file and its WAL file (if present) at the
+// specified destination path. The backup is atomic - if any step fails, the partial
+// backup files are cleaned up.
 func (db *DB) Backup(destPath string) error {
 	if db == nil {
 		return fmt.Errorf("database is nil")

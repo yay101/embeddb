@@ -65,6 +65,9 @@ func (t *Table[T]) deleteSecondaryKeys(record *T, recordID uint32, offset uint64
 	}
 }
 
+// CreateIndex builds a secondary index for the specified field by scanning all existing
+// records. If auto-indexing is disabled, the field is added to the explicit index list.
+// Returns nil if the index already exists.
 func (t *Table[T]) CreateIndex(fieldName string) error {
 	if t.db.parent != nil && !t.db.parent.autoIndex {
 		t.db.mu.Lock()
@@ -132,6 +135,8 @@ func (t *Table[T]) CreateIndex(fieldName string) error {
 	return nil
 }
 
+// DropIndex removes all secondary index entries for the specified field and marks
+// the field as dropped to prevent auto-reindexing.
 func (t *Table[T]) DropIndex(fieldName string) error {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -161,6 +166,7 @@ func (t *Table[T]) DropIndex(fieldName string) error {
 	return nil
 }
 
+// GetIndexedFields returns the list of fields that currently have secondary indexes.
 func (t *Table[T]) GetIndexedFields() []string {
 	var fields []string
 	if t.db.parent != nil && t.db.parent.autoIndex {

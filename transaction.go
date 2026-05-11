@@ -2,10 +2,14 @@ package embeddb
 
 import "fmt"
 
+// Transaction represents a copy-on-write transaction. All writes within a transaction
+// are isolated until Commit is called. Rollback restores the database to its pre-transaction state.
+// Only one transaction can be active at a time per database.
 type Transaction struct {
 	db                   *database
 	indexRootSnapshot    uint64
 	committed            bool
+	rolledBack           bool
 	recordCounts         map[string]uint32
 	newTxnPages          map[uint64]bool
 	recordCountSnapshot  map[string]uint32
@@ -16,6 +20,10 @@ type Transaction struct {
 func (db *database) Begin() *Transaction {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+
+	if db.tx != nil && !db.tx.committed && !db.tx.rolledBack {
+		return nil
+	}
 
 	indexRootSnapshot := db.index.RootOffset()
 
@@ -32,6 +40,7 @@ func (db *database) Begin() *Transaction {
 		db:                   db,
 		indexRootSnapshot:    indexRootSnapshot,
 		committed:            false,
+		rolledBack:           false,
 		recordCounts:         make(map[string]uint32),
 		newTxnPages:          make(map[uint64]bool),
 		recordCountSnapshot:  recordCountSnapshot,
@@ -42,9 +51,17 @@ func (db *database) Begin() *Transaction {
 	return tx
 }
 
+// Commit applies the transaction's changes to the database. After Commit, the transaction
+// cannot be used again.
 func (tx *Transaction) Commit() error {
+	tx.db.mu.Lock()
+	defer tx.db.mu.Unlock()
+
 	if tx.committed {
 		return fmt.Errorf("transaction already committed")
+	}
+	if tx.rolledBack {
+		return fmt.Errorf("transaction already rolled back")
 	}
 	tx.committed = true
 	for name, delta := range tx.recordCounts {
@@ -56,10 +73,19 @@ func (tx *Transaction) Commit() error {
 	return nil
 }
 
+// Rollback discards all changes made within the transaction and restores the database
+// to its state before Begin was called. Cannot be called after Commit.
 func (tx *Transaction) Rollback() error {
+	tx.db.mu.Lock()
+	defer tx.db.mu.Unlock()
+
 	if tx.committed {
 		return fmt.Errorf("cannot rollback committed transaction")
 	}
+	if tx.rolledBack {
+		return fmt.Errorf("transaction already rolled back")
+	}
+	tx.rolledBack = true
 
 	tx.db.index.SetRootOffset(tx.indexRootSnapshot)
 	tx.db.index.count = 0
