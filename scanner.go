@@ -153,10 +153,14 @@ func (t *Table[T]) Scan(fn func(T) bool) error {
 
 // Count returns the number of active records in the table.
 func (t *Table[T]) Count() int {
+	t.db.mu.RLock()
 	entry := t.db.tableCat[t.name]
 	if entry != nil {
-		return int(entry.RecordCount)
+		count := int(entry.RecordCount)
+		t.db.mu.RUnlock()
+		return count
 	}
+	t.db.mu.RUnlock()
 	count := 0
 	_ = t.db.index.Scan(func(key []byte, value uint64) bool {
 		if len(key) >= 2 && key[0] == indexNSPrimary && key[1] == t.tableID {

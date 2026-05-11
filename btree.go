@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -202,10 +203,10 @@ func (bt *BTree) newNode(isLeaf bool) (*BTreeNode, error) {
 		if int64(off)+PageSize > r.Size() {
 			return nil, fmt.Errorf("btree newNode: offset %d + PageSize %d > regionSize %d", off, PageSize, r.Size())
 		}
-		r.RLock()
+		r.WriteLock()
 		base := r.Pointer()
 		copy(unsafe.Slice((*byte)(unsafe.Add(base, int(off))), PageSize), buf)
-		r.RUnlock()
+		r.WriteUnlock()
 	} else {
 		if err := bt.db.writeAt(buf, int64(off)); err != nil {
 			return nil, fmt.Errorf("btree newNode writeAt: %w", err)
@@ -324,9 +325,9 @@ func (bt *BTree) writeNode(node *BTreeNode) error {
 	data := bt.serializeNode(node)
 	r := bt.db.region.Load()
 	if r != nil {
-		r.RLock()
+		r.WriteLock()
 		copy(bt.pageData(node.Offset), data)
-		r.RUnlock()
+		r.WriteUnlock()
 	} else {
 		if err := bt.db.writeAt(data, int64(node.Offset)); err != nil {
 			return fmt.Errorf("btree writeNode writeAt: %w", err)
@@ -454,10 +455,6 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 
 	node.Count = len(node.Keys)
 
-	if nodeType == PageTypeRootLeaf || nodeType == PageTypeRootInternal {
-		bt.count = int(binary.LittleEndian.Uint32(pageCopy[RootCountOff : RootCountOff+4]))
-	}
-
 	pageBufPool.Put(pageBufPtr)
 
 	bt.cacheNode(node)
@@ -495,21 +492,23 @@ func (bt *BTree) cacheNode(node *BTreeNode) {
 
 func (bt *BTree) trackAccess(hit bool) {
 	if hit {
-		bt.hits++
+		atomic.AddUint64(&bt.hits, 1)
 	} else {
-		bt.misses++
+		atomic.AddUint64(&bt.misses, 1)
 	}
 
 	if time.Since(bt.lastAdjust) < bt.adjustInterval {
 		return
 	}
 
-	total := bt.hits + bt.misses
+	hits := atomic.LoadUint64(&bt.hits)
+	misses := atomic.LoadUint64(&bt.misses)
+	total := hits + misses
 	if total < 100 {
 		return
 	}
 
-	hitRate := float64(bt.hits) / float64(total)
+	hitRate := float64(hits) / float64(total)
 
 	if hitRate > 0.90 && bt.cacheSize < bt.maxSize {
 		newSize := bt.cacheSize * 3 / 2
@@ -525,8 +524,8 @@ func (bt *BTree) trackAccess(hit bool) {
 		bt.resizeCache(newSize)
 	}
 
-	bt.hits = 0
-	bt.misses = 0
+	atomic.StoreUint64(&bt.hits, 0)
+	atomic.StoreUint64(&bt.misses, 0)
 	bt.lastAdjust = time.Now()
 }
 
@@ -1172,16 +1171,18 @@ type CacheStats struct {
 func (bt *BTree) GetCacheStats() CacheStats {
 	bt.cacheMu.RLock()
 	defer bt.cacheMu.RUnlock()
-	total := bt.hits + bt.misses
+	hits := atomic.LoadUint64(&bt.hits)
+	misses := atomic.LoadUint64(&bt.misses)
+	total := hits + misses
 	hitRate := 0.0
 	if total > 0 {
-		hitRate = float64(bt.hits) / float64(total)
+		hitRate = float64(hits) / float64(total)
 	}
 	return CacheStats{
 		Size:    bt.cacheSize,
 		Filled:  len(bt.cache),
-		Hits:    bt.hits,
-		Misses:  bt.misses,
+		Hits:    hits,
+		Misses:  misses,
 		HitRate: hitRate,
 	}
 }
@@ -1333,12 +1334,16 @@ func (bt *BTree) Sync() error {
 
 // RootOffset returns the file offset of the root node.
 func (bt *BTree) RootOffset() uint64 {
+	bt.mu.RLock()
+	defer bt.mu.RUnlock()
 	return bt.rootOff
 }
 
 // SetRootOffset sets the file offset of the root node. Used during transaction rollback.
 func (bt *BTree) SetRootOffset(off uint64) {
+	bt.mu.Lock()
 	bt.rootOff = off
+	bt.mu.Unlock()
 }
 
 // Verify checks the integrity of the B+ tree by scanning all entries and verifying
