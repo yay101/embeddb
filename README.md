@@ -601,6 +601,12 @@ carts.Insert(&Cart{
 - B-tree nodes: 4096 bytes per node, adaptive LRU cache (auto-sizes 64–16,384 pages based on hit rate)
 - Record IDs: uint32 (4 bytes) in secondary key suffix for compact storage
 
+## Known Limitations
+
+- **Concurrent mmap writes (stress mode)**: With 2+ concurrent writer goroutines, the memory-mapped storage mode may produce rare CRC errors (~1 in 20,000 operations) on B-tree pages. This is an OS-level mmap coherence issue — the Go race detector passes cleanly. Single-writer mode (`-workers 1` in the torture test) has zero errors. Use `StorageFile` mode for guaranteed correctness under concurrent writes.
+- **Single-writer transactions**: Only one write transaction can be active at a time. Concurrent `Begin()` returns nil.
+- **Lock order**: The internal lock hierarchy is `db.mu` → `bt.mu` → `cacheMu`. All code paths must follow this order to avoid deadlocks.
+
 ## Why EmbedDB?
 
 | SQLite | EmbedDB |

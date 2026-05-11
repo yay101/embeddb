@@ -1,2 +1,4 @@
 datatest.json
 bench/bench
+torture/torture_test
+torture.db

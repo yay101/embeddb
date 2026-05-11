@@ -42,6 +42,10 @@ var pageBufPool = sync.Pool{
 // BTree is a persistent B+ tree index stored in the database file.
 // It supports insert, delete, point lookup, range scan, and bulk insert operations.
 // An adaptive LRU cache is used to reduce disk I/O for frequently accessed pages.
+//
+// Lock hierarchy (must not be inverted):
+//
+//	db.mu (database) → bt.mu (btree operations) → cacheMu (page cache)
 type BTree struct {
 	db        *database
 	alloc     *allocator

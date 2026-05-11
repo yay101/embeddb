@@ -158,7 +158,6 @@ func benchQuery(mode StorageMode, label string, count int, useWAL bool) time.Dur
 }
 
 func TestStorageBenchmark(t *testing.T) {
-	t.Skip("benchmark: run manually with go test -run TestStorageBenchmark -timeout 30m")
 	counts := []int{10_000, 50_000, 100_000}
 
 	for _, count := range counts {

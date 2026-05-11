@@ -35,7 +35,6 @@ type StressEvent struct {
 }
 
 func TestStress10M(t *testing.T) {
-	t.Skip("stress test: run manually with go test -run TestStress10M -timeout 30m")
 	const (
 		numTables      = 10
 		perTable       = 100000
