@@ -330,14 +330,24 @@ func (bt *BTree) writeNode(node *BTreeNode) error {
 	data := bt.serializeNode(node)
 	r := bt.db.region.Load()
 	if r != nil {
-		r.WriteLock()
+		r.RLock()
 		copy(bt.pageData(node.Offset), data)
-		r.WriteUnlock()
+		r.RUnlock()
 	} else {
 		if err := bt.db.writeAt(data, int64(node.Offset)); err != nil {
 			return fmt.Errorf("btree writeNode writeAt: %w", err)
 		}
 	}
+
+	// Debug: verify the CRC was written correctly
+	writtenCRC := binary.LittleEndian.Uint32(data[PageFooterOff:])
+	checkPage := bt.pageData(node.Offset)
+	mmapCRC := binary.LittleEndian.Uint32(checkPage[PageFooterOff:])
+	if mmapCRC != writtenCRC {
+		panic(fmt.Sprintf("WRITENODE CRC MISMATCH AFTER WRITE: offset=%d written=%08x mmap=%08x",
+			node.Offset, writtenCRC, mmapCRC))
+	}
+
 	bt.cacheNode(node)
 	return nil
 }
