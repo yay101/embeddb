@@ -20,6 +20,8 @@ type allocator struct {
 	freeList   []freeBlock
 	actualSize uint64
 	mu         sync.Mutex
+	debugMode  bool
+	allocSet   map[[2]uint64]struct{} // [offset, size] set for debug mode
 }
 
 type freeBlock struct {
@@ -50,12 +52,34 @@ func (a *allocator) Allocate(size uint64) (offset uint64, length uint64, err err
 				a.freeList[i].offset += size
 				a.freeList[i].length -= size
 			}
-			return fb.offset, size, nil
+			offset = fb.offset
+			length = size
+			break
 		}
 	}
-	offset = a.actualSize
-	a.actualSize += size
-	a.nextOffset = a.actualSize
+	if length == 0 {
+		offset = a.actualSize
+		a.actualSize += size
+		a.nextOffset = a.actualSize
+		length = size
+	}
+
+	if a.debugMode {
+		k := [2]uint64{offset, offset + size}
+		if _, ok := a.allocSet[k]; ok {
+			panic(fmt.Sprintf("ALLOCATOR DOUBLE-ALLOCATION: offset=%d size=%d", offset, size))
+		}
+		// Check for overlapping allocations
+		for existing := range a.allocSet {
+			existStart, existEnd := existing[0], existing[1]
+			if offset < existEnd && offset+size > existStart {
+				panic(fmt.Sprintf("ALLOCATOR OVERLAP: new [%d,%d) overlaps existing [%d,%d)",
+					offset, offset+size, existStart, existEnd))
+			}
+		}
+		a.allocSet[k] = struct{}{}
+	}
+
 	return offset, size, nil
 }
 
@@ -120,6 +144,9 @@ func (a *allocator) Reset(nextOffset uint64, freeList []freeBlock) {
 	if a.actualSize < nextOffset {
 		a.actualSize = nextOffset
 	}
+	if a.debugMode {
+		a.allocSet = make(map[[2]uint64]struct{})
+	}
 }
 
 // Snapshot returns a snapshot of the allocator state that can be restored later.
@@ -142,6 +169,9 @@ func (a *allocator) Restore(snap allocatorSnapshot) {
 	a.nextOffset = snap.nextOffset
 	a.actualSize = snap.actualSize
 	a.freeList = snap.freeList
+	if a.debugMode {
+		a.allocSet = make(map[[2]uint64]struct{})
+	}
 }
 
 type allocatorSnapshot struct {

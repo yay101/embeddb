@@ -586,6 +586,19 @@ func (db *DB) Stats() DBStats {
 	return stats
 }
 
+// EnableAllocatorDebug enables debug tracking in the allocator. All subsequent
+// allocations are tracked and the allocator will panic if it returns the same
+// offset twice or if allocations overlap. Use this to detect double-allocation bugs.
+// Intended for testing/debugging only. Call before any table operations.
+func (db *DB) EnableAllocatorDebug() {
+	if db.database != nil {
+		db.database.alloc.mu.Lock()
+		db.database.alloc.debugMode = true
+		db.database.alloc.allocSet = make(map[[2]uint64]struct{})
+		db.database.alloc.mu.Unlock()
+	}
+}
+
 // FastSync performs an asynchronous sync of the memory-mapped region without
 // rebuilding the B-tree index. This is faster than Sync() but provides weaker
 // durability guarantees.

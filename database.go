@@ -221,13 +221,13 @@ func (db *database) writeAt(buf []byte, offset int64) error {
 			return nil
 		}
 		needed := offset + int64(len(buf))
-		currentRegion.WriteLock()
+		currentRegion.RLock()
 		if needed <= currentRegion.Size() {
 			copy(unsafe.Slice((*byte)(unsafe.Add(currentRegion.Pointer(), offset)), len(buf)), buf)
-			currentRegion.WriteUnlock()
+			currentRegion.RUnlock()
 			return nil
 		}
-		currentRegion.WriteUnlock()
+		currentRegion.RUnlock()
 		if err := db.ensureRegion(needed); err != nil {
 			return fmt.Errorf("writeAt ensureRegion: %w", err)
 		}
