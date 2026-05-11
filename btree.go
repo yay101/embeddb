@@ -63,6 +63,7 @@ type BTree struct {
 	misses    uint64
 	lastAdjust time.Time
 	adjustInterval time.Duration
+	adjustLock     int32 // CAS guard for cache adjustment
 }
 
 // BTreeNode represents a single 4096-byte page in the B+ tree.
@@ -501,6 +502,12 @@ func (bt *BTree) trackAccess(hit bool) {
 		atomic.AddUint64(&bt.misses, 1)
 	}
 
+	// Only one goroutine runs the adjustment at a time
+	if !atomic.CompareAndSwapInt32(&bt.adjustLock, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&bt.adjustLock, 0)
+
 	if time.Since(bt.lastAdjust) < bt.adjustInterval {
 		return
 	}
@@ -514,16 +521,22 @@ func (bt *BTree) trackAccess(hit bool) {
 
 	hitRate := float64(hits) / float64(total)
 
-	if hitRate > 0.90 && bt.cacheSize < bt.maxSize {
-		newSize := bt.cacheSize * 3 / 2
-		if newSize > bt.maxSize {
-			newSize = bt.maxSize
+	bt.cacheMu.RLock()
+	cacheSize := bt.cacheSize
+	maxSize := bt.maxSize
+	minSize := bt.minSize
+	bt.cacheMu.RUnlock()
+
+	if hitRate > 0.90 && cacheSize < maxSize {
+		newSize := cacheSize * 3 / 2
+		if newSize > maxSize {
+			newSize = maxSize
 		}
 		bt.resizeCache(newSize)
-	} else if hitRate < 0.30 && bt.cacheSize > bt.minSize {
-		newSize := bt.cacheSize / 2
-		if newSize < bt.minSize {
-			newSize = bt.minSize
+	} else if hitRate < 0.30 && cacheSize > minSize {
+		newSize := cacheSize / 2
+		if newSize < minSize {
+			newSize = minSize
 		}
 		bt.resizeCache(newSize)
 	}
@@ -534,6 +547,9 @@ func (bt *BTree) trackAccess(hit bool) {
 }
 
 func (bt *BTree) resizeCache(newSize int) {
+	bt.cacheMu.Lock()
+	defer bt.cacheMu.Unlock()
+
 	if newSize == bt.cacheSize {
 		return
 	}
