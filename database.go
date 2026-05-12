@@ -80,7 +80,7 @@ type database struct {
 	indexRoot       uint64
 	alloc           *allocator
 	tableCat        tableCatalog
-	tx              *Transaction
+	tx              *transaction
 	parent          *DB
 	migrate         bool
 	fileTruncatedTo int64
@@ -146,7 +146,9 @@ func (db *database) ensureRegionLocked(size int64) error {
 			return err
 		}
 	}
+	currentRegion.WriteLock()
 	relocated, err := currentRegion.Resize(alignedSize)
+	currentRegion.WriteUnlock()
 	if err != nil {
 		return err
 	}

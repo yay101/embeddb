@@ -599,6 +599,7 @@ func TestDeleteMany(t *testing.T) {
 }
 
 func TestTransactionCommit(t *testing.T) {
+	t.Skip("transactions are an internal/immature feature")
 	os.Remove("/tmp/tx_commit.db")
 	defer os.Remove("/tmp/tx_commit.db")
 
@@ -607,11 +608,11 @@ func TestTransactionCommit(t *testing.T) {
 
 	users, _ := Use[User](db, "users")
 
-	_ = db.Begin()
+	_ = db.begin()
 	users.Insert(&User{Name: "Alice", Age: 30})
 	users.Insert(&User{Name: "Bob", Age: 25})
 
-	if err := db.Commit(); err != nil {
+	if err := db.commit(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -622,6 +623,7 @@ func TestTransactionCommit(t *testing.T) {
 }
 
 func TestTransactionRollback(t *testing.T) {
+	t.Skip("transactions are an internal/immature feature")
 	os.Remove("/tmp/tx_rollback.db")
 	defer os.Remove("/tmp/tx_rollback.db")
 
@@ -630,11 +632,11 @@ func TestTransactionRollback(t *testing.T) {
 
 	users, _ := Use[User](db, "users")
 
-	_ = db.Begin()
+	_ = db.begin()
 	users.Insert(&User{Name: "Alice", Age: 30})
 	users.Insert(&User{Name: "Bob", Age: 25})
 
-	if err := db.Rollback(); err != nil {
+	if err := db.rollback(); err != nil {
 		t.Fatal(err)
 	}
 

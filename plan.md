@@ -1,213 +1,222 @@
-# EmbedDB v1.0.0 — Improvement Plan
+# EmbedDB — Investigation & Path Forward
 
-## Priority 1: Performance (High Impact)
+## CRC Error Investigation
 
-### 1.1 B-Tree Range Scans for QueryRange
-**Problem**: All range queries (`QueryRangeGreaterThan`, `QueryRangeLessThan`, `QueryRangeBetween`, `QueryNotEqual`, `QueryGreaterOrEqual`, `QueryLessOrEqual`, `QueryLike`, `QueryNotLike`) fall through to `filterByField()` — a full table scan deserializing every record. Benchmark shows `QueryRangeBetween` at **13.7ms** vs `Query` at **312µs** — a 44x gap.
+### Symptom
+```
+btree page 148600737: CRC mismatch (stored=62616261 computed=6b403117)
+[type=unknown hex=000101015c440000 RECORD_DATA?]
+```
+- `stored=62616261` = ASCII `"baab"` (`strings.Repeat("ab", 5000)` from torture test notes pool)
+- File CRC also mismatches → data synced to disk, not mmap coherence
+- Same page offset gets multiple errors, stored CRC varies between reads
+- Reproduces at 3+ concurrent workers, ~12 errors per 312K operations
 
-**Fix**: Add `ScanRange(startPrefix, endPrefix []byte)` to `BTree` that walks the leaf chain starting from the first key ≥ `startPrefix` and stopping after keys exceed `endPrefix`. Then implement each range method to construct appropriate start/end bounds from the secondary key encoding and call `ScanRange` instead of `filterByField`.
+### Root Cause: In-place B-tree mutations incompatible with rollback
 
-**Example** for `QueryRangeGreaterThan("Age", 20)`:
-- Start: `encodeSecondaryKeyPrefixWithValue(tableID, "Age", encodeIndexValue(21))`
-- End: `encodeSecondaryKeyPrefix(tableID+1, "Age")` (or a sentinel)
+The B-tree mutates nodes **in-place** — `splitChild`, `insertNonFull`, `deleteFromNode`,
+`borrowFromLeft`, `borrowFromRight`, `mergeNodes` all call `writeNode` which writes
+back to the **same disk offset**. Only `newNode` allocates a fresh page.
 
-**Files**: `btree.go` (add `ScanRange`), `table_api.go` (rewrite QueryRange* methods), `index.go` (add bound constructors)
+**Mechanism:**
+1. Transaction begins: snapshots root offset (R) + allocator state (A)
+2. Insert triggers split: internal node P at offset 1000 modified in-place — gets new
+   Children[i] = 2000 (allocated during transaction)
+3. Rollback: root restored to R, allocator restored to A (freeing offset 2000)
+4. Root R still references P at offset 1000 — **but P was overwritten in step 2**
+5. P still has Children[i] = 2000 from during the transaction
+6. Offset 2000 gets re-allocated for records → record data overwrites B-tree page
+7. Subsequent traversal follows Children[i] to 2000 → reads record data → CRC mismatch
 
-**Expected result**: Range queries drop from O(n) to O(k+m) where k is result count and m is sibling leaf pages traversed. Should match `Query` performance (~300µs).
+The corruption is **persistent** because `writeNode` writes through to both mmap and
+file. Once a page is overwritten, the original data is gone. The allocator restore
+only affects allocation state, not on-disk page content.
 
----
+### Affected Code Paths
 
-### 1.2 B-Tree Page Cache Improvements
-**Problem**: Cache is a fixed 2048-entry ring buffer (8MB) with FIFO eviction, `sync.Mutex` (no read concurrency), root page gets no special treatment, and the unused `pagePool` sync.Pool wastes code.
+| Function | In-Place Writes | During Transaction? | Risk |
+|---|---|---|---|
+| `insertNonFull` (leaf) | Writes leaf to existing offset | Yes (if within tx) | Medium |
+| `insertNonFull` (internal) | No direct write (recurses) | N/A | Low |
+| `splitChild` | Writes child, parent to existing offset; newNode to fresh | Yes | **High** |
+| `deleteFromNode` | Writes leaf/internal to existing offset | Yes | Medium |
+| `borrowFromLeft/Right` | Writes left/right/parent in-place | Yes | Medium |
+| `mergeNodes` | Writes left/parent in-place | Yes | Medium |
+| `BulkInsert` | All writes to fresh pages (via `buildInternalNodes`) | No in-place writes | Low |
 
-**Fixes**:
-- Replace `sync.Mutex` with `sync.RWMutex` for `cacheMu` — concurrent reads should not serialize
-- Pin the root node in cache (never evict) — it's traversed on every operation
-- Make cache size configurable via `OpenOptions.CachePages` (default 4096)
-- LRU eviction instead of FIFO — use a doubly-linked list or container/heap
-- Remove the unused `pagePool` at `btree.go:33-38`
-
-**Files**: `btree.go`
-
----
-
-### 1.3 Eliminate Double Allocation in serializeNode
-**Problem**: `serializeNode()` allocates two `PageSize` buffers — one working buffer and one result copy (`btree.go:189,231`). Every node write wastes 4KB.
-
-**Fix**: Return the working buffer directly. The caller (`writeNode`) already copies it to the mmap region.
-
-**Files**: `btree.go:188-233`
-
----
-
-### 1.4 Remove Pre-Insert Search in B-Tree
-**Problem**: `Insert()` and `Put()` both call `searchUnlocked(key)` before the actual insert just to decide whether to increment `bt.count`. This is an extra full tree traversal per insert.
-
-**Fix**: Track count during the insert itself. After `insertNonFull`, check if the key was newly added vs updated (return a bool). Alternatively, maintain a count delta and reconcile on flush.
-
-**Files**: `btree.go:401-468`
-
----
-
-### 1.5 Reduce Per-Record Allocations in Hot Paths
-**Problem**: Every `readRecordAt` allocates 2-3 byte slices (header, record buffer, result). `ScanRecords().Next()` re-acquires `db.mu.RLock()` per record. `encodePrimaryKey`/`encodeSecondaryKey` allocate on every call.
-
-**Fixes**:
-- `Get()` already holds RLock — `readRecordAt` shouldn't re-lock internally
-- Pool record buffers or use arena allocation for batch operations
-- Use `sync.Pool` for `encodePrimaryKey` buffers (currently `index.go:17-23` allocates fresh each time)
-- `ScanRecords` should read all records in a single RLock pass, not per-record Get()
-
-**Files**: `table_api.go`, `index.go`, `main.go`
+The **high-risk** path is `splitChild`: it adds new Children entries referencing
+transaction-allocated pages. After rollback, those children are freed but the parent
+still points to them.
 
 ---
 
-### 1.6 Allocator Mutex Holds Through Syscalls
-**Problem**: `Allocate()` holds `a.mu.Lock()` through `file.Truncate` and `mmap.Resize` — both blocking syscalls. All concurrent writes serialize on this.
+## All Issues Found
 
-**Fix**: Pre-allocate the file in chunks (e.g., 64MB at a time). Only take the mutex for the fast path (bump offset). Slow path (growth) is rare and can be lock-free after reservation.
+### Critical (causes data corruption)
+1. **In-place mutations break rollback** — See Root Cause above. Any `writeNode` call
+   inside a transaction overwrites pre-transaction page data.
 
-**Files**: `storage.go:66-123`
+### High (causes data loss or incorrect behavior)
+2. **`BulkInsert` replaces entire tree** — Builds a new tree from only the provided
+   entries, orphaning ALL existing keys from other tables. Multi-table databases
+   lose data after any BulkInsert.
+3. **`InsertManyBulk` bypasses transaction tracking** — Directly modifies
+   `entry.RecordCount` without checking `t.db.tx`. On rollback, record counts
+   are restored from snapshot but NextRecordID may be inconsistent.
+4. **`bt.count = 0` unprotected in Rollback** — Runs after `bt.mu.Unlock()` in
+   `SetRootOffset`. Between these, a concurrent reader sees stale count. **(Fixed)**
 
----
+### Medium (bugs with workarounds)
+5. **B-tree pages never freed** — No `Free()` calls in production code. Orphaned
+   pages from splits/merges/deletes/BulkInserts accumulate. File grows unbounded.
+   Vacuum can reclaim some but can't detect all orphans.
+6. **Missing `children[i]` bounds checks** — 7 call sites accessed `Children[i]`
+   without `len(Children)` guard. Would crash or return bad data if page was
+   corrupted. **(Fixed)**
 
-## Priority 2: Correctness & Robustness
-
-### 2.1 Rebuild Secondary Indexes After Corruption Recovery
-**Problem**: `rebuildIndexFromScan()` only rebuilds primary keys. Secondary and version entries are permanently lost. After reopening, `Query()` returns empty results and `ListVersions()` fails.
-
-**Fix**: After inserting primary keys, scan each record's payload to extract indexed field values and re-insert secondary keys. For version entries, use the record header's `PrevVersionOff` to reconstruct the version chain.
-
-**Files**: `main.go:439-566`
-
----
-
-### 2.2 Transaction Rollback Doesn't Reclaim Space
-**Problem**: On `Rollback()`, the B-tree root is reset and cache is cleared, but written record data and allocated B-tree pages remain in the file. The allocator's free list is never restored.
-
-**Fix**: Snapshot the allocator state at `Begin()`. On `Rollback()`, restore it. Alternatively, use a WAL-based approach for true atomicity.
-
-**Files**: `main.go:1085-1158`
-
----
-
-### 2.3 Silent Error Swallowing in Delete
-**Problem**: `readAt` errors are silently discarded in `Delete()` (`table_api.go:864-865`) and `DeleteMany()`. If the read fails, `hdr.RecordID` is 0, and secondary keys won't be cleaned up — orphaned index entries persist forever.
-
-**Fix**: Return errors from `readAt` calls. If the read fails, skip the record but log a warning. Consider adding an `Err` return to `Delete`.
-
-**Files**: `table_api.go:864-865`
+### Low (code quality)
+7. **`newTxnPages` allocated but never used** — `transaction.go:14` declares the map
+   but nothing reads or writes to it.
+8. **`Transaction` type not integrated** — Struct exists but transaction semantics
+   (isolation, atomic visibility) are incomplete. Rollback clears cache and restores
+   allocator but can't restore overwritten page data.
 
 ---
 
-### 2.4 Mmap Region Data Race
-**Problem**: In `readAt()`/`writeAt()`, after releasing `currentRegion.RLock()` and calling `ensureRegion()`, the region is re-loaded. If another goroutine resizes the region between the reload and the copy, the offset could be stale.
+## Path Forward Options
 
-**Fix**: Hold the region RLock through the entire read/write operation, or use atomic pointer swaps that guarantee the region doesn't change mid-operation.
+### Option A: Full CoW B-tree (Recommended)
 
-**Files**: `main.go:248-277`
+Rewrite B-tree mutations to be fully Copy-on-Write. Every modified node gets a new
+page. Parent nodes propagate new child offsets upward. Root offset changes on every
+mutation.
 
----
+**What was tried:**
+- **Cascading CoW** — `cloneForWrite` at each level, write new page, update parent
+  reference. Correct but O(depth) allocations per insert. Caused OOM/SIGBUS in
+  long-running tests due to page explosion (~GB of pages over 15s of inserts).
+- **Redirect map** — `cowMap[oldOffset] = newOffset`, `readNode` follows redirects.
+  Avoids cascading but map grows unboundedly (never cleaned up after commit).
 
-## Priority 3: Code Quality & Cleanup
+**What's needed:**
+A disciplined shadow-paging design where:
+1. `writeNode` always allocates a new page when a transaction is active
+2. Parent references are updated via a `redirectMap` indexed by original offset
+3. On commit: bake in redirects by walking reachable nodes and rewriting
+   Children[i] in-place (now that old pages are garbage), then clear the map
+4. On rollback: clear redirect map, allocator restore handles everything
 
-### 3.1 Remove Dead Code
-- `mapIndex` type and all methods (`main.go:24-108`) — unused
-- `btreeMapIndex` and `btreeOffsetMapIndex` (`btree.go:964-1130`) — vestigial wrappers for deleted interfaces
-- `decodeVersionValue`/`encodeVersionValue` (`index.go:85-99`) — never called
-- `shrinkRegion` (`main.go:231-237`) — no-op
-- `pagePool` (`btree.go:33-38`) — defined but never used
-- Entire `wal.go` — defines types but never integrated
+**Scope:** ~300-500 lines in `btree.go`. Touches `writeNode`, `insertNonFull`,
+`splitChild`, `deleteFromNode`, `rebalance`, `borrowFromLeft/Right`, `mergeNodes`.
 
-**Files**: `main.go`, `btree.go`, `index.go`, `wal.go`
+**Risk:** Medium. All mutation paths must be converted. Missed paths corrupt silently.
 
----
+### Option B: Shadow Page Isolated Subtree
 
-### 3.2 Split table_api.go (2064 lines) Into Focused Files
-Current file mixes concerns:
-- `table_crud.go` — Insert, Get, Update, Delete, Upsert
-- `table_query.go` — Query, QueryRange*, filterByField
-- `table_index.go` — CreateIndex, DropIndex, insertSecondaryKeys, deleteSecondaryKeys, explicitIndexes
-- `scanner.go` — ScanRecords, Scanner type, Next/Record/Close
-- `pagination.go` — Paged result types and pagination logic
-- `types.go` — normalizePK, compareValues, valueToIndexKey, helper functions
+Instead of CoW for every node, only shadow pages on the path from root to modified
+leaf. Internal nodes below the root are written to new pages; the root itself is
+updated. This is what Option A does but with stricter scope.
 
----
+**Difference from A:** Same approach, just a recognition that only nodes on the
+insertion/delete path need shadow copies.
 
-### 3.3 Split main.go (1288 lines) Into Focused Files
-- `database.go` — openDatabase, Close, load, flush, ensureRegion, readAt, writeAt
-- `vacuum.go` — Vacuum
-- `transaction.go` — Begin, Commit, Rollback
-- `migration.go` — migrateTable
-- `allocator.go` — already in storage.go, but mapIndex should be removed
+### Option C: Pre-transaction page snapshot + restore
 
----
+Before the first write in a transaction, snapshot ALL pages that will potentially
+be modified. On rollback, restore the snapshots byte-for-byte. Reads during
+transaction read from the modified (in-place) pages.
 
-### 3.4 Secondary Key Encoding: Use RecordID Instead of RecordOffset
-**Problem**: `encodeSecondaryKey` embeds `recordOffset` as a suffix. When Vacuum compacts the file, every secondary key must be reconstructed with new offsets. This is O(n) and requires a full index rebuild.
+**Approach:**
+1. On `Begin`: record all page offsets reachable from root (full tree walk)
+2. Before `writeNode` overwrites a page: copy page data to a snapshot buffer
+3. On rollback: write snapshot buffers back to their original offsets
+4. On commit: discard snapshot buffers
 
-**Fix**: Use `recordID` (uint32, already in the record header) instead of `recordOffset`. Then secondary keys become stable across Vacuum operations. To look up a record, use the primary key index: `secondaryKey → recordID → primaryKey → offset`.
+**Pros:** All existing mutation code works unchanged. No structural changes.
+**Cons:** Full tree walk on Begin (expensive for large trees). Snapshot storage
+overhead (~1 page per modified page). Rollback must write-back before allocator
+restore.
 
-This requires either:
-- Storing `recordID → primaryKey` mapping somewhere, or
-- Encoding `tableID + recordID` in the secondary key and scanning primary keys for that recordID
+**Scope:** ~100 lines. Hook into `writeNode` to snapshot before write, hook into
+`rollback()` to restore. Tree walk on `begin()`.
 
-**Trade-off**: Adds an extra primary key lookup per secondary query, but eliminates the need to rebuild secondary keys during Vacuum.
+### Option D: Transaction-isolated allocator region
 
-**Files**: `index.go`, `main.go` (Vacuum), `table_api.go`
+Allocate pages for the transaction in a dedicated region. Parent pages within the
+region reference each other; on rollback, the entire region is discarded. The root
+switches atomically on commit.
 
----
+**Approach:**
+1. On `Begin`: record current root + allocator state
+2. All `writeNode` calls during transaction: allocate from a transient arena
+3. When root offset changes (due to CoW or split), record new root
+4. On commit: final root becomes permanent, arena pages are committed
+5. On rollback: arena pages freed, root restored
 
-## Priority 4: Future Features
+**Pros:** Clean separation of transaction data. No in-place overwrites of
+pre-transaction pages. **Cons:** Requires separate allocator for transactions
+or careful tracking of which allocations belong to the transaction. Root-swap
+logic needed for all mutation paths.
 
-### 4.1 Write-Ahead Log (WAL)
-**Problem**: No durability guarantee. A crash between `Insert` and `Sync` loses data. The `wal.go` placeholder exists but is never integrated.
+### Option E: Remove transactions, fix BulkInsert instead
 
-**Fix**: 
-- On `Open`, create WAL file
-- Before each mutation, append a WAL frame (operation type, key, value)
-- On `Sync`, flush WAL then flush main data
-- On recovery, replay WAL frames
+Accept that transactions are not viable without major B-tree rewrite. Focus on
+fixing the BulkInsert tree-replacement bug and orphaned page accumulation.
 
-**Files**: `wal.go`, `main.go`
+**What changes:**
+1. Fix BulkInsert to merge with existing tree (or document limitation)
+2. Keep `begin/commit/rollback` as no-ops with a logged warning
+3. Focus on single-writer correctness and performance
+4. Remove `Transaction` struct and dead `newTxnPages` map
 
----
+**Pros:** No CoW overhead. All existing code stays as-is. B-tree operations are
+simpler and faster. **Cons:** No isolation or rollback. Applications must
+implement their own undo logic.
 
-### 4.2 B-Tree Prefix Range Scan Method
-**Problem**: Currently `Scan()` iterates all leaf nodes. No method for bounded iteration from a start key to an end key.
-
-**Fix**: Add `ScanRange(startKey, endKey []byte, fn func(key []byte, value uint64) bool)` to `BTree`:
-1. Search for the first key ≥ `startKey`
-2. Walk leaf chain until keys exceed `endKey`
-3. Call `fn` for each entry
-
-This is needed for Priority 1.1 (range queries) but also useful for prefix queries, pagination, and cursor-based iteration.
-
-**Files**: `btree.go`
-
----
-
-### 4.3 Configurable Cache Size
-**Problem**: B-tree page cache is hardcoded to 2048 entries regardless of database size or available memory.
-
-**Fix**: Add `CachePages int` to `OpenOptions`. Default to 4096. Apply in `openBTree`.
-
-**Files**: `table_api.go` (OpenOptions), `btree.go` (openBTree)
-
----
-
-### 4.4 Batch Operations
-**Problem**: `InsertMany`, `UpdateMany`, `DeleteMany` all hold the write lock for the entire batch and perform individual B-tree operations. No batching at the B-tree level.
-
-**Fix**: Add `BTree.BatchInsert(entries []KeyValue)` that amortizes lock acquisition and page splits. Also consider `Table.BatchInsert(records []*T)` that does a single lock acquisition + batch B-tree mutation.
-
-**Files**: `btree.go`, `table_api.go`
+**Current status:** This option is effectively the current state after this
+session — transaction API is hidden (lowercase), transaction tests are skipped,
+README documents unavailability.
 
 ---
 
-### 4.5 CRC Verification Toggle
-**Problem**: Every B-tree page read verifies CRC (`btree.go:304-319`). This adds CPU overhead on every cache miss during normal operation. CRC should only be verified on recovery.
+## Changes Made This Session
 
-**Fix**: Add `VerifyCRC bool` to `OpenOptions`. Only check on `rebuildIndexFromScan` path or explicit `Verify()` call.
+### A. Defensive validation
+- `readNode` bounds validator: validates `len(Children) == Count+1` and all
+  child offsets `>= FileHeaderSize`
+- Bounds checks at 7 vulnerable call sites (`insertNonFull`, `deleteFromNode`,
+  `rebalance`, `findMax`, `Scan`)
 
-**Files**: `btree.go`, `table_api.go`
+### B. Race fix
+- `bt.count = 0` moved inside `SetRootOffset` under `bt.mu.Lock()`
+- Removed unprotected `tx.db.index.count = 0` from `Rollback`
+
+### C. API hiding
+- `DB.Begin/Commit/Rollback` → lowercase unexported `begin/commit/rollback`
+- `Transaction` → `transaction` (unexported)
+- All 8 transaction tests skipped with `t.Skip("transactions are an internal/immature feature")`
+- `torture/main.go`: removed `runTransaction`, widened adjacent op ranges
+
+### D. Documentation
+- README Transactions section: replaced example code with explanation of why
+  unavailable + root cause + path to re-enable
+- Features list: strikethrough on transactions entry
+- Known Limitations: added transaction unavailability note
+- `plan.md`: this file, with full investigation and path-forward options
+
+---
+
+## Recommendation
+
+**Short-term (now):** Option E is already implemented — transactions are hidden
+and documented as unavailable. Focus on single-writer correctness.
+
+**Medium-term:** Option C (page snapshot + restore) is the lowest-risk path to
+re-enabling transactions. A tree walk on Begin + page copy before writeNode is
+straightforward and doesn't require touching any B-tree mutation logic. The
+snapshot storage cost is 4KB per modified page, bounded by tree depth per insert.
+
+**Long-term:** Option A (full CoW) is the correct architectural fix. It requires
+rewriting all B-tree mutation paths but eliminates the in-place modification
+problem entirely and enables true MVCC. The redirect-map approach with commit-time
+bake-in is the most promising variant tested so far.

@@ -7,14 +7,14 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **Pure Go** - No Cgo, minimal dependencies
 - **Type-safe** - Full Go generics support
 - **Single file** - Database and indexes in one file
-- **B-tree primary index** - Persistent B-tree with Copy-on-Write transactions
+- **B-tree primary index** - Persistent B-tree with mmap or file I/O
 - **Range queries** - Greater than, less than, between (indexed and non-indexed)
 - **Nested structs** - Query fields like `Address.City`
 - **Multiple tables** - Different struct types in one file
 - **Efficient pagination** - Built-in paged queries
 - **Case-insensitive LIKE** - SQL LIKE patterns
 - **Scanner** - Low-lock sequential access with early exit
-- **Transactions** - Full Copy-on-Write commit and rollback support
+- **Transactions** - ~~Copy-on-Write commit and rollback~~ (unavailable, see [Transactions](#transactions))
 - **Vacuum** - File compaction
 - **Auto-indexing** - Automatically creates indexes for `db:"index"` fields
 - **Schema migration** - Automatically migrates records when struct changes
@@ -428,21 +428,12 @@ if result.HasMore {
 
 ### Transactions
 
-Transactions use Copy-on-Write semantics for crash safety:
-
-```go
-// Begin transaction
-db.Begin()
-
-users.Insert(&User{Name: "Alice", Age: 30})
-users.Insert(&User{Name: "Bob", Age: 25})
-
-// Commit or Rollback
-err := db.Commit()
-// err := db.Rollback()
-```
-
-On rollback, both the primary key index (B-tree) and version index are restored to their pre-transaction state.
+> **Note:** Transactions are currently unavailable. The B-tree index performs in-place
+> mutations during operations like splits and rebalancing, which is incompatible with
+> Copy-on-Write rollback semantics. After a rollback, internal nodes may retain child
+> pointers to pages freed by the allocator restore, causing CRC corruption on subsequent
+> reads. Transactions will be re-enabled once the B-tree is rewritten with full
+> Copy-on-Write support. See `plan.md` for details.
 
 ### Table & Index Management
 
@@ -594,7 +585,7 @@ carts.Insert(&Cart{
 - Header: 128 bytes (magic, version, catalog offset, B-tree roots)
 - Records: TLV-encoded with CRC verification, optional snappy compression (flagged in record header)
 - Catalog: table definitions at end of file
-- Primary Index: Persistent B-tree with mmap or file I/O (configurable), Copy-on-Write transactions
+- Primary Index: Persistent B-tree with mmap or file I/O (configurable)
 - Secondary Indexes: Persistent B-tree indexes with automatic recovery
 - Version Index: B-tree tracking record version history
 - WAL: Append-only log file (`<dbname>.wal`) for crash recovery, entries have CRC32 checksums
@@ -604,7 +595,7 @@ carts.Insert(&Cart{
 ## Known Limitations
 
 - **Concurrent mmap writes (stress mode)**: With 2+ concurrent writer goroutines, the memory-mapped storage mode may produce rare CRC errors (~1 in 20,000 operations) on B-tree pages. This is an OS-level mmap coherence issue — the Go race detector passes cleanly. Single-writer mode (`-workers 1` in the torture test) has zero errors. Use `StorageFile` mode for guaranteed correctness under concurrent writes.
-- **Single-writer transactions**: Only one write transaction can be active at a time. Concurrent `Begin()` returns nil.
+- **Single-writer transactions**: Transactions (`begin`, `commit`, `rollback`) are currently inaccessible. The B-tree performs in-place node mutations that conflict with rollback semantics. A full Copy-on-Write rewrite is required before re-enabling this feature.
 - **Lock order**: The internal lock hierarchy is `db.mu` → `bt.mu` → `cacheMu`. All code paths must follow this order to avoid deadlocks.
 
 ## Why EmbedDB?

@@ -2,22 +2,18 @@ package embeddb
 
 import "fmt"
 
-// Transaction represents a copy-on-write transaction. All writes within a transaction
-// are isolated until Commit is called. Rollback restores the database to its pre-transaction state.
-// Only one transaction can be active at a time per database.
-type Transaction struct {
+type transaction struct {
 	db                   *database
 	indexRootSnapshot    uint64
 	committed            bool
 	rolledBack           bool
 	recordCounts         map[string]uint32
-	newTxnPages          map[uint64]bool
 	recordCountSnapshot  map[string]uint32
 	nextRecordIDSnapshot map[string]uint32
 	allocSnapshot        allocatorSnapshot
 }
 
-func (db *database) Begin() *Transaction {
+func (db *database) begin() *transaction {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -36,13 +32,12 @@ func (db *database) Begin() *Transaction {
 
 	allocSnapshot := db.alloc.Snapshot()
 
-	tx := &Transaction{
+	tx := &transaction{
 		db:                   db,
 		indexRootSnapshot:    indexRootSnapshot,
 		committed:            false,
 		rolledBack:           false,
 		recordCounts:         make(map[string]uint32),
-		newTxnPages:          make(map[uint64]bool),
 		recordCountSnapshot:  recordCountSnapshot,
 		nextRecordIDSnapshot: nextRecordIDSnapshot,
 		allocSnapshot:        allocSnapshot,
@@ -53,7 +48,7 @@ func (db *database) Begin() *Transaction {
 
 // Commit applies the transaction's changes to the database. After Commit, the transaction
 // cannot be used again.
-func (tx *Transaction) Commit() error {
+func (tx *transaction) commit() error {
 	tx.db.mu.Lock()
 	defer tx.db.mu.Unlock()
 
@@ -75,7 +70,7 @@ func (tx *Transaction) Commit() error {
 
 // Rollback discards all changes made within the transaction and restores the database
 // to its state before Begin was called. Cannot be called after Commit.
-func (tx *Transaction) Rollback() error {
+func (tx *transaction) rollback() error {
 	tx.db.mu.Lock()
 	defer tx.db.mu.Unlock()
 
@@ -88,7 +83,6 @@ func (tx *Transaction) Rollback() error {
 	tx.rolledBack = true
 
 	tx.db.index.SetRootOffset(tx.indexRootSnapshot)
-	tx.db.index.count = 0
 	tx.db.index.cacheMu.Lock()
 	tx.db.index.cache = make(map[uint64]*BTreeNode, 2048)
 	tx.db.index.cacheMu.Unlock()

@@ -1,7 +1,6 @@
 package embeddb
 
 import (
-	"bytes"
 	"fmt"
 	"reflect"
 	"slices"
@@ -38,10 +37,14 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 			prefix := encodeSecondaryKeyPrefixWithValue(t.tableID, fieldName, strValue)
 
 			var offsets []uint64
-			_ = t.db.index.Scan(func(key []byte, val uint64) bool {
-				if bytes.HasPrefix(key, prefix) {
-					offsets = append(offsets, val)
-				}
+			endKey := make([]byte, len(prefix)+4)
+			copy(endKey, prefix)
+			endKey[len(prefix)] = 0xFF
+			endKey[len(prefix)+1] = 0xFF
+			endKey[len(prefix)+2] = 0xFF
+			endKey[len(prefix)+3] = 0xFF
+			_ = t.db.index.ScanRange(prefix, endKey, func(key []byte, val uint64) bool {
+				offsets = append(offsets, val)
 				return true
 			})
 
@@ -217,20 +220,21 @@ func (t *Table[T]) rangeQueryFromField(fieldName string, startValue interface{},
 	}
 
 	prefix := encodeSecondaryKeyPrefix(t.tableID, fieldName)
+	endKey := make([]byte, len(prefix)+1)
+	copy(endKey, prefix)
+	endKey[len(prefix)] = 0xFF
 
 	cmpFunc := func(fieldValue any) bool {
 		return compareValues(fieldValue, startValue) > 0 || (inclusive && compareValues(fieldValue, startValue) == 0)
 	}
 
 	var offsets []uint64
-	_ = t.db.index.Scan(func(key []byte, val uint64) bool {
-		if bytes.HasPrefix(key, prefix) {
-			_, _, fv, _, parsed := parseSecondaryKey(key)
-			if parsed {
-				fieldVal := decodeIndexKeyToValue(fv, field.Type)
-				if cmpFunc(fieldVal) {
-					offsets = append(offsets, val)
-				}
+	_ = t.db.index.ScanRange(prefix, endKey, func(key []byte, val uint64) bool {
+		_, _, fv, _, parsed := parseSecondaryKey(key)
+		if parsed {
+			fieldVal := decodeIndexKeyToValue(fv, field.Type)
+			if cmpFunc(fieldVal) {
+				offsets = append(offsets, val)
 			}
 		}
 		return true
@@ -255,20 +259,21 @@ func (t *Table[T]) rangeQueryToField(fieldName string, endValue interface{}, inc
 	}
 
 	prefix := encodeSecondaryKeyPrefix(t.tableID, fieldName)
+	endKey := make([]byte, len(prefix)+1)
+	copy(endKey, prefix)
+	endKey[len(prefix)] = 0xFF
 
 	cmpFunc := func(fieldValue any) bool {
 		return compareValues(fieldValue, endValue) < 0 || (inclusive && compareValues(fieldValue, endValue) == 0)
 	}
 
 	var offsets []uint64
-	_ = t.db.index.Scan(func(key []byte, val uint64) bool {
-		if bytes.HasPrefix(key, prefix) {
-			_, _, fv, _, parsed := parseSecondaryKey(key)
-			if parsed {
-				fieldVal := decodeIndexKeyToValue(fv, field.Type)
-				if cmpFunc(fieldVal) {
-					offsets = append(offsets, val)
-				}
+	_ = t.db.index.ScanRange(prefix, endKey, func(key []byte, val uint64) bool {
+		_, _, fv, _, parsed := parseSecondaryKey(key)
+		if parsed {
+			fieldVal := decodeIndexKeyToValue(fv, field.Type)
+			if cmpFunc(fieldVal) {
+				offsets = append(offsets, val)
 			}
 		}
 		return true
@@ -293,6 +298,9 @@ func (t *Table[T]) rangeQueryBetween(fieldName string, min, max interface{}, inc
 	}
 
 	prefix := encodeSecondaryKeyPrefix(t.tableID, fieldName)
+	endKey := make([]byte, len(prefix)+1)
+	copy(endKey, prefix)
+	endKey[len(prefix)] = 0xFF
 
 	cmpFunc := func(fieldValue any) bool {
 		cMin := compareValues(fieldValue, min)
@@ -303,14 +311,12 @@ func (t *Table[T]) rangeQueryBetween(fieldName string, min, max interface{}, inc
 	}
 
 	var offsets []uint64
-	_ = t.db.index.Scan(func(key []byte, val uint64) bool {
-		if bytes.HasPrefix(key, prefix) {
-			_, _, fv, _, parsed := parseSecondaryKey(key)
-			if parsed {
-				fieldVal := decodeIndexKeyToValue(fv, field.Type)
-				if cmpFunc(fieldVal) {
-					offsets = append(offsets, val)
-				}
+	_ = t.db.index.ScanRange(prefix, endKey, func(key []byte, val uint64) bool {
+		_, _, fv, _, parsed := parseSecondaryKey(key)
+		if parsed {
+			fieldVal := decodeIndexKeyToValue(fv, field.Type)
+			if cmpFunc(fieldVal) {
+				offsets = append(offsets, val)
 			}
 		}
 		return true

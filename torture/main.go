@@ -283,9 +283,7 @@ func runWorker(id int, db *embeddb.DB, ws *WorkerState, rng *rand.Rand, stopCh <
 			runDelete(ws, rng)
 		case op < 85:
 			runQuery(ws, rng)
-		case op < 90:
-			runTransaction(db, ws, rng, names, notesPool, tagsPool)
-		case op < 93:
+		case op < 88:
 			runScan(ws, rng)
 		case op < 96:
 			runFilter(ws, rng)
@@ -434,50 +432,6 @@ func runQuery(ws *WorkerState, rng *rand.Rand) {
 		logError(fmt.Sprintf("Query: %v", err))
 	}
 	atomic.AddInt64(&queryCount, 1)
-}
-
-func runTransaction(db *embeddb.DB, ws *WorkerState, rng *rand.Rand, names []string, notes []string, tags [][]string) {
-	tx := db.Begin()
-	if tx == nil {
-		atomic.AddInt64(&expectedErrs, 1)
-		return
-	}
-
-	rec := TestRecord{
-		Name:   names[rng.Intn(len(names))],
-		Age:    int32(rng.Intn(80) + 18),
-		Score:  rng.Float64() * 100,
-		Active: true,
-		Notes:  "tx test",
-		Tags:   []string{"tx"},
-	}
-	id, err := ws.table.Insert(&rec)
-	if err != nil {
-		tx.Rollback()
-		atomic.AddInt64(&expectedErrs, 1)
-		return
-	}
-
-	if rng.Intn(2) == 0 {
-		if err := db.Commit(); err != nil {
-			atomic.AddInt64(&errorCount, 1)
-			atomic.AddInt64(&txErrs, 1)
-			atomic.AddInt64(&expectedErrs, 1)
-			return
-		}
-		atomic.AddInt64(&txCommitCnt, 1)
-		ws.mu.Lock()
-		ws.insertedIDs = append(ws.insertedIDs, id)
-		ws.mu.Unlock()
-	} else {
-		if err := db.Rollback(); err != nil {
-			atomic.AddInt64(&errorCount, 1)
-			atomic.AddInt64(&txErrs, 1)
-			atomic.AddInt64(&expectedErrs, 1)
-			return
-		}
-		atomic.AddInt64(&txRollbackCnt, 1)
-	}
 }
 
 func runScan(ws *WorkerState, rng *rand.Rand) {
