@@ -62,6 +62,15 @@ func (t *Table[T]) Query(fieldName string, value interface{}) ([]T, error) {
 		}
 	}
 
+	field, err := t.findField(fieldName)
+	if err == nil && field.Primary {
+		record, err := t.Get(value)
+		if err != nil {
+			return nil, fmt.Errorf("record not found")
+		}
+		return []T{*record}, nil
+	}
+
 	if strings.Contains(fieldName, ".") {
 		comparator := func(fieldValue interface{}) bool {
 			return compareValues(fieldValue, value) == 0
