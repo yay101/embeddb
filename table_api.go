@@ -224,12 +224,24 @@ func validateLayout[T any]() error {
 	if t.Kind() != reflect.Struct {
 		return nil
 	}
+	return validateFields(t)
+}
 
+func validateFields(t reflect.Type) error {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		dbTag := f.Tag.Get("db")
-		if dbTag == "" {
+
+		if !f.IsExported() {
 			continue
+		}
+
+		dbTag := f.Tag.Get("db")
+		if dbTag == "-" {
+			continue
+		}
+
+		if err := validateFieldType(f.Type, f.Name); err != nil {
+			return err
 		}
 
 		parts := strings.Split(dbTag, ",")
@@ -248,6 +260,48 @@ func validateLayout[T any]() error {
 		if hasIndex && hasEncrypt {
 			return fmt.Errorf("field %q cannot have both index and encrypt tags: encrypted fields cannot be indexed", f.Name)
 		}
+	}
+	return nil
+}
+
+func validateFieldType(t reflect.Type, name string) error {
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64,
+		reflect.Bool, reflect.String:
+		return nil
+	case reflect.Slice:
+		return validateFieldType(t.Elem(), name)
+	case reflect.Struct:
+		if t.PkgPath() == "time" && t.Name() == "Time" {
+			return nil
+		}
+		return validateFields(t)
+	case reflect.Map:
+		if t.Key().Kind() != reflect.String {
+			return fmt.Errorf("unsupported map key type %v for field %q: only string keys are supported", t.Key().Kind(), name)
+		}
+		if err := validateFieldType(t.Elem(), name); err != nil {
+			return err
+		}
+		return nil
+	case reflect.Array:
+		return fmt.Errorf("unsupported field type [N]T for field %q: fixed-size arrays are not supported", name)
+	case reflect.Chan:
+		return fmt.Errorf("unsupported field type chan for field %q", name)
+	case reflect.Func:
+		return fmt.Errorf("unsupported field type func for field %q", name)
+	case reflect.Interface:
+		return nil
+	case reflect.Ptr:
+		return fmt.Errorf("unsupported field type pointer for field %q", name)
+	case reflect.Complex64, reflect.Complex128:
+		return fmt.Errorf("unsupported field type complex for field %q", name)
+	case reflect.Uintptr:
+		return fmt.Errorf("unsupported field type uintptr for field %q", name)
+	case reflect.UnsafePointer:
+		return fmt.Errorf("unsupported field type unsafe.Pointer for field %q", name)
 	}
 	return nil
 }
@@ -294,10 +348,8 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 		return nil, fmt.Errorf("database is closed")
 	}
 
-	if len(db.encryptionKey) > 0 {
-		if err := validateLayout[T](); err != nil {
-			return nil, err
-		}
+	if err := validateLayout[T](); err != nil {
+		return nil, err
 	}
 
 	if existing, ok := db.tables[tableName]; ok {

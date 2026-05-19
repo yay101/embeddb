@@ -963,3 +963,260 @@ func TestEveryTypeRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// ─── Map Type Tests ────────────────────────────────────────────────────────────
+
+type MapRecord struct {
+	ID        uint32            `db:"id,primary"`
+	Tags      map[string]string
+	Counts    map[string]int
+	Ratings   map[string]float64
+	Flags     map[string]bool
+	IntCounts map[string]int64
+}
+
+func TestMapRoundTrip(t *testing.T) {
+	os.Remove("/tmp/test_map_roundtrip.db")
+	defer os.Remove("/tmp/test_map_roundtrip.db")
+
+	db, err := Open("/tmp/test_map_roundtrip.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[MapRecord](db, "maps")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &MapRecord{
+		Tags: map[string]string{
+			"env":  "production",
+			"team": "backend",
+		},
+		Counts: map[string]int{
+			"requests": 42,
+			"errors":   3,
+		},
+		Ratings: map[string]float64{
+			"latency": 1.54,
+			"uptime":  99.99,
+		},
+		Flags: map[string]bool{
+			"active":  true,
+			"blocked": false,
+		},
+		IntCounts: map[string]int64{
+			"total": 999999999,
+		},
+	}
+
+	id, err := tbl.Insert(rec)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	got, err := tbl.Get(id)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if len(got.Tags) != 2 || got.Tags["env"] != "production" || got.Tags["team"] != "backend" {
+		t.Errorf("Tags mismatch: got %v", got.Tags)
+	}
+	if got.Counts["requests"] != 42 || got.Counts["errors"] != 3 {
+		t.Errorf("Counts mismatch: got %v", got.Counts)
+	}
+	if got.Ratings["latency"] != 1.54 || got.Ratings["uptime"] != 99.99 {
+		t.Errorf("Ratings mismatch: got %v", got.Ratings)
+	}
+	if got.Flags["active"] != true || got.Flags["blocked"] != false {
+		t.Errorf("Flags mismatch: got %v", got.Flags)
+	}
+	if got.IntCounts["total"] != 999999999 {
+		t.Errorf("IntCounts mismatch: got %v", got.IntCounts)
+	}
+}
+
+func TestEmptyMap(t *testing.T) {
+	os.Remove("/tmp/test_empty_map.db")
+	defer os.Remove("/tmp/test_empty_map.db")
+
+	db, err := Open("/tmp/test_empty_map.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[MapRecord](db, "maps")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &MapRecord{
+		Tags: make(map[string]string),
+	}
+
+	id, err := tbl.Insert(rec)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	got, err := tbl.Get(id)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if got.Tags == nil {
+		t.Error("Tags should be non-nil")
+	}
+	if len(got.Tags) != 0 {
+		t.Errorf("Tags should be empty, got %v", got.Tags)
+	}
+}
+
+func TestNilMap(t *testing.T) {
+	os.Remove("/tmp/test_nil_map.db")
+	defer os.Remove("/tmp/test_nil_map.db")
+
+	db, err := Open("/tmp/test_nil_map.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[MapRecord](db, "maps")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &MapRecord{
+		Tags: nil,
+	}
+
+	id, err := tbl.Insert(rec)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	got, err := tbl.Get(id)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if got.Tags == nil {
+		t.Error("Tags should be non-nil after round-trip")
+	}
+}
+
+func TestMapUpdate(t *testing.T) {
+	os.Remove("/tmp/test_map_update.db")
+	defer os.Remove("/tmp/test_map_update.db")
+
+	db, err := Open("/tmp/test_map_update.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tbl, err := Use[MapRecord](db, "maps")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &MapRecord{
+		Counts: map[string]int{"a": 1},
+	}
+	id, err := tbl.Insert(rec)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	updated := &MapRecord{
+		Counts: map[string]int{"b": 2, "c": 3},
+	}
+	if err := tbl.Update(id, updated); err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+
+	got, err := tbl.Get(id)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if len(got.Counts) != 2 || got.Counts["b"] != 2 || got.Counts["c"] != 3 {
+		t.Errorf("Counts mismatch after update: got %v", got.Counts)
+	}
+}
+
+func TestUnsupportedMapKeyType(t *testing.T) {
+	type BadRecord struct {
+		ID   uint32   `db:"id,primary"`
+		Data map[int]string
+	}
+
+	db, err := Open("/tmp/test_bad_map_key.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = Use[BadRecord](db, "bad")
+	if err == nil {
+		t.Fatal("expected error for map with int key")
+	}
+}
+
+func TestUnsupportedFieldType(t *testing.T) {
+	t.Run("pointer", func(t *testing.T) {
+		type BadRecord struct {
+			ID  uint32 `db:"id,primary"`
+			Ptr *int
+		}
+		db, _ := Open("/tmp/test_bad_ptr.db")
+		defer db.Close()
+		_, err := Use[BadRecord](db, "bad")
+		if err == nil {
+			t.Fatal("expected error for pointer field")
+		}
+	})
+
+	t.Run("array", func(t *testing.T) {
+		type BadRecord struct {
+			ID  uint32 `db:"id,primary"`
+			Arr [4]int
+		}
+		db, _ := Open("/tmp/test_bad_array.db")
+		defer db.Close()
+		_, err := Use[BadRecord](db, "bad")
+		if err == nil {
+			t.Fatal("expected error for array field")
+		}
+	})
+
+	t.Run("channel", func(t *testing.T) {
+		type BadRecord struct {
+			ID uint32 `db:"id,primary"`
+			Ch chan int
+		}
+		db, _ := Open("/tmp/test_bad_chan.db")
+		defer db.Close()
+		_, err := Use[BadRecord](db, "bad")
+		if err == nil {
+			t.Fatal("expected error for channel field")
+		}
+	})
+
+	t.Run("interface", func(t *testing.T) {
+		type BadRecord struct {
+			ID  uint32 `db:"id,primary"`
+			Val interface{}
+		}
+		db, _ := Open("/tmp/test_bad_iface.db")
+		defer db.Close()
+		_, err := Use[BadRecord](db, "bad")
+		if err != nil {
+			t.Logf("interface field is accepted but silently skipped: %v", err)
+		}
+	})
+}

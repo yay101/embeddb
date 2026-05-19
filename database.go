@@ -146,9 +146,7 @@ func (db *database) ensureRegionLocked(size int64) error {
 			return err
 		}
 	}
-	currentRegion.WriteLock()
 	relocated, err := currentRegion.Resize(alignedSize)
-	currentRegion.WriteUnlock()
 	if err != nil {
 		return err
 	}

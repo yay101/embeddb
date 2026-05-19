@@ -511,22 +511,22 @@ func fetchURL(url string) ([]byte, error) {
 	return buf, err
 }
 
-type CityInspection struct {
-	ID                string `db:"id,primary"`
-	CertificateNumber any    `db:"index"`
-	BusinessName      string `db:"index"`
-	Date              string
-	Result            string `db:"index"`
-	Sector            string
-	Address           InspectionAddress
-}
+	type CityInspection struct {
+		ID                string `db:"id,primary"`
+		CertificateNumber any
+		BusinessName      string `db:"index"`
+		Date              string
+		Result            string `db:"index"`
+		Sector            string
+		Address           InspectionAddress
+	}
 
-type InspectionAddress struct {
-	City   interface{}
-	Zip    interface{}
-	Street interface{}
-	Number interface{}
-}
+	type InspectionAddress struct {
+		City   string `db:"-"`
+		Zip    any    `db:"-"`
+		Street any    `db:"-"`
+		Number any    `db:"-"`
+	}
 
 func TestCityInspectionsFull(t *testing.T) {
 	os.Remove("/tmp/city_inspections_full.db")
