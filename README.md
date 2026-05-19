@@ -576,6 +576,15 @@ carts.Insert(&Cart{
 - `[]bool`
 - `[]struct` - slices of structs (all scalar and slice fields supported recursively)
 
+### Maps (stored, round-tripped)
+
+- `map[string]string` - metadata / JSON-style maps
+- `map[string]int` / `map[string]int64` - counters / IDs
+- `map[string]float64` - metrics / ratings
+- `map[string]bool` - feature flags
+
+Maps are TLV-encoded as key-value pairs. Only `string` keys are supported. Map fields are not indexed or queryable.
+
 ### Nested structs
 
 - Named and embedded structs are flattened and their fields become queryable with dot notation (e.g., `Address.City`)
