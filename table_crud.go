@@ -531,7 +531,11 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 			t.db.index.Insert(encodeVersionKey(t.tableID, b.recordID, 1), b.offset)
 		}
 		t.insertSecondaryKeys(b.record, b.recordID, b.offset)
-		entry.RecordCount++
+		if t.db.tx != nil {
+			t.db.tx.recordCounts[t.name]++
+		} else {
+			entry.RecordCount++
+		}
 	}
 
 	t.db.autoSync()

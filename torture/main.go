@@ -30,6 +30,7 @@ type TestRecord struct {
 }
 
 type WorkerState struct {
+	db          *embeddb.DB
 	table       *embeddb.Table[TestRecord]
 	insertedIDs []uint32
 	mu          sync.RWMutex
@@ -178,7 +179,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Failed to open table %s: %v\n", tableName, err)
 			os.Exit(1)
 		}
-		workerStates = append(workerStates, &WorkerState{table: table})
+		workerStates = append(workerStates, &WorkerState{db: db, table: table})
 	}
 
 	var wg sync.WaitGroup
@@ -273,24 +274,26 @@ func runWorker(id int, db *embeddb.DB, ws *WorkerState, rng *rand.Rand, stopCh <
 		op := rng.Intn(100)
 
 		switch {
-		case op < 25:
+		case op < 23:
 			runInsert(ws, rng, names, notesPool, tagsPool, maxRecords)
-		case op < 45:
+		case op < 42:
 			runGet(ws, rng)
-		case op < 60:
+		case op < 56:
 			runUpdate(ws, rng, names, notesPool, tagsPool)
-		case op < 75:
+		case op < 68:
 			runDelete(ws, rng)
-		case op < 85:
+		case op < 78:
 			runQuery(ws, rng)
-		case op < 88:
+		case op < 80:
 			runScan(ws, rng)
-		case op < 96:
+		case op < 85:
 			runFilter(ws, rng)
-		case op < 98:
+		case op < 87:
 			runPagination(ws, rng)
-		default:
+		case op < 90:
 			runBulkInsert(ws, rng, names, notesPool, tagsPool)
+		default:
+			runTransaction(ws, rng, names, notesPool, tagsPool)
 		}
 
 		atomic.AddInt64(&opCount, 1)
@@ -498,6 +501,54 @@ func runBulkInsert(ws *WorkerState, rng *rand.Rand, names []string, notes []stri
 	}
 	ws.mu.Unlock()
 	atomic.AddInt64(&insertCount, int64(len(ids)))
+}
+
+func runTransaction(ws *WorkerState, rng *rand.Rand, names []string, notes []string, tags [][]string) {
+	tx := ws.db.Begin()
+	if tx == nil {
+		return
+	}
+
+	nOps := rng.Intn(5) + 2
+	for i := 0; i < nOps; i++ {
+		op := rng.Intn(3)
+		switch op {
+		case 0: // Insert
+			rec := TestRecord{
+				Name:      names[rng.Intn(len(names))],
+				Age:       int32(rng.Intn(80) + 18),
+				Score:     rng.Float64() * 100,
+				Active:    rng.Intn(2) == 1,
+				CreatedAt: time.Now().Add(-time.Duration(rng.Intn(365*24)) * time.Hour),
+				Notes:     notes[rng.Intn(len(notes))],
+				Tags:      tags[rng.Intn(len(tags))],
+			}
+			_, err := ws.table.Insert(&rec)
+			if err != nil {
+				atomic.AddInt64(&errorCount, 1)
+				tx.Rollback()
+				atomic.AddInt64(&txRollbackCnt, 1)
+				return
+			}
+			ws.mu.Lock()
+			ws.insertedIDs = append(ws.insertedIDs, rec.ID)
+			ws.mu.Unlock()
+			atomic.AddInt64(&insertCount, 1)
+		}
+	}
+
+	if rng.Intn(2) == 0 {
+		if err := tx.Commit(); err != nil {
+			atomic.AddInt64(&errorCount, 1)
+			tx.Rollback()
+			atomic.AddInt64(&txRollbackCnt, 1)
+			return
+		}
+		atomic.AddInt64(&txCommitCnt, 1)
+	} else {
+		tx.Rollback()
+		atomic.AddInt64(&txRollbackCnt, 1)
+	}
 }
 
 func runVacuum(db *embeddb.DB, interval time.Duration, stopCh <-chan struct{}) {

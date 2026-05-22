@@ -21,7 +21,7 @@ type TxReproRecord struct {
 // while concurrent Get/Scan reads are running. This is the specific pattern
 // that triggers CRC errors in the torture test (Phase 1 finding).
 func TestTxRollbackWithConcurrentReads(t *testing.T) {
-	t.Skip("transactions are an internal/immature feature")
+
 	os.Remove("/tmp/test_tx_rollback_race.db")
 	defer os.Remove("/tmp/test_tx_rollback_race.db")
 
@@ -62,7 +62,7 @@ func TestTxRollbackWithConcurrentReads(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for atomic.LoadInt64(&stop) == 0 {
-			tx := db.begin()
+			tx := db.Begin()
 			if tx == nil {
 				continue
 			}
@@ -73,16 +73,16 @@ func TestTxRollbackWithConcurrentReads(t *testing.T) {
 				Data: strings.Repeat("txdata", 100),
 			})
 			if err != nil {
-				tx.rollback()
+				tx.Rollback()
 				atomic.AddInt64(&txRollback, 1)
 				continue
 			}
 
 			if time.Now().UnixNano()%2 == 0 {
-				db.commit()
+				tx.Commit()
 				atomic.AddInt64(&txCommit, 1)
 			} else {
-				db.rollback()
+				tx.Rollback()
 				atomic.AddInt64(&txRollback, 1)
 			}
 		}
@@ -138,7 +138,7 @@ func TestTxRollbackWithConcurrentReads(t *testing.T) {
 // after rollback by inserting records, rolling back, and verifying all
 // pre-existing records are still accessible.
 func TestTxRollbackVsBTreeIntegrity(t *testing.T) {
-	t.Skip("transactions are an internal/immature feature")
+
 	os.Remove("/tmp/test_tx_integrity.db")
 	defer os.Remove("/tmp/test_tx_integrity.db")
 
@@ -171,7 +171,7 @@ func TestTxRollbackVsBTreeIntegrity(t *testing.T) {
 
 	// Now do many Begin->Insert->Rollback cycles
 	for i := 0; i < 200; i++ {
-		tx := db.begin()
+		tx := db.Begin()
 		if tx == nil {
 			t.Fatal("Begin returned nil")
 		}
@@ -183,12 +183,12 @@ func TestTxRollbackVsBTreeIntegrity(t *testing.T) {
 			Data: strings.Repeat("tx", 50),
 		})
 		if err != nil {
-			tx.rollback()
+			tx.Rollback()
 			continue
 		}
 
 		// Rollback — insert should be discarded
-		if err := db.rollback(); err != nil {
+		if err := tx.Rollback(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -214,7 +214,7 @@ func TestTxRollbackVsBTreeIntegrity(t *testing.T) {
 // TestTxRollbackVsBTreeIntegrityConcurrent is like TestTxRollbackVsBTreeIntegrity
 // but with concurrent reads during rollback.
 func TestTxRollbackVsBTreeIntegrityConcurrent(t *testing.T) {
-	t.Skip("transactions are an internal/immature feature")
+
 	os.Remove("/tmp/test_tx_integrity_conc.db")
 	defer os.Remove("/tmp/test_tx_integrity_conc.db")
 
@@ -260,7 +260,7 @@ func TestTxRollbackVsBTreeIntegrityConcurrent(t *testing.T) {
 			if atomic.LoadInt64(&stop) != 0 {
 				return
 			}
-			tx := db.begin()
+			tx := db.Begin()
 			if tx == nil {
 				continue
 			}
@@ -270,10 +270,10 @@ func TestTxRollbackVsBTreeIntegrityConcurrent(t *testing.T) {
 				Data: strings.Repeat("tx-data", 30),
 			})
 			if err != nil {
-				tx.rollback()
+				tx.Rollback()
 				continue
 			}
-			db.rollback()
+			tx.Rollback()
 		}
 	}()
 
@@ -329,7 +329,7 @@ func TestTxRollbackVsBTreeIntegrityConcurrent(t *testing.T) {
 // is properly rolled back and does not corrupt the B-tree. This targets the
 // scenario where children[i] could reference offsets freed by rollback.
 func TestTxBulkInsertRollback(t *testing.T) {
-	t.Skip("transactions are an internal/immature feature")
+
 	os.Remove("/tmp/test_tx_bulk_rollback.db")
 	defer os.Remove("/tmp/test_tx_bulk_rollback.db")
 
@@ -362,7 +362,7 @@ func TestTxBulkInsertRollback(t *testing.T) {
 	// Many Begin -> BulkInsert -> Rollback cycles
 	bulkData := strings.Repeat("bulk", 200)
 	for cycle := 0; cycle < 100; cycle++ {
-		tx := db.begin()
+		tx := db.Begin()
 		if tx == nil {
 			t.Fatal("Begin returned nil")
 		}
@@ -379,12 +379,12 @@ func TestTxBulkInsertRollback(t *testing.T) {
 
 		_, err := tbl.InsertManyBulk(records)
 		if err != nil {
-			tx.rollback()
+			tx.Rollback()
 			continue
 		}
 
 		// Always rollback — bulk insert should be discarded
-		if err := db.rollback(); err != nil {
+		if err := tx.Rollback(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -409,7 +409,7 @@ func TestTxBulkInsertRollback(t *testing.T) {
 
 // TestTxBulkInsertRollbackConcurrent stresses BulkInsert + Rollback with concurrent reads.
 func TestTxBulkInsertRollbackConcurrent(t *testing.T) {
-	t.Skip("transactions are an internal/immature feature")
+
 	os.Remove("/tmp/test_tx_bulk_rollback_conc.db")
 	defer os.Remove("/tmp/test_tx_bulk_rollback_conc.db")
 
@@ -453,7 +453,7 @@ func TestTxBulkInsertRollbackConcurrent(t *testing.T) {
 			if atomic.LoadInt64(&stop) != 0 {
 				return
 			}
-			tx := db.begin()
+			tx := db.Begin()
 			if tx == nil {
 				continue
 			}
@@ -468,10 +468,10 @@ func TestTxBulkInsertRollbackConcurrent(t *testing.T) {
 			}
 
 			if _, err := tbl.InsertManyBulk(records); err != nil {
-				tx.rollback()
+				tx.Rollback()
 				continue
 			}
-			db.rollback()
+			tx.Rollback()
 		}
 	}()
 

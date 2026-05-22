@@ -11,6 +11,7 @@ type transaction struct {
 	recordCountSnapshot  map[string]uint32
 	nextRecordIDSnapshot map[string]uint32
 	allocSnapshot        allocatorSnapshot
+	pageSnapshots        map[uint64][]byte
 }
 
 func (db *database) begin() *transaction {
@@ -41,6 +42,7 @@ func (db *database) begin() *transaction {
 		recordCountSnapshot:  recordCountSnapshot,
 		nextRecordIDSnapshot: nextRecordIDSnapshot,
 		allocSnapshot:        allocSnapshot,
+		pageSnapshots:        make(map[uint64][]byte),
 	}
 	db.tx = tx
 	return tx
@@ -81,6 +83,10 @@ func (tx *transaction) rollback() error {
 		return fmt.Errorf("transaction already rolled back")
 	}
 	tx.rolledBack = true
+
+	for offset, oldPage := range tx.pageSnapshots {
+		tx.db.writeAt(oldPage, int64(offset))
+	}
 
 	tx.db.index.SetRootOffset(tx.indexRootSnapshot)
 	tx.db.index.cacheMu.Lock()

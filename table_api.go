@@ -484,37 +484,41 @@ func (db *DB) Close() error {
 	return closeErr
 }
 
-// begin starts a copy-on-write transaction. All subsequent writes are isolated until
-// commit or rollback is called. Only one transaction can be active at a time.
-func (db *DB) begin() *transaction {
+// Begin starts a transaction. All subsequent writes are tracked and can be rolled back.
+// Only one transaction can be active at a time.
+func (db *DB) Begin() *Transaction {
 	if db == nil || db.database == nil {
 		return nil
 	}
-	return db.database.begin()
+	if tx := db.database.begin(); tx != nil {
+		return &Transaction{tx: tx}
+	}
+	return nil
 }
 
-// commit applies all writes from the current transaction and releases the transaction lock.
-// Returns an error if no transaction is active or the transaction was already committed.
-func (db *DB) commit() error {
-	if db == nil || db.database == nil {
-		return fmt.Errorf("database not initialized")
-	}
-	if db.database.tx == nil {
-		return fmt.Errorf("no active transaction")
-	}
-	return db.database.tx.commit()
+// Transaction holds the state of an active transaction. Call Commit to persist
+// all changes or Rollback to discard them.
+type Transaction struct {
+	tx *transaction
 }
 
-// rollback discards all writes from the current transaction and restores the database
-// to its state before begin was called. Returns an error if the transaction was already committed.
-func (db *DB) rollback() error {
-	if db == nil || db.database == nil {
-		return fmt.Errorf("database not initialized")
-	}
-	if db.database.tx == nil {
+// Commit persists all writes made during this transaction. Returns an error
+// if the transaction was already committed or rolled back.
+func (tx *Transaction) Commit() error {
+	if tx == nil || tx.tx == nil {
 		return fmt.Errorf("no active transaction")
 	}
-	return db.database.tx.rollback()
+	return tx.tx.commit()
+}
+
+// Rollback discards all writes made during this transaction and restores the
+// database to its state before Begin was called. Returns an error if the
+// transaction was already committed.
+func (tx *Transaction) Rollback() error {
+	if tx == nil || tx.tx == nil {
+		return fmt.Errorf("no active transaction")
+	}
+	return tx.tx.rollback()
 }
 
 // Sync flushes all pending writes to disk for all open tables. This is a full sync that

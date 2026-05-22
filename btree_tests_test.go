@@ -308,7 +308,6 @@ func TestManySecondaryIndexes(t *testing.T) {
 }
 
 func TestTransactionRollbackWithBTree(t *testing.T) {
-	t.Skip("transactions are an internal/immature feature")
 	os.Remove("/tmp/tx_rollback.db")
 	defer os.Remove("/tmp/tx_rollback.db")
 
@@ -325,13 +324,13 @@ func TestTransactionRollbackWithBTree(t *testing.T) {
 
 	tbl.Insert(&User{ID: 1, Name: "Alice", Age: 30})
 
-	tx := db.begin()
+	tx := db.Begin()
 	usersTx, _ := Use[User](db, "users")
 
 	usersTx.Insert(&User{ID: 2, Name: "Bob", Age: 25})
 	usersTx.Insert(&User{ID: 3, Name: "Charlie", Age: 35})
 
-	tx.rollback()
+	tx.Rollback()
 
 	count := tbl.Count()
 	if count != 1 {

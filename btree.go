@@ -336,6 +336,15 @@ func (bt *BTree) writeNode(node *BTreeNode) error {
 		return fmt.Errorf("btree writeNode ensureRegion: %w", err)
 	}
 
+	if tx := bt.db.tx; tx != nil {
+		if _, has := tx.pageSnapshots[node.Offset]; !has {
+			snapshot := make([]byte, PageSize)
+			if err := bt.db.readAt(snapshot, int64(node.Offset)); err == nil {
+				tx.pageSnapshots[node.Offset] = snapshot
+			}
+		}
+	}
+
 	dataBufPtr := serializeBufPool.Get().(*[]byte)
 	data := *dataBufPtr
 	bt.serializeNode(node, data)
