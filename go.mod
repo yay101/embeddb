@@ -12,3 +12,4 @@ require (
 require golang.org/x/sys v0.43.0 // indirect
 
 // v1.9.4 - Add in-memory storage backend (StorageMemory), fix mmap region creation bug
+replace github.com/yay101/embeddbcore => ../embeddbcore

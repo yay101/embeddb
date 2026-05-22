@@ -2,7 +2,6 @@ package embeddb
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -628,47 +627,62 @@ func decodeSliceOfStructs(data []byte, field embeddbcore.FieldOffset, cipher *fi
 }
 
 func encodeMapField(record interface{}, field embeddbcore.FieldOffset, cipher *fieldCipher) []byte {
-	val, err := embeddbcore.GetMapField(record, field)
-	if err != nil || val == nil {
+	rootVal := reflect.ValueOf(record).Elem()
+	val := rootVal.FieldByName(field.Name)
+	if len(field.Parent) > 0 {
+		val = rootVal
+		for _, part := range field.Parent {
+			val = val.FieldByName(part)
+			if !val.IsValid() {
+				return embeddbcore.EncodeUvarint(nil, 0)
+			}
+		}
+		fieldParts := strings.Split(field.Name, ".")
+		lastPart := fieldParts[len(fieldParts)-1]
+		val = val.FieldByName(lastPart)
+	}
+	if !val.IsValid() || val.IsNil() {
 		return embeddbcore.EncodeUvarint(nil, 0)
 	}
+
 	var buf []byte
-	buf = embeddbcore.EncodeUvarint(buf, uint64(len(val)))
-	for k, v := range val {
-		buf = embeddbcore.EncodeString(buf, k)
+	buf = embeddbcore.EncodeUvarint(buf, uint64(val.Len()))
+	iter := val.MapRange()
+	for iter.Next() {
+		k := iter.Key()
+		buf = embeddbcore.EncodeString(buf, k.String())
+
+		v := iter.Value()
 		var elemBuf []byte
-		switch rv := v.(type) {
-		case int:
-			elemBuf = embeddbcore.EncodeVarint(nil, int64(rv))
-		case int8:
-			elemBuf = embeddbcore.EncodeVarint(nil, int64(rv))
-		case int16:
-			elemBuf = embeddbcore.EncodeVarint(nil, int64(rv))
-		case int32:
-			elemBuf = embeddbcore.EncodeVarint(nil, int64(rv))
-		case int64:
-			elemBuf = embeddbcore.EncodeVarint(nil, rv)
-		case uint:
-			elemBuf = embeddbcore.EncodeUvarint(nil, uint64(rv))
-		case uint8:
-			elemBuf = embeddbcore.EncodeUvarint(nil, uint64(rv))
-		case uint16:
-			elemBuf = embeddbcore.EncodeUvarint(nil, uint64(rv))
-		case uint32:
-			elemBuf = embeddbcore.EncodeUvarint(nil, uint64(rv))
-		case uint64:
-			elemBuf = embeddbcore.EncodeUvarint(nil, rv)
-		case float32:
-			elemBuf = embeddbcore.EncodeFloat64(nil, float64(rv))
-		case float64:
-			elemBuf = embeddbcore.EncodeFloat64(nil, rv)
-		case string:
-			elemBuf = embeddbcore.EncodeString(nil, rv)
-		case bool:
-			elemBuf = embeddbcore.EncodeBool(nil, rv)
-		default:
-			b, _ := json.Marshal(rv)
-			elemBuf = embeddbcore.EncodeBytes(nil, b)
+		switch field.MapValType.Kind() {
+		case reflect.Int:
+			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
+		case reflect.Int8:
+			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
+		case reflect.Int16:
+			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
+		case reflect.Int32:
+			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
+		case reflect.Int64:
+			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
+		case reflect.Uint:
+			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
+		case reflect.Uint8:
+			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
+		case reflect.Uint16:
+			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
+		case reflect.Uint32:
+			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
+		case reflect.Uint64:
+			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
+		case reflect.Float32:
+			elemBuf = embeddbcore.EncodeFloat64(nil, v.Float())
+		case reflect.Float64:
+			elemBuf = embeddbcore.EncodeFloat64(nil, v.Float())
+		case reflect.String:
+			elemBuf = embeddbcore.EncodeString(nil, v.String())
+		case reflect.Bool:
+			elemBuf = embeddbcore.EncodeBool(nil, v.Bool())
 		}
 		buf = embeddbcore.EncodeUvarint(buf, uint64(len(elemBuf)))
 		buf = append(buf, elemBuf...)
@@ -676,7 +690,7 @@ func encodeMapField(record interface{}, field embeddbcore.FieldOffset, cipher *f
 	return buf
 }
 
-func decodeMapField(data []byte, field embeddbcore.FieldOffset, cipher *fieldCipher) (map[string]interface{}, int, error) {
+func decodeMapField(data []byte, field embeddbcore.FieldOffset, cipher *fieldCipher) (interface{}, int, error) {
 	length, n := binary.Uvarint(data)
 	if n <= 0 {
 		return nil, 0, errors.New("invalid map length")
@@ -684,7 +698,11 @@ func decodeMapField(data []byte, field embeddbcore.FieldOffset, cipher *fieldCip
 	data = data[n:]
 	totalRead := n
 
-	result := make(map[string]interface{}, int(length))
+	mapType := field.MapType
+	result := reflect.MakeMapWithSize(mapType, int(length))
+	keyType := field.MapKeyType
+	valType := field.MapValType
+
 	for i := 0; i < int(length) && len(data) > 0; i++ {
 		k, trailing, err := embeddbcore.DecodeString(data)
 		if err != nil {
@@ -708,52 +726,32 @@ func decodeMapField(data []byte, field embeddbcore.FieldOffset, cipher *fieldCip
 		data = data[valLen:]
 		totalRead += int(valLen)
 
-		switch field.MapValType.Kind() {
-		case reflect.Int:
+		kv := reflect.New(keyType).Elem()
+		kv.SetString(k)
+
+		vv := reflect.New(valType).Elem()
+		switch valType.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			v, _, _ := embeddbcore.DecodeVarint(valBytes)
-			result[k] = int(v)
-		case reflect.Int8:
-			v, _, _ := embeddbcore.DecodeVarint(valBytes)
-			result[k] = int8(v)
-		case reflect.Int16:
-			v, _, _ := embeddbcore.DecodeVarint(valBytes)
-			result[k] = int16(v)
-		case reflect.Int32:
-			v, _, _ := embeddbcore.DecodeVarint(valBytes)
-			result[k] = int32(v)
-		case reflect.Int64:
-			v, _, _ := embeddbcore.DecodeVarint(valBytes)
-			result[k] = v
-		case reflect.Uint:
+			vv.SetInt(v)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 			v, _, _ := embeddbcore.DecodeUvarint(valBytes)
-			result[k] = uint(v)
-		case reflect.Uint8:
-			v, _, _ := embeddbcore.DecodeUvarint(valBytes)
-			result[k] = uint8(v)
-		case reflect.Uint16:
-			v, _, _ := embeddbcore.DecodeUvarint(valBytes)
-			result[k] = uint16(v)
-		case reflect.Uint32:
-			v, _, _ := embeddbcore.DecodeUvarint(valBytes)
-			result[k] = uint32(v)
-		case reflect.Uint64:
-			v, _, _ := embeddbcore.DecodeUvarint(valBytes)
-			result[k] = v
-		case reflect.Float32:
+			vv.SetUint(v)
+		case reflect.Float32, reflect.Float64:
 			v, _, _ := embeddbcore.DecodeFloat64(valBytes)
-			result[k] = float32(v)
-		case reflect.Float64:
-			v, _, _ := embeddbcore.DecodeFloat64(valBytes)
-			result[k] = v
+			vv.SetFloat(v)
 		case reflect.String:
 			s, _, _ := embeddbcore.DecodeString(valBytes)
-			result[k] = s
+			vv.SetString(s)
 		case reflect.Bool:
 			b, _, _ := embeddbcore.DecodeBool(valBytes)
-			result[k] = b
+			vv.SetBool(b)
 		}
+
+		result.SetMapIndex(kv, vv)
 	}
-	return result, totalRead, nil
+
+	return result.Interface(), totalRead, nil
 }
 
 func buildV2Record(tableID uint8, recordID uint32, schemaVersion uint32, flags byte, prevVersionOff uint64, payload []byte) []byte {
