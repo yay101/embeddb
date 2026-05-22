@@ -14,7 +14,7 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 - **Efficient pagination** - Built-in paged queries
 - **Case-insensitive LIKE** - SQL LIKE patterns
 - **Scanner** - Low-lock sequential access with early exit
-- **Transactions** - ~~Copy-on-Write commit and rollback~~ (unavailable, see [Transactions](#transactions))
+- **Transactions** - Rollback and commit with page-level snapshots
 - **Vacuum** - File compaction
 - **Auto-indexing** - Automatically creates indexes for `db:"index"` fields
 - **Schema migration** - Automatically migrates records when struct changes
@@ -428,12 +428,27 @@ if result.HasMore {
 
 ### Transactions
 
-> **Note:** Transactions are currently unavailable. The B-tree index performs in-place
-> mutations during operations like splits and rebalancing, which is incompatible with
-> Copy-on-Write rollback semantics. After a rollback, internal nodes may retain child
-> pointers to pages freed by the allocator restore, causing CRC corruption on subsequent
-> reads. Transactions will be re-enabled once the B-tree is rewritten with full
-> Copy-on-Write support. See `plan.md` for details.
+```go
+// Begin a transaction
+tx := db.Begin()
+defer tx.Rollback() // safe rollback if not committed
+
+// All writes within the transaction are tracked
+users.Insert(&User{Name: "Alice", Age: 30})
+users.Insert(&User{Name: "Bob", Age: 25})
+
+// Commit persists all changes
+if err := tx.Commit(); err != nil {
+    log.Fatal(err)
+}
+
+// Rollback discards all changes
+// tx.Rollback()  // automatically called via defer if Commit fails
+```
+
+Transactions use page-level snapshots — before any B-tree page is overwritten during a transaction, its original content is saved. On rollback, all snapshotted pages are restored before the allocator and root are reset, ensuring the database returns to its exact pre-transaction state.
+
+Only one transaction can be active at a time. `InsertManyBulk` is tracked within transactions.
 
 ### Table & Index Management
 
@@ -604,7 +619,6 @@ Maps are TLV-encoded as key-value pairs. Only `string` keys are supported. Map f
 ## Known Limitations
 
 - **Concurrent mmap writes (stress mode)**: With 2+ concurrent writer goroutines, the memory-mapped storage mode may produce rare CRC errors (~1 in 20,000 operations) on B-tree pages. This is an OS-level mmap coherence issue — the Go race detector passes cleanly. Single-writer mode (`-workers 1` in the torture test) has zero errors. Use `StorageFile` mode for guaranteed correctness under concurrent writes.
-- **Single-writer transactions**: Transactions (`begin`, `commit`, `rollback`) are currently inaccessible. The B-tree performs in-place node mutations that conflict with rollback semantics. A full Copy-on-Write rewrite is required before re-enabling this feature.
 - **Lock order**: The internal lock hierarchy is `db.mu` → `bt.mu` → `cacheMu`. All code paths must follow this order to avoid deadlocks.
 
 ## Why EmbedDB?
