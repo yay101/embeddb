@@ -97,7 +97,7 @@ func encodeFieldPayload(record interface{}, layout *embeddbcore.StructLayout, ci
 		case reflect.Float64:
 			valBuf = embeddbcore.EncodeFloat64(nil, embeddbcore.GetFloat64Field(record, field))
 		case reflect.Float32:
-			valBuf = embeddbcore.EncodeFloat64(nil, float64(embeddbcore.GetFloat32Field(record, field)))
+			valBuf = embeddbcore.EncodeFloat32(nil, embeddbcore.GetFloat32Field(record, field))
 		case reflect.Struct:
 			if field.IsTime {
 				valBuf = embeddbcore.EncodeVarint(nil, embeddbcore.GetTimeField(record, field).UnixNano())
@@ -266,10 +266,18 @@ func decodeFieldPayload(data []byte, record interface{}, layout *embeddbcore.Str
 		case reflect.Float64:
 			val, _, decodeErr = embeddbcore.DecodeFloat64(value)
 		case reflect.Float32:
-			var v float64
-			v, _, decodeErr = embeddbcore.DecodeFloat64(value)
-			if decodeErr == nil {
-				val = float32(v)
+			if len(value) == 4 {
+				var v float32
+				v, _, decodeErr = embeddbcore.DecodeFloat32(value)
+				if decodeErr == nil {
+					val = v
+				}
+			} else {
+				var v float64
+				v, _, decodeErr = embeddbcore.DecodeFloat64(value)
+				if decodeErr == nil {
+					val = float32(v)
+				}
 			}
 		case reflect.Struct:
 			if field.IsTime {
@@ -390,7 +398,7 @@ func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset, cip
 			case reflect.Float64:
 				fieldVal = embeddbcore.EncodeFloat64(nil, embeddbcore.GetFloat64Field(elemAddr, f))
 			case reflect.Float32:
-				fieldVal = embeddbcore.EncodeFloat64(nil, float64(embeddbcore.GetFloat32Field(elemAddr, f)))
+				fieldVal = embeddbcore.EncodeFloat32(nil, embeddbcore.GetFloat32Field(elemAddr, f))
 			case reflect.Slice:
 				if f.IsBytes {
 					bytesVal, _ := embeddbcore.GetBytesField(elemAddr, f)
@@ -549,10 +557,18 @@ func decodeSliceOfStructs(data []byte, field embeddbcore.FieldOffset, cipher *fi
 			case reflect.Float64:
 				val, _, decodeErr = embeddbcore.DecodeFloat64(value)
 			case reflect.Float32:
-				var v float64
-				v, _, decodeErr = embeddbcore.DecodeFloat64(value)
-				if decodeErr == nil {
-					val = float32(v)
+				if len(value) == 4 {
+					var v float32
+					v, _, decodeErr = embeddbcore.DecodeFloat32(value)
+					if decodeErr == nil {
+						val = v
+					}
+				} else {
+					var v float64
+					v, _, decodeErr = embeddbcore.DecodeFloat64(value)
+					if decodeErr == nil {
+						val = float32(v)
+					}
 				}
 			case reflect.Slice:
 				if f.IsBytes {
@@ -717,7 +733,7 @@ func encodeMapField(record interface{}, field embeddbcore.FieldOffset, cipher *f
 		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
 		for k, v := range m {
 			buf = embeddbcore.EncodeString(buf, k)
-			elem := embeddbcore.EncodeFloat64(nil, float64(v))
+			elem := embeddbcore.EncodeFloat32(nil, v)
 			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
 			buf = append(buf, elem...)
 		}
@@ -791,8 +807,13 @@ func decodeMapField(data []byte, field embeddbcore.FieldOffset, cipher *fieldCip
 			v, _, _ := embeddbcore.DecodeUvarint(valBytes)
 			vv.SetUint(v)
 		case reflect.Float32, reflect.Float64:
-			v, _, _ := embeddbcore.DecodeFloat64(valBytes)
-			vv.SetFloat(v)
+			if valType.Kind() == reflect.Float32 && len(valBytes) == 4 {
+				v, _, _ := embeddbcore.DecodeFloat32(valBytes)
+				vv.SetFloat(float64(v))
+			} else {
+				v, _, _ := embeddbcore.DecodeFloat64(valBytes)
+				vv.SetFloat(v)
+			}
 		case reflect.String:
 			s, _, _ := embeddbcore.DecodeString(valBytes)
 			vv.SetString(s)
