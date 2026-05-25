@@ -92,13 +92,10 @@
 
 ### Low priority
 4. **Pre-allocate TLV encode buffer** — `encodeFieldPayload` grows via `append`.
-   Struct layout knows field count and sizes up front.
+    Struct layout knows field count and sizes up front.
 
-5. **Direct float32 encoding** — Currently upcast to float64, encoded as 8 bytes.
-   A 4-byte IEEE 754 encoder saves space and conversion cost.
-
-6. **Allocator double-allocation hardening** — Debug mode exists but is off in production.
-   A production-mode check (e.g., bitmap or page-zero check) would catch corruption.
+5. **Allocator double-allocation hardening** — Debug mode exists but is off in production.
+    A production-mode check (e.g., bitmap or page-zero check) would catch corruption.
 
 ---
 
