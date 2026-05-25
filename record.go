@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"reflect"
-	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/yay101/embeddbcore"
 )
@@ -335,31 +335,11 @@ func decodeFieldPayload(data []byte, record interface{}, layout *embeddbcore.Str
 }
 
 func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset, cipher *fieldCipher) ([]byte, error) {
-	rootVal := reflect.ValueOf(record).Elem()
+	ptr := unsafe.Pointer(reflect.ValueOf(record).Pointer())
+	sliceHeader := (*reflect.SliceHeader)(unsafe.Add(ptr, field.Offset))
 
-	var val reflect.Value
-	if len(field.Parent) > 0 {
-		val = rootVal
-		for _, part := range field.Parent {
-			val = val.FieldByName(part)
-			if !val.IsValid() {
-				return nil, nil
-			}
-		}
-		fieldParts := strings.Split(field.Name, ".")
-		lastPart := fieldParts[len(fieldParts)-1]
-		val = val.FieldByName(lastPart)
-	} else {
-		val = rootVal.FieldByName(field.Name)
-	}
-
-	if !val.IsValid() || val.IsNil() {
-		return nil, nil
-	}
-
-	numElems := val.Len()
+	numElems := sliceHeader.Len
 	elemBuf := embeddbcore.EncodeUvarint(nil, uint64(numElems))
-
 	if numElems == 0 {
 		return elemBuf, nil
 	}
@@ -370,9 +350,10 @@ func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset, cip
 		return nil, err
 	}
 
+	elemSize := elementType.Size()
 	for i := 0; i < numElems; i++ {
-		elem := val.Index(i)
-		elemPtr := elem.Addr().Interface()
+		elemPtr := unsafe.Pointer(sliceHeader.Data + uintptr(i)*uintptr(elemSize))
+		elemAddr := reflect.NewAt(elementType, elemPtr).Interface()
 
 		var elemData []byte
 		for _, f := range elemLayout.Fields {
@@ -383,74 +364,74 @@ func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset, cip
 			var fieldVal []byte
 			switch f.Type {
 			case reflect.Int:
-				fieldVal = embeddbcore.EncodeVarint(nil, int64(embeddbcore.GetIntField(elemPtr, f)))
+				fieldVal = embeddbcore.EncodeVarint(nil, int64(embeddbcore.GetIntField(elemAddr, f)))
 			case reflect.Int8:
-				fieldVal = embeddbcore.EncodeVarint(nil, int64(embeddbcore.GetInt8Field(elemPtr, f)))
+				fieldVal = embeddbcore.EncodeVarint(nil, int64(embeddbcore.GetInt8Field(elemAddr, f)))
 			case reflect.Int16:
-				fieldVal = embeddbcore.EncodeVarint(nil, int64(embeddbcore.GetInt16Field(elemPtr, f)))
+				fieldVal = embeddbcore.EncodeVarint(nil, int64(embeddbcore.GetInt16Field(elemAddr, f)))
 			case reflect.Int32:
-				fieldVal = embeddbcore.EncodeVarint(nil, int64(embeddbcore.GetInt32Field(elemPtr, f)))
+				fieldVal = embeddbcore.EncodeVarint(nil, int64(embeddbcore.GetInt32Field(elemAddr, f)))
 			case reflect.Int64:
-				fieldVal = embeddbcore.EncodeVarint(nil, embeddbcore.GetInt64Field(elemPtr, f))
+				fieldVal = embeddbcore.EncodeVarint(nil, embeddbcore.GetInt64Field(elemAddr, f))
 			case reflect.Uint:
-				fieldVal = embeddbcore.EncodeUvarint(nil, uint64(embeddbcore.GetUintField(elemPtr, f)))
+				fieldVal = embeddbcore.EncodeUvarint(nil, uint64(embeddbcore.GetUintField(elemAddr, f)))
 			case reflect.Uint8:
-				fieldVal = embeddbcore.EncodeUvarint(nil, uint64(embeddbcore.GetUint8Field(elemPtr, f)))
+				fieldVal = embeddbcore.EncodeUvarint(nil, uint64(embeddbcore.GetUint8Field(elemAddr, f)))
 			case reflect.Uint16:
-				fieldVal = embeddbcore.EncodeUvarint(nil, uint64(embeddbcore.GetUint16Field(elemPtr, f)))
+				fieldVal = embeddbcore.EncodeUvarint(nil, uint64(embeddbcore.GetUint16Field(elemAddr, f)))
 			case reflect.Uint32:
-				fieldVal = embeddbcore.EncodeUvarint(nil, uint64(embeddbcore.GetUint32Field(elemPtr, f)))
+				fieldVal = embeddbcore.EncodeUvarint(nil, uint64(embeddbcore.GetUint32Field(elemAddr, f)))
 			case reflect.Uint64:
-				fieldVal = embeddbcore.EncodeUvarint(nil, embeddbcore.GetUint64Field(elemPtr, f))
+				fieldVal = embeddbcore.EncodeUvarint(nil, embeddbcore.GetUint64Field(elemAddr, f))
 			case reflect.String:
-				fieldVal = embeddbcore.EncodeString(nil, embeddbcore.GetStringField(elemPtr, f))
+				fieldVal = embeddbcore.EncodeString(nil, embeddbcore.GetStringField(elemAddr, f))
 			case reflect.Bool:
-				fieldVal = embeddbcore.EncodeBool(nil, embeddbcore.GetBoolField(elemPtr, f))
+				fieldVal = embeddbcore.EncodeBool(nil, embeddbcore.GetBoolField(elemAddr, f))
 			case reflect.Float64:
-				fieldVal = embeddbcore.EncodeFloat64(nil, embeddbcore.GetFloat64Field(elemPtr, f))
+				fieldVal = embeddbcore.EncodeFloat64(nil, embeddbcore.GetFloat64Field(elemAddr, f))
 			case reflect.Float32:
-				fieldVal = embeddbcore.EncodeFloat64(nil, float64(embeddbcore.GetFloat32Field(elemPtr, f)))
+				fieldVal = embeddbcore.EncodeFloat64(nil, float64(embeddbcore.GetFloat32Field(elemAddr, f)))
 			case reflect.Slice:
 				if f.IsBytes {
-					bytesVal, _ := embeddbcore.GetBytesField(elemPtr, f)
+					bytesVal, _ := embeddbcore.GetBytesField(elemAddr, f)
 					fieldVal = embeddbcore.EncodeBytes(nil, bytesVal)
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.String {
-					fieldVal = embeddbcore.EncodeSlice(nil, embeddbcore.GetStringSlice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeSlice(nil, embeddbcore.GetStringSlice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int {
-					fieldVal = embeddbcore.EncodeIntSlice(nil, embeddbcore.GetIntSlice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeIntSlice(nil, embeddbcore.GetIntSlice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int8 {
-					fieldVal = embeddbcore.EncodeInt8Slice(nil, embeddbcore.GetInt8Slice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeInt8Slice(nil, embeddbcore.GetInt8Slice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int16 {
-					fieldVal = embeddbcore.EncodeInt16Slice(nil, embeddbcore.GetInt16Slice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeInt16Slice(nil, embeddbcore.GetInt16Slice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int32 {
-					fieldVal = embeddbcore.EncodeInt32Slice(nil, embeddbcore.GetInt32Slice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeInt32Slice(nil, embeddbcore.GetInt32Slice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Int64 {
-					fieldVal = embeddbcore.EncodeInt64Slice(nil, embeddbcore.GetInt64Slice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeInt64Slice(nil, embeddbcore.GetInt64Slice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint {
-					fieldVal = embeddbcore.EncodeUintSlice(nil, embeddbcore.GetUintSlice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeUintSlice(nil, embeddbcore.GetUintSlice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint16 {
-					fieldVal = embeddbcore.EncodeUint16Slice(nil, embeddbcore.GetUint16Slice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeUint16Slice(nil, embeddbcore.GetUint16Slice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint32 {
-					fieldVal = embeddbcore.EncodeUint32Slice(nil, embeddbcore.GetUint32Slice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeUint32Slice(nil, embeddbcore.GetUint32Slice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Uint64 {
-					fieldVal = embeddbcore.EncodeUint64Slice(nil, embeddbcore.GetUint64Slice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeUint64Slice(nil, embeddbcore.GetUint64Slice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Float32 {
-					fieldVal = embeddbcore.EncodeFloat32Slice(nil, embeddbcore.GetFloat32Slice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeFloat32Slice(nil, embeddbcore.GetFloat32Slice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Float64 {
-					fieldVal = embeddbcore.EncodeFloat64Slice(nil, embeddbcore.GetFloat64Slice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeFloat64Slice(nil, embeddbcore.GetFloat64Slice(elemAddr, f))
 				} else if f.IsSlice && f.SliceElem.Kind() == reflect.Bool {
-					fieldVal = embeddbcore.EncodeBoolSlice(nil, embeddbcore.GetBoolSlice(elemPtr, f))
+					fieldVal = embeddbcore.EncodeBoolSlice(nil, embeddbcore.GetBoolSlice(elemAddr, f))
 				} else {
 					continue
 				}
 			case reflect.Struct:
 				if f.IsTime {
-					fieldVal = embeddbcore.EncodeVarint(nil, embeddbcore.GetTimeField(elemPtr, f).UnixNano())
+					fieldVal = embeddbcore.EncodeVarint(nil, embeddbcore.GetTimeField(elemAddr, f).UnixNano())
 				} else {
 					continue
 				}
 			case reflect.Map:
-				fieldVal = encodeMapField(record, field, cipher)
+				fieldVal = encodeMapField(elemAddr, f, cipher)
 			default:
 				continue
 			}
@@ -627,65 +608,137 @@ func decodeSliceOfStructs(data []byte, field embeddbcore.FieldOffset, cipher *fi
 }
 
 func encodeMapField(record interface{}, field embeddbcore.FieldOffset, cipher *fieldCipher) []byte {
-	rootVal := reflect.ValueOf(record).Elem()
-	val := rootVal.FieldByName(field.Name)
-	if len(field.Parent) > 0 {
-		val = rootVal
-		for _, part := range field.Parent {
-			val = val.FieldByName(part)
-			if !val.IsValid() {
-				return embeddbcore.EncodeUvarint(nil, 0)
-			}
-		}
-		fieldParts := strings.Split(field.Name, ".")
-		lastPart := fieldParts[len(fieldParts)-1]
-		val = val.FieldByName(lastPart)
-	}
-	if !val.IsValid() || val.IsNil() {
-		return embeddbcore.EncodeUvarint(nil, 0)
-	}
+	ptr := unsafe.Pointer(reflect.ValueOf(record).Pointer())
+	fieldPtr := unsafe.Add(ptr, field.Offset)
 
 	var buf []byte
-	buf = embeddbcore.EncodeUvarint(buf, uint64(val.Len()))
-	iter := val.MapRange()
-	for iter.Next() {
-		k := iter.Key()
-		buf = embeddbcore.EncodeString(buf, k.String())
-
-		v := iter.Value()
-		var elemBuf []byte
-		switch field.MapValType.Kind() {
-		case reflect.Int:
-			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
-		case reflect.Int8:
-			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
-		case reflect.Int16:
-			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
-		case reflect.Int32:
-			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
-		case reflect.Int64:
-			elemBuf = embeddbcore.EncodeVarint(nil, v.Int())
-		case reflect.Uint:
-			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
-		case reflect.Uint8:
-			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
-		case reflect.Uint16:
-			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
-		case reflect.Uint32:
-			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
-		case reflect.Uint64:
-			elemBuf = embeddbcore.EncodeUvarint(nil, v.Uint())
-		case reflect.Float32:
-			elemBuf = embeddbcore.EncodeFloat64(nil, v.Float())
-		case reflect.Float64:
-			elemBuf = embeddbcore.EncodeFloat64(nil, v.Float())
-		case reflect.String:
-			elemBuf = embeddbcore.EncodeString(nil, v.String())
-		case reflect.Bool:
-			elemBuf = embeddbcore.EncodeBool(nil, v.Bool())
+	switch field.MapValType.Kind() {
+	case reflect.String:
+		m := *(*map[string]string)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeString(nil, v)
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
 		}
-		buf = embeddbcore.EncodeUvarint(buf, uint64(len(elemBuf)))
-		buf = append(buf, elemBuf...)
+	case reflect.Int:
+		m := *(*map[string]int)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeVarint(nil, int64(v))
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Int64:
+		m := *(*map[string]int64)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeVarint(nil, v)
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Int8:
+		m := *(*map[string]int8)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeVarint(nil, int64(v))
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Int16:
+		m := *(*map[string]int16)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeVarint(nil, int64(v))
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Int32:
+		m := *(*map[string]int32)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeVarint(nil, int64(v))
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Uint:
+		m := *(*map[string]uint)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeUvarint(nil, uint64(v))
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Uint8:
+		m := *(*map[string]uint8)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeUvarint(nil, uint64(v))
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Uint16:
+		m := *(*map[string]uint16)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeUvarint(nil, uint64(v))
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Uint32:
+		m := *(*map[string]uint32)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeUvarint(nil, uint64(v))
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Uint64:
+		m := *(*map[string]uint64)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeUvarint(nil, v)
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Float32:
+		m := *(*map[string]float32)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeFloat64(nil, float64(v))
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Float64:
+		m := *(*map[string]float64)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeFloat64(nil, v)
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
+	case reflect.Bool:
+		m := *(*map[string]bool)(fieldPtr)
+		buf = embeddbcore.EncodeUvarint(buf, uint64(len(m)))
+		for k, v := range m {
+			buf = embeddbcore.EncodeString(buf, k)
+			elem := embeddbcore.EncodeBool(nil, v)
+			buf = embeddbcore.EncodeUvarint(buf, uint64(len(elem)))
+			buf = append(buf, elem...)
+		}
 	}
 	return buf
 }
