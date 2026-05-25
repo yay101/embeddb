@@ -82,26 +82,27 @@
 
 ### Medium priority
 2. **Multi-table BulkInsert scan cost** — `collectLeafEntries()` walks all leaves
-   of the shared B-tree to collect old entries. For large multi-table databases,
-   this is O(total entries) per BulkInsert. Could be optimized with table-scoped
-   B-trees or key prefix filtering during the collection walk.
-
-3. **Dirty-cell encoding in serializeNode** — Re-serializes entire 4KB page every
-   `writeNode` call even when only one cell changed. A dirty-bit system could patch
-   just the modified cell region (~15% CPU savings from profiles).
+    of the shared B-tree to collect old entries. For large multi-table databases,
+    this is O(total entries) per BulkInsert. Could be optimized with table-scoped
+    B-trees or key prefix filtering during the collection walk.
 
 ### Low priority
-4. **Pre-allocate TLV encode buffer** — `encodeFieldPayload` grows via `append`.
+3. **Pre-allocate TLV encode buffer** — `encodeFieldPayload` grows via `append`.
     Struct layout knows field count and sizes up front.
 
-5. **Allocator double-allocation hardening** — Debug mode exists but is off in production.
+4. **Allocator double-allocation hardening** — Debug mode exists but is off in production.
     A production-mode check (e.g., bitmap or page-zero check) would catch corruption.
+
+5. **Dirty-cell encoding** — Attempted append-only leaf optimization; caused data
+   corruption due to in-place page mutation without proper CoW semantics. Requires
+   full B-tree rewrite to safely avoid full-page serialization.
 
 ---
 
 ## Verdict
 
 All critical/high severity bugs from the original investigation are fixed and verified.
-The remaining item (page reclamation) is a medium-severity quality-of-life issue that
-manifests as unbounded file growth on heavy delete/update workloads. Vacuum provides
-a partial workaround but doesn't reclaim all orphaned pages.
+Page reclamation is now implemented (`freeAllNodes` during BulkInsert, `freeNode` on
+merges and root changes). Remaining items are low-priority optimizations that require
+either a CoW B-tree rewrite (dirty-cell encoding) or provide marginal performance gain
+(pre-allocate TLV buffer).
