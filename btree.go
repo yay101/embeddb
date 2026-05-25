@@ -1353,6 +1353,12 @@ func (bt *BTree) BulkInsert(entries []struct{ key []byte; value uint64 }) error 
 
 	bt.count += len(deduped)
 
+	if bt.rootOff != 0 {
+		oldEntries := bt.collectLeafEntries()
+		deduped = mergeSortedEntries(oldEntries, deduped)
+		bt.count = len(deduped)
+	}
+
 	leafNodes, err := bt.buildLeafNodes(deduped)
 	if err != nil {
 		return err
@@ -1372,6 +1378,70 @@ func (bt *BTree) BulkInsert(entries []struct{ key []byte; value uint64 }) error 
 	bt.writeNode(root)
 
 	return nil
+}
+
+func (bt *BTree) collectLeafEntries() []struct{ key []byte; value uint64 } {
+	if bt.rootOff == 0 {
+		return nil
+	}
+	root, err := bt.readNode(bt.rootOff)
+	if err != nil {
+		return nil
+	}
+	node := root
+	for !node.IsLeaf {
+		if len(node.Children) == 0 {
+			return nil
+		}
+		node, err = bt.readNode(node.Children[0])
+		if err != nil {
+			return nil
+		}
+	}
+	var entries []struct{ key []byte; value uint64 }
+	for node != nil {
+		for i := 0; i < node.Count; i++ {
+			if i < len(node.Keys) && i < len(node.Values) {
+				entries = append(entries, struct{ key []byte; value uint64 }{key: node.Keys[i], value: node.Values[i]})
+			}
+		}
+		if node.NextLeaf == 0 {
+			break
+		}
+		node, err = bt.readNode(node.NextLeaf)
+		if err != nil {
+			break
+		}
+	}
+	return entries
+}
+
+func mergeSortedEntries(old, newEntries []struct{ key []byte; value uint64 }) []struct{ key []byte; value uint64 } {
+	merged := make([]struct{ key []byte; value uint64 }, 0, len(old)+len(newEntries))
+	oi, ni := 0, 0
+	for oi < len(old) && ni < len(newEntries) {
+		cmp := bytes.Compare(old[oi].key, newEntries[ni].key)
+		if cmp < 0 {
+			merged = append(merged, old[oi])
+			oi++
+		} else if cmp > 0 {
+			merged = append(merged, newEntries[ni])
+			ni++
+		} else {
+			merged = append(merged, newEntries[ni])
+			oi++
+			ni++
+		}
+	}
+	for oi < len(old) {
+		merged = append(merged, old[oi])
+		oi++
+	}
+	for ni < len(newEntries) {
+		merged = append(merged, newEntries[ni])
+		ni++
+	}
+	return merged
 }
 
 func (bt *BTree) buildLeafNodes(entries []struct{ key []byte; value uint64 }) ([]*BTreeNode, error) {
@@ -1433,9 +1503,10 @@ func (bt *BTree) buildInternalNodes(children []*BTreeNode) (*BTreeNode, error) {
 		node.Children = append(node.Children, children[i].Offset)
 		i++
 
-		for i < len(children) && !bt.wouldOverflowInternal(node, len(children[i].Keys[0])) {
-			promoteKey := make([]byte, len(children[i].Keys[0]))
-			copy(promoteKey, children[i].Keys[0])
+		for i < len(children) && !bt.wouldOverflowInternal(node, len(bt.firstKeyInSubtree(children[i]))) {
+			k := bt.firstKeyInSubtree(children[i])
+			promoteKey := make([]byte, len(k))
+			copy(promoteKey, k)
 			node.Keys = append(node.Keys, promoteKey)
 			node.Children = append(node.Children, children[i].Offset)
 			node.Count++
@@ -1451,6 +1522,25 @@ func (bt *BTree) buildInternalNodes(children []*BTreeNode) (*BTreeNode, error) {
 	}
 
 	return bt.buildInternalNodes(nextLevel)
+}
+
+func (bt *BTree) firstKeyInSubtree(node *BTreeNode) []byte {
+	for {
+		if node == nil {
+			return nil
+		}
+		if len(node.Keys) > 0 {
+			return node.Keys[0]
+		}
+		if node.IsLeaf || len(node.Children) == 0 {
+			return nil
+		}
+		var err error
+		node, err = bt.readNode(node.Children[0])
+		if err != nil {
+			return nil
+		}
+	}
 }
 
 func (bt *BTree) wouldOverflowInternal(node *BTreeNode, extraKeyLen int) bool {
