@@ -1155,6 +1155,33 @@ func (bt *BTree) freeNodeOffset(offset uint64) {
 	bt.alloc.Free(offset, PageSize)
 }
 
+func (bt *BTree) freeAllNodes() {
+	oldRoot := bt.rootOff
+	if oldRoot == 0 {
+		return
+	}
+	root, err := bt.readNode(oldRoot)
+	if err != nil || root == nil {
+		return
+	}
+	bt.freeNodeRecursive(root)
+}
+
+func (bt *BTree) freeNodeRecursive(node *BTreeNode) {
+	if node == nil || node.Offset == 0 {
+		return
+	}
+	if !node.IsLeaf {
+		for _, child := range node.Children {
+			childNode, err := bt.readNode(child)
+			if err == nil && childNode != nil {
+				bt.freeNodeRecursive(childNode)
+			}
+		}
+	}
+	bt.freeNode(node)
+}
+
 func (bt *BTree) findMax(offset uint64) ([]byte, uint64) {
 	node, err := bt.readNode(offset)
 	if err != nil || node == nil || node.Count == 0 {
@@ -1357,6 +1384,9 @@ func (bt *BTree) BulkInsert(entries []struct{ key []byte; value uint64 }) error 
 		oldEntries := bt.collectLeafEntries()
 		deduped = mergeSortedEntries(oldEntries, deduped)
 		bt.count = len(deduped)
+		if bt.db.tx == nil {
+			bt.freeAllNodes()
+		}
 	}
 
 	leafNodes, err := bt.buildLeafNodes(deduped)
