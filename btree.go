@@ -235,27 +235,15 @@ func (bt *BTree) newNode(isLeaf bool) (*BTreeNode, error) {
 }
 
 func (bt *BTree) wouldOverflow(node *BTreeNode, extraKeyLen int) bool {
-	cellOverhead := 2 + extraKeyLen
-	if node.IsLeaf {
-		cellOverhead += 8
-	} else {
-		cellOverhead += 8
-	}
-
+	cellOverhead := 2 + extraKeyLen + 8
 	currentUsed := PageHeaderSize
 	for i := 0; i < node.Count; i++ {
-		currentUsed += 2 + len(node.Keys[i])
-		if node.IsLeaf {
-			currentUsed += 8
-		} else {
-			currentUsed += 8
-		}
+		currentUsed += 2 + len(node.Keys[i]) + 8
 	}
 	if !node.IsLeaf {
 		currentUsed += 8
 	}
 	currentUsed += PageCRCSize
-
 	return currentUsed+cellOverhead > PageSize
 }
 
@@ -309,25 +297,25 @@ func (bt *BTree) serializeNode(node *BTreeNode, buf []byte) []byte {
 }
 
 func (bt *BTree) encodeLeafCell(buf []byte, end uint16, key []byte, value uint64) uint16 {
-	cellSize := 2 + len(key) + 8
-	start := end - uint16(cellSize)
+	cellSize := uint16(2 + len(key) + 8)
+	start := end - cellSize
 
 	binary.LittleEndian.PutUint16(buf[start:], uint16(len(key)))
 	copy(buf[start+2:], key)
 	binary.LittleEndian.PutUint64(buf[start+2+uint16(len(key)):], value)
 
-	return uint16(cellSize)
+	return cellSize
 }
 
 func (bt *BTree) encodeInternalCell(buf []byte, end uint16, key []byte, leftChild uint64) uint16 {
-	cellSize := 2 + len(key) + 8
-	start := end - uint16(cellSize)
+	cellSize := uint16(2 + len(key) + 8)
+	start := end - cellSize
 
 	binary.LittleEndian.PutUint16(buf[start:], uint16(len(key)))
 	copy(buf[start+2:], key)
 	binary.LittleEndian.PutUint64(buf[start+2+uint16(len(key)):], leftChild)
 
-	return uint16(cellSize)
+	return cellSize
 }
 
 func (bt *BTree) writeNode(node *BTreeNode) error {
@@ -763,6 +751,12 @@ func (bt *BTree) insertNonFull(node *BTreeNode, key []byte, value uint64) (bool,
 	}
 
 	if bt.wouldOverflow(child, len(key)) {
+		mid := child.Count / 2
+		promoteLen := len(child.Keys[mid])
+		if promoteLen > len(key) && bt.wouldOverflow(node, promoteLen) {
+			return false, fmt.Errorf("split promotion overflow: insertKey=%d promoteKey=%d pageSize=%d count=%d",
+				len(key), promoteLen, PageSize, node.Count)
+		}
 		if err := bt.splitChild(node, i, child); err != nil {
 			return false, err
 		}
