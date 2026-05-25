@@ -27,8 +27,13 @@ const (
 	PageTypeRootLeaf     byte = 3
 	PageTypeRootInternal byte = 4
 
+	CRCVersionOffset     = 1
+	CRCVersionCastagnoli byte = 1
+
 	MinLeafKeys = 1
 )
+
+var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 
 var ErrKeyNotFound = errors.New("key not found")
 
@@ -207,7 +212,8 @@ func (bt *BTree) newNode(isLeaf bool) (*BTreeNode, error) {
 	} else {
 		buf[0] = PageTypeInternal
 	}
-	checksum := crc32.ChecksumIEEE(buf[:PageFooterOff])
+	buf[CRCVersionOffset] = CRCVersionCastagnoli
+	checksum := crc32.Checksum(buf[:PageFooterOff], castagnoliTable)
 	binary.LittleEndian.PutUint32(buf[PageFooterOff:], checksum)
 
 	r := bt.db.region.Load()
@@ -295,7 +301,8 @@ func (bt *BTree) serializeNode(node *BTreeNode, buf []byte) []byte {
 		binary.LittleEndian.PutUint32(buf[RootCountOff:RootCountOff+4], uint32(bt.count))
 	}
 
-	checksum := crc32.ChecksumIEEE(buf[:PageFooterOff])
+	buf[CRCVersionOffset] = CRCVersionCastagnoli
+	checksum := crc32.Checksum(buf[:PageFooterOff], castagnoliTable)
 	binary.LittleEndian.PutUint32(buf[PageFooterOff:], checksum)
 
 	return buf
@@ -411,14 +418,24 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 	}
 
 	storedCRC := binary.LittleEndian.Uint32(pageCopy[PageFooterOff:])
-	computedCRC := crc32.ChecksumIEEE(pageCopy[:PageFooterOff])
+	var computedCRC uint32
+	if pageCopy[CRCVersionOffset] == CRCVersionCastagnoli {
+		computedCRC = crc32.Checksum(pageCopy[:PageFooterOff], castagnoliTable)
+	} else {
+		computedCRC = crc32.ChecksumIEEE(pageCopy[:PageFooterOff])
+	}
 	if storedCRC != computedCRC {
 		if bt.db.file != nil {
 			filePageBufPtr := pageBufPool.Get().(*[]byte)
 			filePageCopy := *filePageBufPtr
 			if _, err := bt.db.file.ReadAt(filePageCopy, int64(offset)); err == nil {
 				fileCRC := binary.LittleEndian.Uint32(filePageCopy[PageFooterOff:])
-				fileComputed := crc32.ChecksumIEEE(filePageCopy[:PageFooterOff])
+				var fileComputed uint32
+				if filePageCopy[CRCVersionOffset] == CRCVersionCastagnoli {
+					fileComputed = crc32.Checksum(filePageCopy[:PageFooterOff], castagnoliTable)
+				} else {
+					fileComputed = crc32.ChecksumIEEE(filePageCopy[:PageFooterOff])
+				}
 				if fileCRC == fileComputed {
 					copy(pageCopy, filePageCopy)
 				} else {
@@ -1576,7 +1593,12 @@ func (bt *BTree) diagCRC(offset uint64, mmapData, fileData []byte) string {
 	fileInfo := ""
 	if fileData != nil {
 		fCRC := binary.LittleEndian.Uint32(fileData[PageFooterOff:])
-		fComp := crc32.ChecksumIEEE(fileData[:PageFooterOff])
+		var fComp uint32
+		if fileData[CRCVersionOffset] == CRCVersionCastagnoli {
+			fComp = crc32.Checksum(fileData[:PageFooterOff], castagnoliTable)
+		} else {
+			fComp = crc32.ChecksumIEEE(fileData[:PageFooterOff])
+		}
 		fileInfo = fmt.Sprintf(" file_crc=%08x:%08x", fCRC, fComp)
 	}
 
