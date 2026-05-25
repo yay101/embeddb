@@ -38,8 +38,6 @@ A lightweight, embedded database for Go with a clean, type-safe API. Perfect for
 
 --- Single-record ops ---
 Insert:       23.5 µs/op   (~42,500/sec)
-Get:           1.4 µs/op  (~703,000/sec)
-Query indexed: 2.1 µs/op  (~478,000/sec)
 
 --- Map support ---
 Insert with 2-entry map:  9.8 µs/op (~101,000/sec)
@@ -47,7 +45,11 @@ Map round-trip (no DB):   2.4 µs/op   (~420,000/sec)
 
 --- Transactions ---
 10 inserts + commit:  102 µs/op   (~9,800 tx/sec)
-Rollback overhead:    1 snapshot page per modified B-tree node
+
+--- B-tree page CRC (4KB) ---
+Castagnoli (v1.10.3+):  154 ns  (26.6 GB/s, SSE4.2 hardware)
+IEEE (legacy):          303 ns  (13.5 GB/s, PCLMULQDQ)
+```
 ```
 
 ## Installation
