@@ -166,6 +166,39 @@ func (t *Table[T]) DropIndex(fieldName string) error {
 	return nil
 }
 
+// InsertRawIndex inserts an arbitrary key-offset pair into the table's B-tree index.
+// This allows external callers to manage secondary indexes for fields not present
+// on the struct type T. Used by network layers (e.g. netembeddb).
+func (t *Table[T]) InsertRawIndex(key []byte, offset uint64) error {
+	t.db.mu.Lock()
+	defer t.db.mu.Unlock()
+	return t.db.index.Insert(key, offset)
+}
+
+// DeleteRawIndex removes an arbitrary key from the table's B-tree index.
+func (t *Table[T]) DeleteRawIndex(key []byte) error {
+	t.db.mu.Lock()
+	defer t.db.mu.Unlock()
+	return t.db.index.Delete(key)
+}
+
+// ScanRawIndex iterates over index keys in the range [start, end) using the B-tree.
+// If fn returns false, iteration stops early.
+// This enables external callers to perform index-based queries.
+func (t *Table[T]) ScanRawIndex(start, end []byte, fn func(key []byte, value uint64) bool) error {
+	t.db.mu.RLock()
+	defer t.db.mu.RUnlock()
+	return t.db.index.ScanRange(start, end, fn)
+}
+
+// GetRawIndex returns the offset for a given index key. Returns an error
+// if the key is not found.
+func (t *Table[T]) GetRawIndex(key []byte) (uint64, error) {
+	t.db.mu.RLock()
+	defer t.db.mu.RUnlock()
+	return t.db.index.Get(key)
+}
+
 // GetIndexedFields returns the list of fields that currently have secondary indexes.
 func (t *Table[T]) GetIndexedFields() []string {
 	var fields []string

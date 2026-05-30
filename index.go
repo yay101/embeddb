@@ -190,6 +190,47 @@ func parseVersionKey(key []byte) (tableID uint8, recordID uint32, version uint32
 	return tableID, uint32(rid), uint32(ver), true
 }
 
+// Exported index key encoding/decoding utilities.
+// These are needed by netembeddb to construct secondary index keys externally
+// without duplicating the internal key format.
+
+const (
+	IndexNSPrimary   byte = indexNSPrimary
+	IndexNSSecondary byte = indexNSSecondary
+	IndexNSVersion   byte = indexNSVersion
+)
+
+// EncodePrimaryKey builds a primary index key for a table/ID pair.
+// Exported for netembeddb.
+func EncodePrimaryKey(tableID uint8, pkValue any) []byte {
+	return encodePrimaryKey(tableID, pkValue)
+}
+
+// EncodeSecondaryKey builds a secondary index key for field-value lookups.
+// Exported for netembeddb.
+func EncodeSecondaryKey(tableID uint8, fieldName string, fieldValue any, recordID uint32) []byte {
+	return encodeSecondaryKey(tableID, fieldName, fieldValue, recordID)
+}
+
+// EncodeSecondaryKeyPrefix builds the prefix portion of a secondary index key
+// (before the value). Exported for netembeddb.
+func EncodeSecondaryKeyPrefix(tableID uint8, fieldName string) []byte {
+	return encodeSecondaryKeyPrefix(tableID, fieldName)
+}
+
+// EncodeSecondaryKeyPrefixWithValue builds a secondary index key prefix
+// including the field value but without the record ID tail.
+// Exported for netembeddb.
+func EncodeSecondaryKeyPrefixWithValue(tableID uint8, fieldName string, fieldValue any) []byte {
+	return encodeSecondaryKeyPrefixWithValue(tableID, fieldName, fieldValue)
+}
+
+// ParseSecondaryKey parses a secondary index key into its components.
+// Exported for netembeddb.
+func ParseSecondaryKey(key []byte) (tableID uint8, fieldName string, fieldValue []byte, recordID uint32, ok bool) {
+	return parseSecondaryKey(key)
+}
+
 func encodeIndexValue(buf []byte, value any) []byte {
 	switch v := value.(type) {
 	case int:

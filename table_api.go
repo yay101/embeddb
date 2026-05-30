@@ -947,6 +947,12 @@ func (t *Table[T]) Name() string {
 	return t.name
 }
 
+// TableID returns the internal table identifier used for index key construction.
+// Exported for netembeddb to construct secondary index keys via EncodeSecondaryKey.
+func (t *Table[T]) TableID() uint8 {
+	return t.tableID
+}
+
 // Drop marks the table as dropped and removes all its index entries from the B-tree.
 // The records remain in the file until a Vacuum is performed.
 func (t *Table[T]) Drop() error {
