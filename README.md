@@ -613,7 +613,6 @@ Maps are TLV-encoded as key-value pairs. Only `string` keys are supported. Map f
 
 ## Known Limitations
 
-- **Concurrent mmap writes (stress mode)**: With 2+ concurrent writer goroutines, the memory-mapped storage mode may produce rare CRC errors (~1 in 20,000 operations) on B-tree pages. This is an OS-level mmap coherence issue — the Go race detector passes cleanly. Single-writer mode (`-workers 1` in the torture test) has zero errors. Use `StorageFile` mode for guaranteed correctness under concurrent writes.
 - **Lock order**: The internal lock hierarchy is `db.mu` → `bt.mu` → `cacheMu`. All code paths must follow this order to avoid deadlocks.
 
 ## Why EmbedDB?
