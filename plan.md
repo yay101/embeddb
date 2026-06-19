@@ -1,108 +1,75 @@
-# EmbedDB — Investigation & Path Forward
+# EmbedDB — Codebase Audit & Fix Plan
 
-## Completed Fixes
+## Phase 1: Critical (crash / data corruption)
 
-### Critical (causes data corruption) — **FIXED**
-1. **In-place mutations break rollback** — `writeNode` overwrote B-tree pages in-place
-   during transactions. Rollback restored root+allocator but the overwritten page data
-   was permanently lost. Internal nodes retained dangling child pointers to freed pages,
-   causing CRC corruption.
-   → **Fixed with Option C (page snapshots):** `writeNode` snapshots old page bytes before
-   overwriting. `rollback()` writes snapshots back to disk before restoring allocator.
-   Torture test: 86K ops, 5,564 txns, 0 CRC errors.
+| # | Issue | File(s) | Fix |
+|---|-------|---------|-----|
+| 1 | WAL broken after replay — `Replay` closes WAL file, `openDatabase` never reopens → nil panic on next write | `wal.go:157`, `database.go:316` | Reopen WAL after replay |
+| 2 | B-tree writes bypass WAL — `writeNode` writes directly to mmap, index not recoverable after crash | `btree.go:346` | Document limitation or log page writes to WAL |
+| 3 | Region reload race — `pageData` reloads region after `RLock` on old one → SIGBUS | `btree.go:174,346` | Pass loaded region into `pageData` |
+| 4 | `resizeCache` out-of-bounds — `cacheHead` can equal `newSize` → panic | `btree.go:607` | `cacheHead = n % newSize` |
+| 5 | Rollback leaves stale on-disk root — crash after rollback reopens with transaction's root | `transaction.go:87` | Write restored root to file header immediately |
+| 6 | `deleteSecondaryKeys` no-op without autoIndex — explicit indexes never cleaned | `table_index.go:53` | Mirror `insertSecondaryKeys` explicit-index logic |
+| 7 | `deactivateRecord` swallows all errors — failed reads write zeros, clobbering records | `table_api.go:747` | Return and propagate errors |
 
-### High (causes data loss) — **FIXED**
-2. **BulkInsert replaces entire tree** — Built a new tree from only provided entries,
-   setting `bt.rootOff` to the new root, orphaning ALL existing keys from other tables.
-   → **Fixed:** `collectLeafEntries()` walks old tree, `mergeSortedEntries()` combines
-   old + new, combined set builds the new tree. Also fixed `buildInternalNodes` panic
-   when internal nodes have zero keys (single child) by adding `firstKeyInSubtree()`.
+## Phase 2: High (data loss / incorrect behavior)
 
-3. **InsertManyBulk bypasses transaction tracking** — Directly modified
-   `entry.RecordCount` without checking `t.db.tx`.
-   → **Fixed:** Added `t.db.tx` check, delegates to `tx.recordCounts` when active.
+| # | Issue | File(s) |
+|---|-------|---------|
+| 8 | `updateLocked` overwrites version 1, skips maxVersions pruning | `table_crud.go:692` |
+| 9 | `Vacuum` error paths leave DB with no file, no recovery | `vacuum.go:126` |
+| 10 | `Vacuum` ignores read errors during copy → garbage output | `vacuum.go:69,90` |
+| 11 | 7 B-tree operations discard `writeNode` errors | `btree.go:955+` |
+| 12 | `Update`/`updateLocked` ignore PK Insert error | `table_crud.go:307` |
+| 13 | Map fields tagged `encrypt` stored in plaintext | `record.go:626` |
+| 14 | `Backup` not crash-consistent — no mmap sync, no db.mu | `backup.go:46` |
+| 15 | `Sync`/`Vacuum`/`FastSync` call flush N times (once per table) | `table_api.go:540` |
+| 16 | `encodeSecondaryKeyEndPrefix` wraps at tableID 255 | `index.go:107` |
 
-4. **bt.count = 0 unprotected in Rollback** — Ran after `bt.mu.Unlock()` in
-   `SetRootOffset`. Concurrent reader could see stale count.
-   → **Fixed:** Moved `bt.count = 0` inside `SetRootOffset` under `bt.mu.Lock()`.
+## Phase 3: Performance
 
-### Medium — **FIXED**
-5. **Missing bounds checks** — 7 call sites accessed `Children[i]` without `len(Children)` guard.
-   → **Fixed:** Added bounds checks at all vulnerable call sites.
+| # | Issue | Impact |
+|---|-------|--------|
+| 18 | `InsertManyBulk` double-encodes every record | 2× encoding |
+| 23 | Range queries decode via string round-trip | String alloc per key |
+| 24 | `ListVersions`/`Update` O(n) scan instead of ScanRange | Linear version lookup |
+| 25 | `ScanRecords` loads all PKs into memory upfront | O(n) allocation |
+| 32 | `allocator.Free` O(n) insert + O(n) coalesce | Hotspot under deletes |
+| 33 | `Drop` scans entire index O(n) | Slow table drop |
+| 47 | `encodeSliceOfStructs` recomputes layout every call | Layout recompute per slice |
 
-### Low — **RESOLVED**
-6. **newTxnPages never used** — Removed when `pageSnapshots` replaced the old transaction mechanism.
-7. **Transaction type not integrated** — Transactions fully re-enabled, exported as
-   `DB.Begin()` → `Transaction.Commit()/Rollback()`. All 8 transaction tests active.
+## Phase 4: Hardening & code quality
 
----
+| # | Issue |
+|---|-------|
+| 17 | Migration leaves stale index entries for skipped records |
+| 20 | `DeleteMany` empty `if err != nil {}` body |
+| 21 | `alloc.nextOffset` accessed without `alloc.mu` |
+| 22 | `matchLike` doesn't handle `_` wildcard |
+| 26 | `Scan`/`Count` access `tableCat` without `db.mu` |
+| 27 | `Verify` nests `RWMutex.RLock` → deadlock |
+| 28 | `allocator.Load` doesn't bound `blockCount` → OOM |
+| 29 | Encode/decode silently skip on error — fields vanish |
+| 30 | `recordTotalSize` can OOM on corrupt `PayloadLen` |
+| 31 | WAL `writeEntry` buffer not concurrency-safe |
+| 34 | `Use` on existing table doesn't detect schema change |
+| 36 | 8 pieces of dead code |
+| 37 | `openDatabase` migrate parameter unused |
+| 42 | `hdrBufPool` returns `[]byte` not `*[]byte` |
+| 54 | `Decode*Slice` allocate from untrusted length |
+| 55 | `go.sum` missing entry |
+| 57 | `Decode*Slice` return nil error on truncation |
+| 58 | Scan errors ignored in 5+ places |
+| 59 | `runTransaction` only implements case 0 of 3 |
 
-## Additional Changes (post initial investigation)
+## Phase 5: Testing gaps
 
-### Map support
-- `map[string]V` fields stored/round-tripped as TLV-encoded key-value pairs
-- All scalar value types supported (string, int/int8-64, uint/8-64, float32/64, bool)
-- Non-string key types and unsupported value types rejected at `Use[T]()` time
-
-### Type validation hardening
-- `validateLayout` runs unconditionally on `Use[T]()` (was gated behind encryption)
-- Rejects: `chan`, `func`, `uintptr`, `unsafe.Pointer`, `complex*`, `[N]T` arrays, `*T` pointers
-- Rejects maps with non-string keys or unsupported value types
-- `interface{}` fields allowed but silently skipped (backward compatible)
-
-### Deadlock fix
-- `database.go:ensureRegionLocked` wrapped `Resize()` in `WriteLock/WriteUnlock`,
-  but `Resize()` internally acquires the same mutex — double-lock deadlock.
-  Fixed by removing the outer `WriteLock/WriteUnlock`.
-
-### Encryption flag fix
-- `computeFieldOffsets` never parsed `db:"encrypt"` tag into `field.Encrypted`.
-  Fixed by adding tag parsing and setting `Encrypted: true` on FieldOffset.
-
-### Reflect-to-unsafe conversion
-- `encodeMapField`: FieldByName + MapRange + .Int()/.String() → unsafe.Add + native for-range
-- `encodeSliceOfStructs`: FieldByName + val.Index(i) → unsafe.Add + pointer arithmetic
-- `GetMapField`: FieldByName + map[string]interface{} → unsafe.Add + typed map return
-- `GetSliceOfStructs`: FieldByName chain → unsafe.Add + reflect.NewAt
-- Map round-trip 3.2× faster (7,558 → 2,373 ns), 2.5× less memory
-
-### CRC conversion (Castagnoli)
-- B-tree pages use Castagnoli CRC (154 ns vs 303 ns, 2× faster)
-- Backward compatible: `buf[1] = 0x01` flag distinguishes old IEEE from new Castagnoli
-- Records, free list, WAL entries still use IEEE (not hot paths)
-
----
-
-## Remaining Issues
-
-### High priority
-1. **B-tree pages never freed** — No `Free()` calls in production code. Orphaned
-   pages from splits/merges/deletes/BulkInserts accumulate. File grows unbounded.
-   Vacuum can reclaim some but can't detect all orphans.
-
-### Medium priority
-2. **Multi-table BulkInsert scan cost** — `collectLeafEntries()` walks all leaves
-    of the shared B-tree to collect old entries. For large multi-table databases,
-    this is O(total entries) per BulkInsert. Could be optimized with table-scoped
-    B-trees or key prefix filtering during the collection walk.
-
-### Low priority
-3. **Pre-allocate TLV encode buffer** — `encodeFieldPayload` grows via `append`.
-    Struct layout knows field count and sizes up front.
-
-4. **Allocator double-allocation hardening** — Debug mode exists but is off in production.
-    A production-mode check (e.g., bitmap or page-zero check) would catch corruption.
-
-5. **Dirty-cell encoding** — Attempted append-only leaf optimization; caused data
-   corruption due to in-place page mutation without proper CoW semantics. Requires
-   full B-tree rewrite to safely avoid full-page serialization.
-
----
-
-## Verdict
-
-All critical/high severity bugs from the original investigation are fixed and verified.
-Page reclamation is now implemented (`freeAllNodes` during BulkInsert, `freeNode` on
-merges and root changes). Remaining items are low-priority optimizations that require
-either a CoW B-tree rewrite (dirty-cell encoding) or provide marginal performance gain
-(pre-allocate TLV buffer).
+| # | Missing test |
+|---|-------------|
+| 60 | WAL replay + subsequent writes |
+| 61 | Rollback + crash/reopen |
+| 62 | resizeCache at exact capacity |
+| 63 | Explicit-index Delete/Update |
+| 64 | Vacuum failure recovery |
+| 66 | Fuzz tests for decode/Load/replay |
+| 67 | Sync vs Insert WAL concurrency |

@@ -256,6 +256,7 @@ func openDatabase(filename string, migrate bool, parent *DB, storageMode Storage
 	var file *os.File
 	var stat os.FileInfo
 	var err error
+	var walReplayed bool
 
 	if storageMode != StorageMemory {
 		file, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
@@ -319,6 +320,13 @@ func openDatabase(filename string, migrate bool, parent *DB, storageMode Storage
 				file.Close()
 				return nil, fmt.Errorf("failed to replay WAL: %w", err)
 			}
+			db.wal, walErr = openWAL(filename)
+			if walErr != nil {
+				unlockFile(file)
+				file.Close()
+				return nil, fmt.Errorf("failed to reopen WAL after replay: %w", walErr)
+			}
+			walReplayed = true
 		}
 	}
 
@@ -372,6 +380,14 @@ func openDatabase(filename string, migrate bool, parent *DB, storageMode Storage
 				file.Close()
 			}
 			return nil, fmt.Errorf("failed to load index: %w, failed to rebuild: %v", err, rebuildErr)
+		}
+	} else if walReplayed {
+		if rebuildErr := db.rebuildIndexFromScan(); rebuildErr != nil {
+			if file != nil {
+				unlockFile(file)
+				file.Close()
+			}
+			return nil, fmt.Errorf("failed to rebuild index after WAL replay: %w", rebuildErr)
 		}
 	}
 

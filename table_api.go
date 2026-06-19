@@ -744,12 +744,17 @@ type Table[T any] struct {
 	cipher      *fieldCipher
 }
 
-func (t *Table[T]) deactivateRecord(offset uint64) {
+func (t *Table[T]) deactivateRecord(offset uint64) error {
 	deactivateBuf := hdrBufPool.Get().([]byte)
 	defer hdrBufPool.Put(deactivateBuf)
-	t.db.readAt(deactivateBuf, int64(offset))
+	if err := t.db.readAt(deactivateBuf, int64(offset)); err != nil {
+		return fmt.Errorf("deactivateRecord read at %d: %w", offset, err)
+	}
 	deactivateBuf[1] &^= embeddbcore.FlagsActive
-	t.db.writeAt(deactivateBuf, int64(offset))
+	if err := t.db.writeAt(deactivateBuf, int64(offset)); err != nil {
+		return fmt.Errorf("deactivateRecord write at %d: %w", offset, err)
+	}
+	return nil
 }
 
 func (t *Table[T]) normalizePK(id any) any {

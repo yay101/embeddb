@@ -147,7 +147,7 @@ func (bt *BTree) readCount(node *BTreeNode) int {
 		r := bt.db.region.Load()
 		if r != nil {
 			r.RLock()
-			page := bt.pageData(node.Offset)
+			page := bt.pageDataFrom(r, node.Offset)
 			isRoot := page[0] == PageTypeRootLeaf || page[0] == PageTypeRootInternal
 			var count uint32
 			if isRoot {
@@ -173,6 +173,10 @@ func (bt *BTree) readCount(node *BTreeNode) int {
 
 func (bt *BTree) pageData(offset uint64) []byte {
 	r := bt.db.region.Load()
+	return bt.pageDataFrom(r, offset)
+}
+
+func (bt *BTree) pageDataFrom(r *embeddbmmap.MappedRegion, offset uint64) []byte {
 	if r == nil {
 		buf := make([]byte, PageSize)
 		bt.db.readAt(buf, int64(offset))
@@ -346,7 +350,7 @@ func (bt *BTree) writeNode(node *BTreeNode) error {
 	r := bt.db.region.Load()
 	if r != nil {
 		r.RLock()
-		copy(bt.pageData(node.Offset), data)
+		copy(bt.pageDataFrom(r, node.Offset), data)
 		r.RUnlock()
 	} else {
 		if err := bt.db.writeAt(data, int64(node.Offset)); err != nil {
@@ -395,7 +399,7 @@ func (bt *BTree) readNode(offset uint64) (*BTreeNode, error) {
 	r := bt.db.region.Load()
 	if r != nil {
 		r.RLock()
-		page := bt.pageData(offset)
+		page := bt.pageDataFrom(r, offset)
 		copy(pageCopy, page)
 		r.RUnlock()
 	} else {
@@ -649,7 +653,7 @@ func (bt *BTree) resizeCache(newSize int) {
 		}
 	}
 
-	bt.cacheHead = n
+	bt.cacheHead = n % newSize
 }
 
 // Insert adds a key-value pair to the B+ tree. If the key already exists, the value

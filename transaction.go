@@ -106,6 +106,11 @@ func (tx *transaction) rollback() error {
 		}
 	}
 
+	tx.db.writeHeader()
+	if tx.db.file != nil {
+		tx.db.file.Sync()
+	}
+
 	tx.db.tx = nil
 	return nil
 }
