@@ -6,11 +6,26 @@ import (
 	"fmt"
 	"hash/crc32"
 	"reflect"
+	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/yay101/embeddbcore"
 )
+
+var layoutCache sync.Map
+
+func getCachedLayout(elementType reflect.Type) (*embeddbcore.StructLayout, error) {
+	if cached, ok := layoutCache.Load(elementType); ok {
+		return cached.(*embeddbcore.StructLayout), nil
+	}
+	layout, err := embeddbcore.ComputeStructLayout(reflect.New(elementType).Interface())
+	if err != nil {
+		return nil, err
+	}
+	layoutCache.Store(elementType, layout)
+	return layout, nil
+}
 
 const (
 	V2RecordVersion byte = 0x01
@@ -353,7 +368,7 @@ func encodeSliceOfStructs(record interface{}, field embeddbcore.FieldOffset, cip
 	}
 
 	elementType := field.SliceElem
-	elemLayout, err := embeddbcore.ComputeStructLayout(reflect.New(elementType).Interface())
+	elemLayout, err := getCachedLayout(elementType)
 	if err != nil {
 		return nil, err
 	}
@@ -467,7 +482,7 @@ func decodeSliceOfStructs(data []byte, field embeddbcore.FieldOffset, cipher *fi
 	data = data[n:]
 
 	elementType := field.SliceElem
-	elemLayout, err := embeddbcore.ComputeStructLayout(reflect.New(elementType).Interface())
+	elemLayout, err := getCachedLayout(elementType)
 	if err != nil {
 		return nil, err
 	}

@@ -402,6 +402,7 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 
 		hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 		if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
+			continue
 		}
 		if hdrBuf[0] == V2RecordVersion {
 			hdr, _ := decodeRecordHeader(hdrBuf)
@@ -469,11 +470,12 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 	}
 
 	type bulkEntry struct {
-		record   *T
-		recordID uint32
-		offset   uint64
-		pkVal    any
-		pkKey    []byte
+		record     *T
+		recordID   uint32
+		offset     uint64
+		pkVal      any
+		pkKey      []byte
+		encodedBuf []byte
 	}
 
 	bulk := make([]bulkEntry, 0, len(records))
@@ -495,10 +497,11 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 		}
 
 		bulk = append(bulk, bulkEntry{
-			record:   record,
-			recordID: recordID,
-			pkVal:    pkVal,
-			pkKey:    encodePrimaryKey(t.tableID, pkVal),
+			record:     record,
+			recordID:   recordID,
+			pkVal:      pkVal,
+			pkKey:      encodePrimaryKey(t.tableID, pkVal),
+			encodedBuf: recordBuf,
 		})
 		totalSize += uint64(len(recordBuf))
 	}
@@ -509,18 +512,12 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 	}
 
 	offset := baseOffset
-	var encodedRecords [][]byte
 	for i := range bulk {
-		recordBuf, err := t.encodeRecord(bulk[i].record, bulk[i].recordID, embeddbcore.FlagsActive, 0)
-		if err != nil {
-			return nil, fmt.Errorf("failed to encode record: %w", err)
-		}
-		encodedRecords = append(encodedRecords, recordBuf)
 		bulk[i].offset = offset
-		if err := t.db.writeAt(recordBuf, int64(offset)); err != nil {
+		if err := t.db.writeAt(bulk[i].encodedBuf, int64(offset)); err != nil {
 			return nil, fmt.Errorf("failed to write record: %w", err)
 		}
-		offset += uint64(len(recordBuf))
+		offset += uint64(len(bulk[i].encodedBuf))
 	}
 
 	btEntries := make([]struct{ key []byte; value uint64 }, len(bulk))
@@ -555,7 +552,9 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 		return nil, fmt.Errorf("failed to write header after bulk insert: %w", err)
 	}
 
-	t.db.file.Sync()
+	if t.db.file != nil {
+		t.db.file.Sync()
+	}
 
 	return ids, nil
 }
