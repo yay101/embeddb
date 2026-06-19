@@ -306,7 +306,9 @@ func (t *Table[T]) Update(id any, record *T) error {
 		}
 	}
 
-	t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset)
+	if err := t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset); err != nil {
+		return fmt.Errorf("failed to update primary key index: %w", err)
+	}
 
 	t.insertSecondaryKeys(record, recordID, newOffset)
 
@@ -711,6 +713,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 
 		if len(versions) == 0 {
 			t.db.index.Insert(encodeVersionKey(t.tableID, recordID, 1), oldOffset)
+			versions = append(versions, verInfo{version: 1, offset: oldOffset})
 		}
 		newVersion := uint32(1)
 		for _, v := range versions {
@@ -719,11 +722,26 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 			}
 		}
 		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, newVersion), newOffset)
+		versions = append(versions, verInfo{version: newVersion, offset: newOffset})
+
+		if len(versions) > int(t.maxVersions) {
+			for i := 0; i < len(versions) && len(versions) > int(t.maxVersions); i++ {
+				if versions[i].version == newVersion {
+					continue
+				}
+				_ = t.deactivateRecord(versions[i].offset)
+				t.db.index.Delete(encodeVersionKey(t.tableID, recordID, versions[i].version))
+				versions = append(versions[:i], versions[i+1:]...)
+				i--
+			}
+		}
 	} else {
 		_ = t.deactivateRecord(oldOffset)
 	}
 
-	t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset)
+	if err := t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset); err != nil {
+		return fmt.Errorf("failed to update primary key index: %w", err)
+	}
 
 	t.insertSecondaryKeys(record, recordID, newOffset)
 

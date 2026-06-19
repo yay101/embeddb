@@ -537,8 +537,8 @@ func (db *DB) Sync() error {
 	}
 
 	var firstErr error
-	for _, t := range db.tables {
-		if err := t.flush(); err != nil && firstErr == nil {
+	if db.database != nil {
+		if err := db.database.flush(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -670,8 +670,8 @@ func (db *DB) FastSync() error {
 		return fmt.Errorf("database is closed")
 	}
 
-	for _, t := range db.tables {
-		if r := t.region.Load(); r != nil {
+	if db.database != nil {
+		if r := db.database.region.Load(); r != nil {
 			if err := r.Sync(embeddbmmap.SyncSync); err != nil {
 				return err
 			}
@@ -699,8 +699,8 @@ func (db *DB) Vacuum() error {
 	}
 
 	var firstErr error
-	for _, t := range db.tables {
-		if err := t.Vacuum(); err != nil && firstErr == nil {
+	if db.database != nil {
+		if err := db.database.Vacuum(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

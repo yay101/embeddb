@@ -104,8 +104,11 @@ func encodeSecondaryKeyEndPrefix(tableID uint8, fieldName string) []byte {
 	bp := keyBufPool.Get().(*[]byte)
 	key := (*bp)[:0]
 	key = append(key, indexNSSecondary)
-	nextID := tableID + 1
-	key = append(key, nextID)
+	if tableID < 255 {
+		key = append(key, tableID+1)
+	} else {
+		key = append(key, 255, 0xFF)
+	}
 	key = embeddbcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
 	out := make([]byte, len(key))
