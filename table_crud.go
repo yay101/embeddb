@@ -296,12 +296,14 @@ func (t *Table[T]) Update(id any, record *T) error {
 					oldestIdx = i
 				}
 			}
-			t.deactivateRecord(versions[oldestIdx].offset)
+			_ = t.deactivateRecord(versions[oldestIdx].offset)
 			t.db.index.Delete(encodeVersionKey(t.tableID, recordID, versions[oldestIdx].version))
 			versions = append(versions[:oldestIdx], versions[oldestIdx+1:]...)
 		}
 	} else {
-		t.deactivateRecord(offset)
+		if err := t.deactivateRecord(offset); err != nil {
+			return fmt.Errorf("deactivate old record: %w", err)
+		}
 	}
 
 	t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset)
@@ -350,7 +352,9 @@ func (t *Table[T]) Delete(id any) error {
 		}
 	}
 
-	t.deactivateRecord(offset)
+	if err := t.deactivateRecord(offset); err != nil {
+		return fmt.Errorf("deactivate record %d: %w", id, err)
+	}
 
 	t.db.index.Delete(encodePrimaryKey(t.tableID, t.normalizePK(id)))
 
@@ -414,7 +418,7 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 			}
 		}
 
-		t.deactivateRecord(offset)
+		_ = t.deactivateRecord(offset)
 		t.db.index.Delete(encodePrimaryKey(t.tableID, t.normalizePK(id)))
 		deleted++
 		if t.db.tx != nil {
@@ -716,7 +720,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 		}
 		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, newVersion), newOffset)
 	} else {
-		t.deactivateRecord(oldOffset)
+		_ = t.deactivateRecord(oldOffset)
 	}
 
 	t.db.index.Insert(encodePrimaryKey(t.tableID, t.normalizePK(id)), newOffset)

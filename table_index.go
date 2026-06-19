@@ -51,11 +51,40 @@ func (t *Table[T]) insertSecondaryKeys(record *T, recordID uint32, offset uint64
 }
 
 func (t *Table[T]) deleteSecondaryKeys(record *T, recordID uint32, offset uint64) {
-	if t.db.parent == nil || !t.db.parent.autoIndex {
+	if t.db.parent == nil {
+		return
+	}
+	if !t.db.parent.autoIndex {
+		if t.db.explicitIndexes == nil {
+			return
+		}
+		explicitFields := t.db.explicitIndexes[t.name]
+		if len(explicitFields) == 0 {
+			return
+		}
+		explicitSet := make(map[string]bool, len(explicitFields))
+		for _, f := range explicitFields {
+			explicitSet[f] = true
+		}
+		for _, field := range t.layout.Fields {
+			if field.Name != "" && !field.Primary && field.Offset > 0 && !field.IsSlice && explicitSet[field.Name] {
+				if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][field.Name] {
+					continue
+				}
+				key := embeddbcore.GetFieldAsString(record, field)
+				if key != "" {
+					secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
+					t.db.index.Delete(secKey)
+				}
+			}
+		}
 		return
 	}
 	for _, field := range t.layout.Fields {
 		if field.Name != "" && !field.Primary && field.Offset > 0 && !field.IsSlice {
+			if t.db.droppedIndexes != nil && t.db.droppedIndexes[t.name] != nil && t.db.droppedIndexes[t.name][field.Name] {
+				continue
+			}
 			key := embeddbcore.GetFieldAsString(record, field)
 			if key != "" {
 				secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
