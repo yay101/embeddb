@@ -219,6 +219,10 @@ func (a *allocator) Load(file *os.File, offset int64) error {
 	}
 	blockCount := int(binary.LittleEndian.Uint32(buf4[:]))
 
+	if blockCount < 0 || blockCount > 1<<20 {
+		return fmt.Errorf("free list block count out of range: %d", blockCount)
+	}
+
 	// Read all blocks
 	totalSize := 4 + blockCount*16 + 4 // count + blocks + crc
 	buf := make([]byte, totalSize)
