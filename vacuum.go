@@ -28,7 +28,6 @@ func (db *database) Vacuum() error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(db.filename + ".vacuum")
 
 	stat, _ := db.file.Stat()
 	if stat == nil {
@@ -44,6 +43,7 @@ func (db *database) Vacuum() error {
 
 	if _, err := newFile.Write(header); err != nil {
 		newFile.Close()
+		os.Remove(db.filename + ".vacuum")
 		return err
 	}
 
@@ -66,7 +66,9 @@ func (db *database) Vacuum() error {
 			}
 
 			hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
-			db.readAt(hdrBuf, int64(value))
+			if err := db.readAt(hdrBuf, int64(value)); err != nil {
+				return true
+			}
 
 			if hdrBuf[0] != V2RecordVersion {
 				return true
@@ -83,11 +85,13 @@ func (db *database) Vacuum() error {
 
 			totalLen := recordTotalSize(hdr)
 
-			if totalLen >= embeddbcore.RecordHeaderSize+embeddbcore.RecordFooterSize {
+			if totalLen >= embeddbcore.RecordHeaderSize+embeddbcore.RecordFooterSize && totalLen <= 128*1024*1024 {
 				recData := make([]byte, totalLen)
 				copy(recData, hdrBuf)
 				if totalLen > embeddbcore.RecordHeaderSize {
-					db.readAt(recData[embeddbcore.RecordHeaderSize:], int64(value)+int64(embeddbcore.RecordHeaderSize))
+					if err := db.readAt(recData[embeddbcore.RecordHeaderSize:], int64(value)+int64(embeddbcore.RecordHeaderSize)); err != nil {
+						return true
+					}
 				}
 
 				if _, err := newFile.Write(recData); err != nil {
@@ -110,6 +114,7 @@ func (db *database) Vacuum() error {
 
 	if _, err := newFile.WriteAt(header, 0); err != nil {
 		newFile.Close()
+		os.Remove(db.filename + ".vacuum")
 		return err
 	}
 
@@ -119,19 +124,24 @@ func (db *database) Vacuum() error {
 
 	newFile.Close()
 
-	if r := db.region.Load(); r != nil {
-		r.Unmap()
+	oldFile := db.file
+	oldRegion := db.region.Load()
+
+	if err := os.Rename(db.filename+".vacuum", db.filename); err != nil {
+		os.Remove(db.filename + ".vacuum")
+		return fmt.Errorf("vacuum rename failed: %w", err)
+	}
+
+	if oldRegion != nil {
+		oldRegion.Unmap()
 		db.region.Store(nil)
 	}
-	db.file.Close()
+
+	oldFile.Close()
 
 	if db.wal != nil {
 		db.wal.Close()
 		db.wal = nil
-	}
-
-	if err := os.Rename(db.filename+".vacuum", db.filename); err != nil {
-		return err
 	}
 
 	db.file, err = os.OpenFile(db.filename, os.O_RDWR, 0644)

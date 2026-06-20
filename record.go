@@ -889,9 +889,4 @@ func recordTotalSize(hdr RecordHeader) int {
 	return embeddbcore.RecordHeaderSize + int(hdr.PayloadLen) + embeddbcore.RecordFooterSize
 }
 
-func isV2Record(data []byte) bool {
-	if len(data) < 1 {
-		return false
-	}
-	return data[0] == V2RecordVersion
-}
+

@@ -930,7 +930,9 @@ func (bt *BTree) Delete(key []byte) error {
 		return err
 	}
 
-	bt.deleteFromNode(root, key)
+	if err := bt.deleteFromNode(root, key); err != nil {
+		return err
+	}
 	bt.count--
 
 	root, err = bt.readNode(bt.rootOff)
@@ -945,7 +947,7 @@ func (bt *BTree) Delete(key []byte) error {
 	return nil
 }
 
-func (bt *BTree) deleteFromNode(node *BTreeNode, key []byte) {
+func (bt *BTree) deleteFromNode(node *BTreeNode, key []byte) error {
 	if node.IsLeaf {
 		i := sort.Search(node.Count, func(j int) bool {
 			return bytes.Compare(node.Keys[j], key) >= 0
@@ -956,9 +958,11 @@ func (bt *BTree) deleteFromNode(node *BTreeNode, key []byte) {
 			node.Keys = node.Keys[:node.Count-1]
 			node.Values = node.Values[:node.Count-1]
 			node.Count--
-			bt.writeNode(node)
+			if err := bt.writeNode(node); err != nil {
+				return fmt.Errorf("deleteFromNode write: %w", err)
+			}
 		}
-		return
+		return nil
 	}
 
 	childIdx := sort.Search(node.Count, func(j int) bool {
@@ -966,33 +970,37 @@ func (bt *BTree) deleteFromNode(node *BTreeNode, key []byte) {
 	})
 
 	if childIdx >= len(node.Children) {
-		return
+		return nil
 	}
 
 	child, err := bt.readNode(node.Children[childIdx])
 	if err != nil || child == nil {
-		return
+		return nil
 	}
 
-	bt.deleteFromNode(child, key)
+	if err := bt.deleteFromNode(child, key); err != nil {
+		return err
+	}
 
 	if childIdx > 0 && child.Count > 0 && bytes.Compare(node.Keys[childIdx-1], key) == 0 {
 		newSep := make([]byte, len(child.Keys[0]))
 		copy(newSep, child.Keys[0])
 		node.Keys[childIdx-1] = newSep
-		bt.writeNode(node)
+		if err := bt.writeNode(node); err != nil {
+			return fmt.Errorf("deleteFromNode sep update: %w", err)
+		}
 	}
 
-	bt.rebalance(node, childIdx)
+	return bt.rebalance(node, childIdx)
 }
 
-func (bt *BTree) rebalance(parent *BTreeNode, childIdx int) {
+func (bt *BTree) rebalance(parent *BTreeNode, childIdx int) error {
 	if childIdx >= len(parent.Children) {
-		return
+		return nil
 	}
 	child, err := bt.readNode(parent.Children[childIdx])
 	if err != nil || child == nil {
-		return
+		return nil
 	}
 
 	minKeys := MinLeafKeys
@@ -1000,11 +1008,11 @@ func (bt *BTree) rebalance(parent *BTreeNode, childIdx int) {
 		minKeys = 1
 	}
 	if child.Count >= minKeys {
-		return
+		return nil
 	}
 
 	if parent.Count == 0 {
-		return
+		return nil
 	}
 
 	var leftSibling *BTreeNode
@@ -1022,23 +1030,22 @@ func (bt *BTree) rebalance(parent *BTreeNode, childIdx int) {
 	}
 
 	if leftSibling != nil && leftSibling.Count > minKeys {
-		bt.borrowFromLeft(parent, childIdx, child, leftSibling)
-		return
+		return bt.borrowFromLeft(parent, childIdx, child, leftSibling)
 	}
 
 	if rightSibling != nil && rightSibling.Count > minKeys {
-		bt.borrowFromRight(parent, childIdx, child, rightSibling)
-		return
+		return bt.borrowFromRight(parent, childIdx, child, rightSibling)
 	}
 
 	if leftSibling != nil {
-		bt.mergeNodes(parent, childIdx-1, leftSibling, child)
+		return bt.mergeNodes(parent, childIdx-1, leftSibling, child)
 	} else if rightSibling != nil {
-		bt.mergeNodes(parent, childIdx, child, rightSibling)
+		return bt.mergeNodes(parent, childIdx, child, rightSibling)
 	}
+	return nil
 }
 
-func (bt *BTree) borrowFromLeft(parent *BTreeNode, childIdx int, child *BTreeNode, left *BTreeNode) {
+func (bt *BTree) borrowFromLeft(parent *BTreeNode, childIdx int, child *BTreeNode, left *BTreeNode) error {
 	parentKey := parent.Keys[childIdx-1]
 
 	if child.IsLeaf {
@@ -1067,12 +1074,16 @@ func (bt *BTree) borrowFromLeft(parent *BTreeNode, childIdx int, child *BTreeNod
 		left.Count--
 	}
 
-	bt.writeNode(left)
-	bt.writeNode(child)
-	bt.writeNode(parent)
+	if err := bt.writeNode(left); err != nil {
+		return err
+	}
+	if err := bt.writeNode(child); err != nil {
+		return err
+	}
+	return bt.writeNode(parent)
 }
 
-func (bt *BTree) borrowFromRight(parent *BTreeNode, childIdx int, child *BTreeNode, right *BTreeNode) {
+func (bt *BTree) borrowFromRight(parent *BTreeNode, childIdx int, child *BTreeNode, right *BTreeNode) error {
 	parentKey := parent.Keys[childIdx]
 
 	if child.IsLeaf {
@@ -1102,12 +1113,16 @@ func (bt *BTree) borrowFromRight(parent *BTreeNode, childIdx int, child *BTreeNo
 		right.Count--
 	}
 
-	bt.writeNode(right)
-	bt.writeNode(child)
-	bt.writeNode(parent)
+	if err := bt.writeNode(right); err != nil {
+		return err
+	}
+	if err := bt.writeNode(child); err != nil {
+		return err
+	}
+	return bt.writeNode(parent)
 }
 
-func (bt *BTree) mergeNodes(parent *BTreeNode, leftIdx int, left *BTreeNode, right *BTreeNode) {
+func (bt *BTree) mergeNodes(parent *BTreeNode, leftIdx int, left *BTreeNode, right *BTreeNode) error {
 	parentKey := parent.Keys[leftIdx]
 
 	if left.IsLeaf {
@@ -1128,9 +1143,14 @@ func (bt *BTree) mergeNodes(parent *BTreeNode, leftIdx int, left *BTreeNode, rig
 	parent.Children = parent.Children[:parent.Count]
 	parent.Count--
 
-	bt.writeNode(left)
-	bt.writeNode(parent)
+	if err := bt.writeNode(left); err != nil {
+		return err
+	}
+	if err := bt.writeNode(parent); err != nil {
+		return err
+	}
 	bt.freeNode(right)
+	return nil
 }
 
 func (bt *BTree) freeNode(node *BTreeNode) {
@@ -1607,9 +1627,6 @@ func (bt *BTree) SetRootOffset(off uint64) {
 // Verify checks the integrity of the B+ tree by scanning all entries and verifying
 // that each key can be retrieved via Get. Returns an error if any keys are missing.
 func (bt *BTree) Verify() error {
-	bt.mu.RLock()
-	defer bt.mu.RUnlock()
-
 	type kv struct {
 		key   []byte
 		value uint64

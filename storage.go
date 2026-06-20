@@ -121,20 +121,6 @@ func (a *allocator) Free(offset uint64, length uint64) {
 	a.freeList = merged
 }
 
-// ReclaimIfNeeded returns the number of bytes that can be reclaimed by running a full coalesce.
-// It is used to decide when to run a more aggressive cleanup (e.g., when >1MB has been freed).
-// Note: This function does not modify the allocator; it only reports the potential reclaim.
-// For simplicity, we just return the total free length.
-func (a *allocator) ReclaimIfNeeded() uint64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var total uint64
-	for _, fb := range a.freeList {
-		total += fb.length
-	}
-	return total
-}
-
 // Reset sets the allocator to a known state (used when loading from header).
 func (a *allocator) Reset(nextOffset uint64, freeList []freeBlock) {
 	a.mu.Lock()

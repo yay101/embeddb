@@ -181,24 +181,37 @@ func (t *Table[T]) QueryNotLike(fieldName string, pattern string) ([]T, error) {
 }
 
 func matchLike(s, pattern string) bool {
-	if pattern == "" {
-		return s == ""
-	}
-	if pattern == "%" {
-		return true
-	}
 	sLower := strings.ToLower(s)
 	patternLower := strings.ToLower(pattern)
-	if strings.HasPrefix(pattern, "%") && strings.HasSuffix(pattern, "%") {
-		return strings.Contains(sLower, strings.Trim(patternLower, "%"))
+	return likeMatch(sLower, patternLower)
+}
+
+func likeMatch(s, pattern string) bool {
+	si, pi := 0, 0
+	starSi, starPi := -1, -1
+
+	for si < len(s) {
+		if pi < len(pattern) && (pattern[pi] == s[si] || pattern[pi] == '_') {
+			si++
+			pi++
+		} else if pi < len(pattern) && pattern[pi] == '%' {
+			starPi = pi
+			starSi = si
+			pi++
+		} else if starPi != -1 {
+			pi = starPi + 1
+			starSi++
+			si = starSi
+		} else {
+			return false
+		}
 	}
-	if strings.HasPrefix(pattern, "%") {
-		return strings.HasSuffix(sLower, strings.Trim(patternLower, "%"))
+
+	for pi < len(pattern) && pattern[pi] == '%' {
+		pi++
 	}
-	if strings.HasSuffix(pattern, "%") {
-		return strings.HasPrefix(sLower, strings.Trim(patternLower, "%"))
-	}
-	return sLower == patternLower
+
+	return pi == len(pattern)
 }
 
 func (t *Table[T]) canUseIndex(fieldName string) bool {

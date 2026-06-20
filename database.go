@@ -234,24 +234,6 @@ func (db *database) writeAt(buf []byte, offset int64) error {
 	}
 }
 
-func (db *database) readAtFn() func([]byte, int64) {
-	currentRegion := db.region.Load()
-	if currentRegion != nil {
-		return func(buf []byte, offset int64) {
-			if r := db.region.Load(); r != nil {
-				r.RLock()
-				copy(buf, unsafe.Slice((*byte)(unsafe.Add(r.Pointer(), offset)), len(buf)))
-				r.RUnlock()
-			}
-		}
-	}
-	return func(buf []byte, offset int64) {
-		if db.file != nil {
-			db.file.ReadAt(buf, offset)
-		}
-	}
-}
-
 func openDatabase(filename string, migrate bool, parent *DB, storageMode StorageMode, useWAL bool) (*database, error) {
 	var file *os.File
 	var stat os.FileInfo

@@ -22,35 +22,6 @@ var hdrBufPool = sync.Pool{
 	},
 }
 
-func encodePKForIndex(tableID uint8, pkValue any) []byte {
-	var key []byte
-	key = append(key, tableID)
-	switch v := pkValue.(type) {
-	case int:
-		key = embeddbcore.EncodeUvarint(key, uint64(int64(v)))
-	case int8:
-		key = embeddbcore.EncodeUvarint(key, uint64(int64(v)))
-	case int16:
-		key = embeddbcore.EncodeUvarint(key, uint64(int64(v)))
-	case int32:
-		key = embeddbcore.EncodeUvarint(key, uint64(int64(v)))
-	case int64:
-		key = embeddbcore.EncodeUvarint(key, uint64(v))
-	case uint:
-		key = embeddbcore.EncodeUvarint(key, uint64(v))
-	case uint8:
-		key = embeddbcore.EncodeUvarint(key, uint64(v))
-	case uint16:
-		key = embeddbcore.EncodeUvarint(key, uint64(v))
-	case uint32:
-		key = embeddbcore.EncodeUvarint(key, uint64(v))
-	case uint64:
-		key = embeddbcore.EncodeUvarint(key, v)
-	case string:
-		key = embeddbcore.EncodeString(key, v)
-	}
-	return key
-}
 
 // StorageMode determines how the database file is accessed.
 // StorageMmap uses memory-mapped I/O (default), StorageFile uses direct file I/O,
@@ -358,6 +329,16 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 			return nil, fmt.Errorf("table not found")
 		}
 		layout := computeLayout[T]()
+		if layout.SchemaVersion != existingTable.SchemaVersion {
+			if db.migrate {
+				if err := migrateTable(existing, existingTable, layout); err != nil {
+					return nil, fmt.Errorf("migration failed: %w", err)
+				}
+				existingTable.SchemaVersion = layout.SchemaVersion
+			} else {
+				return nil, fmt.Errorf("schema mismatch for table %q: migration is disabled but struct layout has changed", tableName)
+			}
+		}
 		var cipher *fieldCipher
 		if len(db.encryptionKey) > 0 {
 			cipher, _ = newFieldCipher(db.encryptionKey)
