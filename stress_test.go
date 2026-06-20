@@ -35,6 +35,9 @@ type StressEvent struct {
 }
 
 func TestStress10M(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy stress test in -short mode")
+	}
 	const (
 		numTables      = 10
 		perTable       = 100000
