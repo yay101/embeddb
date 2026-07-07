@@ -425,7 +425,7 @@ func TestAutoIndexRangeQuery(t *testing.T) {
 	os.Remove("/tmp/test_autoindex.db")
 	defer os.Remove("/tmp/test_autoindex.db")
 
-	db, err := Open("/tmp/test_autoindex.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_autoindex.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +462,7 @@ func TestAutoIndexRestart(t *testing.T) {
 	defer os.Remove("/tmp/test_autoindex_restart.db")
 
 	{
-		db, err := Open("/tmp/test_autoindex_restart.db", OpenOptions{AutoIndex: true})
+		db, err := Open("/tmp/test_autoindex_restart.db", OpenOptions{AutoIndex: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -480,7 +480,7 @@ func TestAutoIndexRestart(t *testing.T) {
 	}
 
 	{
-		db2, err := Open("/tmp/test_autoindex_restart.db", OpenOptions{AutoIndex: true})
+		db2, err := Open("/tmp/test_autoindex_restart.db", OpenOptions{AutoIndex: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -549,7 +549,7 @@ func TestMigrateOption(t *testing.T) {
 	}
 
 	{
-		db2, err := Open("/tmp/test_migrate.db", OpenOptions{Migrate: true})
+		db2, err := Open("/tmp/test_migrate.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}

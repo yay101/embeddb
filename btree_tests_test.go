@@ -17,7 +17,7 @@ func TestSliceStorage(t *testing.T) {
 	os.Remove("/tmp/slice_storage.db")
 	defer os.Remove("/tmp/slice_storage.db")
 
-	db, err := Open("/tmp/slice_storage.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/slice_storage.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestSliceStorageNoIndex(t *testing.T) {
 	os.Remove("/tmp/slice_no_idx.db")
 	defer os.Remove("/tmp/slice_no_idx.db")
 
-	db, err := Open("/tmp/slice_no_idx.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/slice_no_idx.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestDeeplyNestedQuery(t *testing.T) {
 	os.Remove("/tmp/deep_nested.db")
 	defer os.Remove("/tmp/deep_nested.db")
 
-	db, err := Open("/tmp/deep_nested.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/deep_nested.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestManySecondaryIndexes(t *testing.T) {
 	os.Remove("/tmp/many_indexes.db")
 	defer os.Remove("/tmp/many_indexes.db")
 
-	db, err := Open("/tmp/many_indexes.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/many_indexes.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +347,7 @@ func TestTransactionRollbackWithBTree(t *testing.T) {
 	}
 
 	// Verify allocator was restored — inserting a new record should work
-	// and reuse the rolled-back record ID since NextRecordID is restored
+	// and reuse the rolled-back record ID since NextEDBID is restored
 	newID, err := tbl.Insert(&User{ID: 0, Name: "Dave", Age: 28})
 	if err != nil {
 		t.Fatalf("expected insert after rollback to succeed, got: %v", err)

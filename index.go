@@ -55,7 +55,7 @@ func truncIndexValue(v []byte) []byte {
 	return v
 }
 
-func encodeSecondaryKey(tableID uint8, fieldName string, fieldValue any, recordID uint32) []byte {
+func encodeSecondaryKey(tableID uint8, fieldName string, fieldValue any, edbID uint32) []byte {
 	bp := keyBufPool.Get().(*[]byte)
 	key := (*bp)[:0]
 	key = append(key, indexNSSecondary)
@@ -63,7 +63,7 @@ func encodeSecondaryKey(tableID uint8, fieldName string, fieldValue any, recordI
 	key = embeddbcore.EncodeUvarint(key, uint64(len(fieldName)))
 	key = append(key, fieldName...)
 	key = append(key, truncIndexValue(encodeIndexValueBytes(fieldValue))...)
-	key = binary.BigEndian.AppendUint32(key, recordID)
+	key = binary.BigEndian.AppendUint32(key, edbID)
 	out := make([]byte, len(key))
 	copy(out, key)
 	*bp = key
@@ -118,12 +118,12 @@ func encodeSecondaryKeyEndPrefix(tableID uint8, fieldName string) []byte {
 	return out
 }
 
-func encodeVersionKeyPrefix(tableID uint8, recordID uint32) []byte {
+func encodeVersionKeyPrefix(tableID uint8, edbID uint32) []byte {
 	bp := keyBufPool.Get().(*[]byte)
 	key := (*bp)[:0]
 	key = append(key, indexNSVersion)
 	key = append(key, tableID)
-	key = embeddbcore.EncodeUvarint(key, uint64(recordID))
+	key = embeddbcore.EncodeUvarint(key, uint64(edbID))
 	out := make([]byte, len(key))
 	copy(out, key)
 	*bp = key
@@ -131,12 +131,12 @@ func encodeVersionKeyPrefix(tableID uint8, recordID uint32) []byte {
 	return out
 }
 
-func encodeVersionKey(tableID uint8, recordID uint32, version uint32) []byte {
+func encodeVersionKey(tableID uint8, edbID uint32, version uint32) []byte {
 	bp := keyBufPool.Get().(*[]byte)
 	key := (*bp)[:0]
 	key = append(key, indexNSVersion)
 	key = append(key, tableID)
-	key = embeddbcore.EncodeUvarint(key, uint64(recordID))
+	key = embeddbcore.EncodeUvarint(key, uint64(edbID))
 	key = embeddbcore.EncodeUvarint(key, uint64(version))
 	out := make([]byte, len(key))
 	copy(out, key)
@@ -152,7 +152,7 @@ func parsePrimaryKey(key []byte) (tableID uint8, pkValue []byte) {
 	return key[1], key[2:]
 }
 
-func parseSecondaryKey(key []byte) (tableID uint8, fieldName string, fieldValue []byte, recordID uint32, ok bool) {
+func parseSecondaryKey(key []byte) (tableID uint8, fieldName string, fieldValue []byte, edbID uint32, ok bool) {
 	if len(key) < 3 || key[0] != indexNSSecondary {
 		return 0, "", nil, 0, false
 	}
@@ -173,11 +173,11 @@ func parseSecondaryKey(key []byte) (tableID uint8, fieldName string, fieldValue 
 		return 0, "", nil, 0, false
 	}
 	fieldValue = key[off:valueEnd]
-	recordID = binary.BigEndian.Uint32(key[valueEnd:])
-	return tableID, fieldName, fieldValue, recordID, true
+	edbID = binary.BigEndian.Uint32(key[valueEnd:])
+	return tableID, fieldName, fieldValue, edbID, true
 }
 
-func parseVersionKey(key []byte) (tableID uint8, recordID uint32, version uint32, ok bool) {
+func parseVersionKey(key []byte) (tableID uint8, edbID uint32, version uint32, ok bool) {
 	if len(key) < 3 || key[0] != indexNSVersion {
 		return 0, 0, 0, false
 	}
@@ -211,8 +211,8 @@ func EncodePrimaryKey(tableID uint8, pkValue any) []byte {
 
 // EncodeSecondaryKey builds a secondary index key for field-value lookups.
 // Exported for netembeddb.
-func EncodeSecondaryKey(tableID uint8, fieldName string, fieldValue any, recordID uint32) []byte {
-	return encodeSecondaryKey(tableID, fieldName, fieldValue, recordID)
+func EncodeSecondaryKey(tableID uint8, fieldName string, fieldValue any, edbID uint32) []byte {
+	return encodeSecondaryKey(tableID, fieldName, fieldValue, edbID)
 }
 
 // EncodeSecondaryKeyPrefix builds the prefix portion of a secondary index key
@@ -230,7 +230,7 @@ func EncodeSecondaryKeyPrefixWithValue(tableID uint8, fieldName string, fieldVal
 
 // ParseSecondaryKey parses a secondary index key into its components.
 // Exported for netembeddb.
-func ParseSecondaryKey(key []byte) (tableID uint8, fieldName string, fieldValue []byte, recordID uint32, ok bool) {
+func ParseSecondaryKey(key []byte) (tableID uint8, fieldName string, fieldValue []byte, edbID uint32, ok bool) {
 	return parseSecondaryKey(key)
 }
 

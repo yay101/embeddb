@@ -36,7 +36,7 @@ type tableCatalogEntry struct {
 	ID            uint8
 	Name          string
 	SchemaVersion uint32
-	NextRecordID  uint32
+	NextEDBID  uint32
 	Dropped       bool
 	RecordCount   uint32
 	MaxVersions   uint8
@@ -64,7 +64,7 @@ func (tc tableCatalog) AddTable(name string, schemaVersion uint32) uint8 {
 		ID:            maxID,
 		Name:          name,
 		SchemaVersion: schemaVersion,
-		NextRecordID:  1,
+		NextEDBID:  1,
 	}
 	return maxID
 }
@@ -484,6 +484,9 @@ func (db *database) rebuildIndexFromScan() error {
 	}
 
 	var maxOffset uint64 = FileHeaderSize
+	if hi := db.alloc.ActualSize(); hi > maxOffset {
+		maxOffset = hi
+	}
 
 	tableInfo := make(map[uint8]*tableCatalogEntry)
 	seenKeys := make(map[[5]byte]struct{})
@@ -547,18 +550,18 @@ func (db *database) rebuildIndexFromScan() error {
 
 		if hdr.IsActive() {
 			dedupKey := [5]byte{hdr.TableID}
-			binary.LittleEndian.PutUint32(dedupKey[1:], hdr.RecordID)
+			binary.LittleEndian.PutUint32(dedupKey[1:], hdr.EDBID)
 			if _, seen := seenKeys[dedupKey]; seen {
 				offset++
 				continue
 			}
 			seenKeys[dedupKey] = struct{}{}
 
-			key := encodePrimaryKey(hdr.TableID, hdr.RecordID)
+			key := encodePrimaryKey(hdr.TableID, hdr.EDBID)
 			db.index.Insert(key, uint64(offset))
 
 			if hdr.HasPrevVersion() && hdr.PrevVersionOff >= FileHeaderSize {
-				verKey := encodeVersionKey(hdr.TableID, hdr.RecordID, 1)
+				verKey := encodeVersionKey(hdr.TableID, hdr.EDBID, 1)
 				db.index.Insert(verKey, uint64(offset))
 			}
 
@@ -576,7 +579,7 @@ func (db *database) rebuildIndexFromScan() error {
 						continue
 					}
 
-					secKey := encodeSecondaryKey(hdr.TableID, fieldName, fieldValue, hdr.RecordID)
+					secKey := encodeSecondaryKey(hdr.TableID, fieldName, fieldValue, hdr.EDBID)
 					db.index.Insert(secKey, uint64(offset))
 				}
 			}
@@ -590,8 +593,8 @@ func (db *database) rebuildIndexFromScan() error {
 				tableInfo[hdr.TableID] = info
 			}
 			info.RecordCount++
-			if hdr.RecordID >= info.NextRecordID {
-				info.NextRecordID = hdr.RecordID + 1
+			if hdr.EDBID >= info.NextEDBID {
+				info.NextEDBID = hdr.EDBID + 1
 			}
 
 			endOffset := uint64(offset) + uint64(totalLen)
@@ -664,7 +667,7 @@ func decodeTableCatalog(data []byte) tableCatalog {
 			ID:            id,
 			Name:          name,
 			SchemaVersion: schemaVersion,
-			NextRecordID:  nextRecID,
+			NextEDBID:  nextRecID,
 			RecordCount:   recordCount,
 			MaxVersions:   maxVersions,
 		}
@@ -772,10 +775,12 @@ func (db *database) flush() error {
 	if err != nil {
 		return err
 	}
+	btEntries := make([]struct{ key []byte; value uint64 }, 0, len(updatedOffsets))
 	for keyStr, newOff := range updatedOffsets {
-		if err := newIndex.Insert([]byte(keyStr), newOff); err != nil {
-			return err
-		}
+		btEntries = append(btEntries, struct{ key []byte; value uint64 }{key: []byte(keyStr), value: newOff})
+	}
+	if err := newIndex.BulkInsert(btEntries); err != nil {
+		return err
 	}
 	newIndex.Sync()
 
@@ -853,7 +858,7 @@ func (db *database) encodeTableCatalog() []byte {
 		buf = append(buf, byte(len(entry.Name)))
 		buf = append(buf, []byte(entry.Name)...)
 		buf = binary.LittleEndian.AppendUint32(buf, entry.SchemaVersion)
-		buf = binary.LittleEndian.AppendUint32(buf, entry.NextRecordID)
+		buf = binary.LittleEndian.AppendUint32(buf, entry.NextEDBID)
 		buf = binary.LittleEndian.AppendUint32(buf, entry.RecordCount)
 		buf = append(buf, entry.MaxVersions)
 	}
@@ -871,14 +876,72 @@ func (db *database) writeHeader() error {
 	return db.writeAt(header, 0)
 }
 
+// persistHeader writes the table catalog and file header without rewriting record
+// data or rebuilding the B-tree. It is a fast alternative to flush() for Close() on
+// write-heavy workloads: record and B-tree pages are already on disk via mmap writes,
+// so only the table catalog (TOC) and header need to be appended and the region synced.
+// Dead space is not reclaimed; use Sync() or Vacuum() for that.
+func (db *database) persistHeader() error {
+	if db.index != nil {
+		if err := db.index.Sync(); err != nil {
+			return fmt.Errorf("persistHeader: index sync: %w", err)
+		}
+	}
+
+	encodedCat := db.encodeTableCatalog()
+	catOffset, _, err := db.alloc.Allocate(uint64(len(encodedCat)))
+	if err != nil {
+		return fmt.Errorf("persistHeader: allocate catalog: %w", err)
+	}
+
+	if err := db.writeAt(encodedCat, int64(catOffset)); err != nil {
+		return fmt.Errorf("persistHeader: write catalog: %w", err)
+	}
+
+	newSize := int64(catOffset) + int64(len(encodedCat))
+
+	header := make([]byte, FileHeaderSize)
+	header[0] = V2RecordVersion
+	copy(header[1:33], []byte(FileMagic))
+	binary.LittleEndian.PutUint32(header[32:36], uint32(len(db.tableCat)))
+	binary.LittleEndian.PutUint64(header[40:48], catOffset)
+	binary.LittleEndian.PutUint64(header[48:56], uint64(newSize))
+	binary.LittleEndian.PutUint64(header[56:64], db.index.RootOffset())
+
+	if err := db.writeAt(header, 0); err != nil {
+		return fmt.Errorf("persistHeader: write header: %w", err)
+	}
+
+	if db.file != nil {
+		if err := db.file.Sync(); err != nil {
+			return fmt.Errorf("persistHeader: file sync: %w", err)
+		}
+	}
+
+	if r := db.region.Load(); r != nil {
+		if err := r.Sync(embeddbmmap.SyncSync); err != nil {
+			return fmt.Errorf("persistHeader: region sync: %w", err)
+		}
+	}
+
+	return nil
+}
+
 func (db *database) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	flushErr := db.flush()
-
-	if db.wal != nil && db.file != nil {
-		db.wal.Checkpoint(db.file)
+	compactOnClose := db.parent != nil && db.parent.compactOnClose
+	var flushErr error
+	if compactOnClose {
+		flushErr = db.flush()
+	} else {
+		flushErr = db.persistHeader()
+		if flushErr == nil && db.wal != nil && db.file != nil {
+			if err := db.wal.Checkpoint(db.file); err != nil && flushErr == nil {
+				flushErr = err
+			}
+		}
 	}
 
 	if r := db.region.Load(); r != nil {
@@ -918,13 +981,25 @@ func (db *database) autoSync() {
 	}
 
 	if syncNeeded {
-		for _, t := range db.parent.tables {
-			if r := t.region.Load(); r != nil {
-				r.Sync(embeddbmmap.SyncAsync)
-			}
-		}
 		db.parent.writeCount = 0
 		db.parent.lastSync = time.Now()
+
+		compactOnSync := db.parent.compactOnSync
+		tables := make([]*database, 0, len(db.parent.tables)+1)
+		for _, t := range db.parent.tables {
+			tables = append(tables, t)
+		}
+		if len(tables) == 0 {
+			tables = append(tables, db)
+		}
+
+		for _, t := range tables {
+			if compactOnSync {
+				t.flush()
+			} else {
+				t.persistHeader()
+			}
+		}
 	}
 }
 

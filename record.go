@@ -35,11 +35,17 @@ var ErrInvalidRecord = errors.New("invalid record format")
 
 // RecordHeader contains the metadata for a V2 record stored in the database file.
 // The header is followed by the TLV-encoded payload and a CRC32 footer.
+//
+// EDBID is the internal, auto-assigned record identifier (unique within a table).
+// It is distinct from any user-defined primary key (the field tagged db:"id,primary"):
+// when the user's PK is zero-valued on insert, EDBID is assigned and also stored as
+// the PK value; otherwise EDBID and the user PK are independent. EDBID is used in
+// version keys and as the disambiguating tail of secondary index keys.
 type RecordHeader struct {
 	Version        byte   // record format version
 	Flags          byte   // active flag, compression flag, previous version flag
 	TableID        uint8  // table this record belongs to
-	RecordID       uint32 // unique record identifier within the table
+	EDBID          uint32 // internal auto-assigned record identifier within the table
 	PrevVersionOff uint64 // file offset of the previous version (0 if none)
 	SchemaVersion  uint32 // schema version at time of write
 	PayloadLen     uint32 // length of the TLV-encoded payload in bytes
@@ -53,7 +59,7 @@ func decodeRecordHeader(data []byte) (RecordHeader, error) {
 		Version:        data[0],
 		Flags:          data[1],
 		TableID:        data[2],
-		RecordID:       binary.LittleEndian.Uint32(data[3:7]),
+		EDBID:       binary.LittleEndian.Uint32(data[3:7]),
 		PrevVersionOff: binary.LittleEndian.Uint64(data[7:15]),
 		SchemaVersion:  binary.LittleEndian.Uint32(data[15:19]),
 		PayloadLen:     binary.LittleEndian.Uint32(data[19:23]),
@@ -843,7 +849,7 @@ func decodeMapField(data []byte, field embeddbcore.FieldOffset, cipher *fieldCip
 	return result.Interface(), totalRead, nil
 }
 
-func buildV2Record(tableID uint8, recordID uint32, schemaVersion uint32, flags byte, prevVersionOff uint64, payload []byte) []byte {
+func buildV2Record(tableID uint8, edbID uint32, schemaVersion uint32, flags byte, prevVersionOff uint64, payload []byte) []byte {
 	headerSize := embeddbcore.RecordHeaderSize
 	footerSize := embeddbcore.RecordFooterSize
 	totalSize := headerSize + len(payload) + footerSize
@@ -852,7 +858,7 @@ func buildV2Record(tableID uint8, recordID uint32, schemaVersion uint32, flags b
 	rec[0] = V2RecordVersion
 	rec[1] = flags
 	rec[2] = byte(tableID)
-	binary.LittleEndian.PutUint32(rec[3:7], recordID)
+	binary.LittleEndian.PutUint32(rec[3:7], edbID)
 	binary.LittleEndian.PutUint64(rec[7:15], prevVersionOff)
 	binary.LittleEndian.PutUint32(rec[15:19], schemaVersion)
 	binary.LittleEndian.PutUint32(rec[19:23], uint32(len(payload)))

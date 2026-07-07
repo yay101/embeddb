@@ -6,7 +6,7 @@ import (
 	"github.com/yay101/embeddbcore"
 )
 
-func (t *Table[T]) insertSecondaryKeys(record *T, recordID uint32, offset uint64) {
+func (t *Table[T]) insertSecondaryKeys(record *T, edbID uint32, offset uint64) {
 	if t.db.parent == nil {
 		return
 	}
@@ -29,7 +29,7 @@ func (t *Table[T]) insertSecondaryKeys(record *T, recordID uint32, offset uint64
 				}
 				key := embeddbcore.GetFieldAsString(record, field)
 				if key != "" {
-					secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
+					secKey := encodeSecondaryKey(t.tableID, field.Name, key, edbID)
 					t.db.index.Insert(secKey, offset)
 				}
 			}
@@ -43,14 +43,14 @@ func (t *Table[T]) insertSecondaryKeys(record *T, recordID uint32, offset uint64
 			}
 			key := embeddbcore.GetFieldAsString(record, field)
 			if key != "" {
-				secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
+				secKey := encodeSecondaryKey(t.tableID, field.Name, key, edbID)
 				t.db.index.Insert(secKey, offset)
 			}
 		}
 	}
 }
 
-func (t *Table[T]) deleteSecondaryKeys(record *T, recordID uint32, offset uint64) {
+func (t *Table[T]) deleteSecondaryKeys(record *T, edbID uint32, offset uint64) {
 	if t.db.parent == nil {
 		return
 	}
@@ -73,7 +73,7 @@ func (t *Table[T]) deleteSecondaryKeys(record *T, recordID uint32, offset uint64
 				}
 				key := embeddbcore.GetFieldAsString(record, field)
 				if key != "" {
-					secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
+					secKey := encodeSecondaryKey(t.tableID, field.Name, key, edbID)
 					t.db.index.Delete(secKey)
 				}
 			}
@@ -87,7 +87,7 @@ func (t *Table[T]) deleteSecondaryKeys(record *T, recordID uint32, offset uint64
 			}
 			key := embeddbcore.GetFieldAsString(record, field)
 			if key != "" {
-				secKey := encodeSecondaryKey(t.tableID, field.Name, key, recordID)
+				secKey := encodeSecondaryKey(t.tableID, field.Name, key, edbID)
 				t.db.index.Delete(secKey)
 			}
 		}
@@ -148,11 +148,11 @@ func (t *Table[T]) CreateIndex(fieldName string) error {
 			if err != nil {
 				continue
 			}
-			recordID, err := t.getRecordIDAt(offset)
+			edbID, err := t.getEDBIDAt(offset)
 			if err != nil {
 				continue
 			}
-			secKey := encodeSecondaryKey(t.tableID, fieldName, key, recordID)
+			secKey := encodeSecondaryKey(t.tableID, fieldName, key, edbID)
 			t.db.index.Insert(secKey, offset)
 		}
 	}

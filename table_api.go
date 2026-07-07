@@ -46,9 +46,19 @@ const (
 // WAL enables write-ahead logging for crash recovery.
 // Compression enables snappy compression for record payloads.
 // CompressMinLen is the minimum payload size before compression is attempted (default 64).
+// CompactOnClose runs a full compaction (rewrite records, rebuild B-tree, reclaim dead
+// space) when Close() is called. Defaults to false, which only persists the header and
+// table catalog without rewriting record data — significantly faster for write-heavy
+// workloads. Use Sync() or Vacuum() to reclaim dead space explicitly.
+// CompactOnSync controls what Sync() does: false (default) only persists the header and
+// table catalog; true runs a full compaction. Use Vacuum() for explicit dead-space reclamation.
+//
+// Migrate and AutoIndex default to true. Because the zero value of bool is false, these
+// two fields are *bool so that omitting them preserves the default (true) while passing a
+// pointer to false explicitly disables them. Use the Bool helper to set them concisely.
 type OpenOptions struct {
-	Migrate        bool
-	AutoIndex      bool
+	Migrate        *bool
+	AutoIndex      *bool
 	SyncThreshold  uint64
 	IdleThreshold  time.Duration
 	CachePages     int
@@ -57,6 +67,21 @@ type OpenOptions struct {
 	WAL            bool
 	Compression    bool
 	CompressMinLen int
+	CompactOnClose bool
+	CompactOnSync  bool
+}
+
+// Bool returns a pointer to b, for use with the *bool fields of OpenOptions.
+//
+//	db, _ := embeddb.Open("app.db", embeddb.OpenOptions{AutoIndex: embeddb.Bool(false)})
+func Bool(b bool) *bool { return &b }
+
+// useOption returns *p when p is non-nil, otherwise def.
+func useBool(p *bool, def bool) bool {
+	if p != nil {
+		return *p
+	}
+	return def
 }
 
 // UseOptions configures table-specific behavior.
@@ -86,6 +111,8 @@ type DB struct {
 	wal            bool
 	compression    bool
 	compressMinLen int
+	compactOnClose bool
+	compactOnSync  bool
 	writeCount     uint64
 	lastSync       time.Time
 	lock           sync.Mutex
@@ -116,10 +143,12 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 	wal := false
 	compression := false
 	compressMinLen := 64
+	compactOnClose := false
+	compactOnSync := false
 	var encryptionKey []byte
 	if len(opts) > 0 {
-		migrate = optsCopy.Migrate
-		autoIndex = optsCopy.AutoIndex
+		migrate = useBool(optsCopy.Migrate, true)
+		autoIndex = useBool(optsCopy.AutoIndex, true)
 		if optsCopy.SyncThreshold > 0 {
 			syncThreshold = optsCopy.SyncThreshold
 		}
@@ -133,6 +162,8 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		storageMode = optsCopy.StorageMode
 		wal = optsCopy.WAL
 		compression = optsCopy.Compression
+		compactOnClose = optsCopy.CompactOnClose
+		compactOnSync = optsCopy.CompactOnSync
 		if optsCopy.CompressMinLen > 0 {
 			compressMinLen = optsCopy.CompressMinLen
 		}
@@ -177,6 +208,8 @@ func Open(filename string, opts ...OpenOptions) (*DB, error) {
 		wal:            wal,
 		compression:    compression,
 		compressMinLen: compressMinLen,
+		compactOnClose: compactOnClose,
+		compactOnSync:  compactOnSync,
 		writeCount:     0,
 		lastSync:       time.Now(),
 		tables:         make(map[string]*database),
@@ -399,7 +432,7 @@ func Use[T any](db *DB, args ...any) (*Table[T], error) {
 				ID:            maxID,
 				Name:          tableName,
 				SchemaVersion: layout.SchemaVersion,
-				NextRecordID:  1,
+				NextEDBID:  1,
 				RecordCount:   0,
 				MaxVersions:   useOpts.MaxVersions,
 			}
@@ -502,9 +535,12 @@ func (tx *Transaction) Rollback() error {
 	return tx.tx.rollback()
 }
 
-// Sync flushes all pending writes to disk for all open tables. This is a full sync that
-// compacts the B-tree index and ensures durability. It is called automatically based on
-// SyncThreshold and IdleThreshold options.
+// Sync flushes all pending writes to disk for all open tables, ensuring durability.
+// It is called automatically based on SyncThreshold and IdleThreshold options.
+//
+// By default Sync only persists the header and table catalog (fast). Set
+// OpenOptions{CompactOnSync: true} to make Sync run a full compaction (rewrite records,
+// rebuild B-tree, reclaim dead space). Use Vacuum() for explicit dead-space reclamation.
 func (db *DB) Sync() error {
 	if db == nil {
 		return nil
@@ -519,7 +555,13 @@ func (db *DB) Sync() error {
 
 	var firstErr error
 	if db.database != nil {
-		if err := db.database.flush(); err != nil && firstErr == nil {
+		var err error
+		if db.compactOnSync {
+			err = db.database.flush()
+		} else {
+			err = db.database.persistHeader()
+		}
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -895,7 +937,7 @@ func (t *Table[T]) readRecordAt(offset uint64) (*T, error) {
 	return &result, nil
 }
 
-func (t *Table[T]) encodeRecord(record *T, recordID uint32, flags byte, prevVersionOff uint64) ([]byte, error) {
+func (t *Table[T]) encodeRecord(record *T, edbID uint32, flags byte, prevVersionOff uint64) ([]byte, error) {
 	payload, err := encodeFieldPayload(record, t.layout, t.cipher)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode field payload: %w", err)
@@ -909,7 +951,7 @@ func (t *Table[T]) encodeRecord(record *T, recordID uint32, flags byte, prevVers
 		}
 	}
 
-	return buildV2Record(t.tableID, recordID, t.layout.SchemaVersion, flags, prevVersionOff, payload), nil
+	return buildV2Record(t.tableID, edbID, t.layout.SchemaVersion, flags, prevVersionOff, payload), nil
 }
 
 func (t *Table[T]) decodeRecord(data []byte, result *T) error {
@@ -970,7 +1012,7 @@ func (t *Table[T]) Drop() error {
 	return nil
 }
 
-func (t *Table[T]) getRecordIDAt(offset uint64) (uint32, error) {
+func (t *Table[T]) getEDBIDAt(offset uint64) (uint32, error) {
 	hdrBuf := hdrBufPool.Get().([]byte)
 	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 		hdrBufPool.Put(hdrBuf)
@@ -981,5 +1023,5 @@ func (t *Table[T]) getRecordIDAt(offset uint64) (uint32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid record header: %w", err)
 	}
-	return hdr.RecordID, nil
+	return hdr.EDBID, nil
 }

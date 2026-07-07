@@ -133,8 +133,8 @@ func main() {
 	}
 
 	opts := embeddb.OpenOptions{
-		Migrate:       true,
-		AutoIndex:     true,
+		Migrate:       embeddb.Bool(true),
+		AutoIndex:     embeddb.Bool(true),
 		WAL:           *wal,
 		Compression:   *compression,
 		SyncThreshold: 500,

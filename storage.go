@@ -135,6 +135,16 @@ func (a *allocator) Reset(nextOffset uint64, freeList []freeBlock) {
 	}
 }
 
+// ActualSize returns the highest allocated offset (the high-water mark of all
+// allocations, including B-tree pages that may have been allocated outside the
+// record stream). Used by recovery paths that must not regress the allocator
+// below already-allocated pages.
+func (a *allocator) ActualSize() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.actualSize
+}
+
 // Snapshot returns a snapshot of the allocator state that can be restored later.
 func (a *allocator) Snapshot() allocatorSnapshot {
 	a.mu.Lock()

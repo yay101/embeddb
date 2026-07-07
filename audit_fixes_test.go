@@ -76,7 +76,7 @@ func TestExplicitIndexDeleteUpdate(t *testing.T) {
 		Email string
 	}
 
-	db, err := Open("/tmp/test_explicit_idx.db", OpenOptions{AutoIndex: false})
+	db, err := Open("/tmp/test_explicit_idx.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestRollbackReopenStaleRoot(t *testing.T) {
 		Name string
 	}
 
-	db, err := Open("/tmp/test_rollback_reopen.db", OpenOptions{AutoIndex: false})
+	db, err := Open("/tmp/test_rollback_reopen.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestRollbackReopenStaleRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open("/tmp/test_rollback_reopen.db", OpenOptions{AutoIndex: false})
+	db, err = Open("/tmp/test_rollback_reopen.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestLikeWildcardUnderscore(t *testing.T) {
 		Name string
 	}
 
-	db, err := Open("/tmp/test_like_underscore.db", OpenOptions{AutoIndex: false})
+	db, err := Open("/tmp/test_like_underscore.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestSchemaChangeDetectionInUse(t *testing.T) {
 		Email string
 	}
 
-	db, err := Open("/tmp/test_schema_change.db", OpenOptions{AutoIndex: false})
+	db, err := Open("/tmp/test_schema_change.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +272,7 @@ func TestSchemaChangeDetectionInUse(t *testing.T) {
 
 	db.Close()
 
-	db, err = Open("/tmp/test_schema_change.db", OpenOptions{AutoIndex: false, Migrate: true})
+	db, err = Open("/tmp/test_schema_change.db", OpenOptions{AutoIndex: Bool(false), Migrate: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,7 @@ func TestDeactivateRecordErrorPropagation(t *testing.T) {
 		Name string
 	}
 
-	db, err := Open("/tmp/test_deactivate_err.db", OpenOptions{AutoIndex: false})
+	db, err := Open("/tmp/test_deactivate_err.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestDeactivateRecordErrorPropagation(t *testing.T) {
 
 	db.Close()
 
-	db2, err := Open("/tmp/test_deactivate_err.db", OpenOptions{AutoIndex: false})
+	db2, err := Open("/tmp/test_deactivate_err.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +394,7 @@ func TestDeleteFromNodeErrorPropagation(t *testing.T) {
 		Name string
 	}
 
-	db, err := Open("/tmp/test_delete_err.db", OpenOptions{AutoIndex: false})
+	db, err := Open("/tmp/test_delete_err.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +440,7 @@ func TestTxCommitThenReopen(t *testing.T) {
 		Name string
 	}
 
-	db, err := Open("/tmp/test_tx_reopen.db", OpenOptions{AutoIndex: false})
+	db, err := Open("/tmp/test_tx_reopen.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +459,7 @@ func TestTxCommitThenReopen(t *testing.T) {
 
 	db.Close()
 
-	db, err = Open("/tmp/test_tx_reopen.db", OpenOptions{AutoIndex: false})
+	db, err = Open("/tmp/test_tx_reopen.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func TestTxRollbackThenReopen(t *testing.T) {
 		Name string
 	}
 
-	db, err := Open("/tmp/test_tx_rollback_reopen.db", OpenOptions{AutoIndex: false})
+	db, err := Open("/tmp/test_tx_rollback_reopen.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +516,7 @@ func TestTxRollbackThenReopen(t *testing.T) {
 	db.Close()
 	time.Sleep(100 * time.Millisecond)
 
-	db, err = Open("/tmp/test_tx_rollback_reopen.db", OpenOptions{AutoIndex: false})
+	db, err = Open("/tmp/test_tx_rollback_reopen.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}

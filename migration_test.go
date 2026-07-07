@@ -91,7 +91,7 @@ func TestMigrationCompletelyNewFields(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_new_fields.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_new_fields.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,7 +147,7 @@ func TestMigrationAddMultipleFields(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_add_multi.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_add_multi.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -213,7 +213,7 @@ func TestMigrationDisabledError(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_disabled.db", OpenOptions{Migrate: false})
+		db, err := Open("/tmp/test_migrate_disabled.db", OpenOptions{Migrate: Bool(false)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -294,7 +294,7 @@ func TestMigrationPersistsAfterRestart(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_persist.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_persist.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -382,7 +382,7 @@ func TestMigrationWithMultipleRecords(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_many.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_many.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -463,7 +463,7 @@ func TestMigrationWithVersioning(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_versioning.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_versioning.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -525,7 +525,7 @@ func TestMigrationOldRecordsInactive(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_inactive.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_inactive.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -600,7 +600,7 @@ func TestMigrationThenInsertUpdate(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_then_ops.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_then_ops.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -673,7 +673,7 @@ func TestMigrationThenDelete(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_then_delete.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_then_delete.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -739,7 +739,7 @@ func TestMigrationAcrossRestarts(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_restarts.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_restarts.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -761,7 +761,7 @@ func TestMigrationAcrossRestarts(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_restarts.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_restarts.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -819,7 +819,7 @@ func TestMigrationWithAutoIndex(t *testing.T) {
 	defer os.Remove("/tmp/test_migrate_autoindex.db")
 
 	{
-		db, err := Open("/tmp/test_migrate_autoindex.db", OpenOptions{AutoIndex: true})
+		db, err := Open("/tmp/test_migrate_autoindex.db", OpenOptions{AutoIndex: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -845,7 +845,7 @@ func TestMigrationWithAutoIndex(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_autoindex.db", OpenOptions{Migrate: true, AutoIndex: true})
+		db, err := Open("/tmp/test_migrate_autoindex.db", OpenOptions{Migrate: Bool(true), AutoIndex: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -903,7 +903,7 @@ func TestMigrationThenInsertAndVacuum(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_vacuum.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_vacuum.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -949,7 +949,7 @@ func TestMigrationSameSchemaWithMigrateDisabled(t *testing.T) {
 	defer os.Remove("/tmp/test_migrate_same_disabled.db")
 
 	{
-		db, err := Open("/tmp/test_migrate_same_disabled.db", OpenOptions{Migrate: false})
+		db, err := Open("/tmp/test_migrate_same_disabled.db", OpenOptions{Migrate: Bool(false)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -965,7 +965,7 @@ func TestMigrationSameSchemaWithMigrateDisabled(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_same_disabled.db", OpenOptions{Migrate: false})
+		db, err := Open("/tmp/test_migrate_same_disabled.db", OpenOptions{Migrate: Bool(false)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1010,7 +1010,7 @@ func TestMigrationEmptyTable(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_empty.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_empty.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1067,7 +1067,7 @@ func TestMigrationWithUpdatesBeforeMigrate(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_updates.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_updates.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1120,7 +1120,7 @@ func TestMigrationWithDeletesBeforeMigrate(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_deletes.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_deletes.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1195,7 +1195,7 @@ func TestMigrationWithVersionedRecordsAndVacuum(t *testing.T) {
 	}
 
 	{
-		db, err := Open("/tmp/test_migrate_versioned_vacuum.db", OpenOptions{Migrate: true})
+		db, err := Open("/tmp/test_migrate_versioned_vacuum.db", OpenOptions{Migrate: Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}

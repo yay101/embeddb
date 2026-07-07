@@ -96,7 +96,7 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embeddbcore
 			newPayload = []byte{}
 		}
 
-		newRecord := buildV2Record(table.ID, hdr.RecordID, newLayout.SchemaVersion, hdr.Flags, hdr.PrevVersionOff, newPayload)
+		newRecord := buildV2Record(table.ID, hdr.EDBID, newLayout.SchemaVersion, hdr.Flags, hdr.PrevVersionOff, newPayload)
 
 		newOffset, _, err := db.alloc.Allocate(uint64(len(newRecord)))
 		if err != nil {
@@ -131,7 +131,49 @@ func migrateTable(db *database, table *tableCatalogEntry, newLayout *embeddbcore
 		db.index.Insert(pw.key, pw.newOffset)
 	}
 
+	offsetMap := make(map[uint64]uint64, len(pending))
+	for _, pw := range pending {
+		offsetMap[pw.oldOffset] = pw.newOffset
+	}
+
+	remapIndexOffsets(db, table.ID, offsetMap)
+
 	db.alloc.Reset(maxOffset, nil)
 
 	return nil
+}
+
+// remapIndexOffsets rewrites secondary and version index entries for the given table
+// so they point at the migrated record offsets. offsetMap maps old record offsets to
+// new offsets. Primary keys are handled by the caller; this covers the remaining
+// namespaces (secondary and version) which would otherwise still reference the
+// now-deactivated old records.
+func remapIndexOffsets(db *database, tableID uint8, offsetMap map[uint64]uint64) {
+	type pendingUpdate struct {
+		key    []byte
+		newOff uint64
+	}
+	var updates []pendingUpdate
+
+	for _, ns := range []byte{indexNSSecondary, indexNSVersion} {
+		prefix := []byte{ns, tableID}
+		db.index.Scan(func(key []byte, value uint64) bool {
+			if !bytes.HasPrefix(key, prefix) {
+				return true
+			}
+			newOff, ok := offsetMap[value]
+			if !ok {
+				return true
+			}
+			keyCopy := make([]byte, len(key))
+			copy(keyCopy, key)
+			updates = append(updates, pendingUpdate{key: keyCopy, newOff: newOff})
+			return true
+		})
+	}
+
+	for _, u := range updates {
+		db.index.Delete(u.key)
+		db.index.Insert(u.key, u.newOff)
+	}
 }

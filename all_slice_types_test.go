@@ -726,7 +726,7 @@ func TestAllScalarTypesQueryRange(t *testing.T) {
 	os.Remove("/tmp/test_scalar_query_range.db")
 	defer os.Remove("/tmp/test_scalar_query_range.db")
 
-	db, err := Open("/tmp/test_scalar_query_range.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_scalar_query_range.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}

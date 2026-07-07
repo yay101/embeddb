@@ -52,7 +52,7 @@ func TestStress10M(t *testing.T) {
 	dbPath := "/home/dave/tmp/stress_10m.db"
 	os.Remove(dbPath)
 
-	db, err := Open(dbPath, OpenOptions{AutoIndex: true})
+	db, err := Open(dbPath, OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestStress10M(t *testing.T) {
 		}
 
 		db.Close()
-		db, err = Open(dbPath, OpenOptions{AutoIndex: true})
+		db, err = Open(dbPath, OpenOptions{AutoIndex: Bool(true)})
 		if err != nil {
 			t.Fatalf("reopen db round %d: %v", round+1, err)
 		}

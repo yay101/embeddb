@@ -124,7 +124,7 @@ func TestCompressionSizeReduction(t *testing.T) {
 	largeData := strings.Repeat("the quick brown fox jumps over the lazy dog. ", 100)
 
 	dbNo, _ := Open("/tmp/test_nocompress_size.db", OpenOptions{
-		AutoIndex:   false,
+		AutoIndex: Bool(false),
 		StorageMode: StorageFile,
 	})
 	tblNo, _ := Use[SizeRecord](dbNo, "test")
@@ -140,7 +140,7 @@ func TestCompressionSizeReduction(t *testing.T) {
 
 	dbYes, _ := Open("/tmp/test_compress_size.db", OpenOptions{
 		Compression: true,
-		AutoIndex:   false,
+		AutoIndex: Bool(false),
 		StorageMode: StorageFile,
 	})
 	tblYes, _ := Use[SizeRecord](dbYes, "test")

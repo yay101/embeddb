@@ -251,7 +251,66 @@ func (bt *BTree) wouldOverflow(node *BTreeNode, extraKeyLen int) bool {
 	return currentUsed+cellOverhead > PageSize
 }
 
-func (bt *BTree) serializeNode(node *BTreeNode, buf []byte) []byte {
+// usedBytes returns the serialized size of node's cells plus header/footer
+// overhead (without any extra key).
+func (bt *BTree) usedBytes(node *BTreeNode) int {
+	used := PageHeaderSize
+	for i := 0; i < node.Count; i++ {
+		used += 2 + len(node.Keys[i]) + 8
+	}
+	if !node.IsLeaf {
+		used += 8
+	}
+	used += PageCRCSize
+	return used
+}
+
+// cellSize returns the serialized size of a single cell for the given key length.
+func cellSize(keyLen int) int { return 2 + keyLen + 8 }
+
+// pickSplitPoint returns the index at which to split a node so that both halves
+// fit within PageSize. It accumulates serialized cell sizes and picks the first
+// index where the left half holds at least half the usable page and the right
+// half also fits. If no such index exists (e.g. a single cell is larger than the
+// page), it returns -1.
+//
+// For leaf nodes the returned index is the first key that goes to the right
+// sibling (the promoted separator is a copy of that key). For internal nodes
+// the returned index is the key promoted to the parent; left keeps keys [0,idx),
+// right keeps keys [idx+1, Count).
+func (bt *BTree) pickSplitPoint(node *BTreeNode) int {
+	usable := PageSize - PageHeaderSize - PageCRCSize
+	if !node.IsLeaf {
+		usable -= 8 // first child pointer stored in the header
+	}
+	half := usable / 2
+
+	// Total bytes of all cells (excluding the first-child pointer already in usable).
+	total := 0
+	for i := 0; i < node.Count; i++ {
+		total += cellSize(len(node.Keys[i]))
+	}
+
+	leftUsed := 0
+	for i := 0; i < node.Count; i++ {
+		cs := cellSize(len(node.Keys[i]))
+		// Right half size: cells from i..Count-1 (leaf) or i+1..Count-1 (internal,
+		// since key i is promoted, not stored in either child).
+		var rightUsed int
+		if node.IsLeaf {
+			rightUsed = total - leftUsed
+		} else {
+			rightUsed = total - leftUsed - cs
+		}
+		if i > 0 && leftUsed >= half && rightUsed <= usable {
+			return i
+		}
+		leftUsed += cs
+	}
+	return -1
+}
+
+func (bt *BTree) serializeNode(node *BTreeNode, buf []byte) ([]byte, error) {
 	if buf == nil {
 		buf = make([]byte, PageSize)
 	}
@@ -274,10 +333,20 @@ func (bt *BTree) serializeNode(node *BTreeNode, buf []byte) []byte {
 
 	if node.IsLeaf {
 		for i := node.Count - 1; i >= 0; i-- {
+			cs := uint16(2 + len(node.Keys[i]) + 8)
+			if cs > cellEnd-uint16(PageHeaderSize) {
+				return nil, fmt.Errorf("serializeNode: leaf node at %d overflows page: key %d is %d bytes, count=%d",
+					node.Offset, i, len(node.Keys[i]), node.Count)
+			}
 			cellEnd -= bt.encodeLeafCell(buf, cellEnd, node.Keys[i], node.Values[i])
 		}
 	} else {
 		for i := node.Count - 1; i >= 0; i-- {
+			cs := uint16(2 + len(node.Keys[i]) + 8)
+			if cs > cellEnd-uint16(PageHeaderSize) {
+				return nil, fmt.Errorf("serializeNode: internal node at %d overflows page: key %d is %d bytes, count=%d",
+					node.Offset, i, len(node.Keys[i]), node.Count)
+			}
 			cellEnd -= bt.encodeInternalCell(buf, cellEnd, node.Keys[i], node.Children[i+1])
 		}
 	}
@@ -297,7 +366,7 @@ func (bt *BTree) serializeNode(node *BTreeNode, buf []byte) []byte {
 	checksum := crc32.Checksum(buf[:PageFooterOff], castagnoliTable)
 	binary.LittleEndian.PutUint32(buf[PageFooterOff:], checksum)
 
-	return buf
+	return buf, nil
 }
 
 func (bt *BTree) encodeLeafCell(buf []byte, end uint16, key []byte, value uint64) uint16 {
@@ -346,7 +415,10 @@ func (bt *BTree) writeNode(node *BTreeNode) error {
 
 	dataBufPtr := serializeBufPool.Get().(*[]byte)
 	data := *dataBufPtr
-	bt.serializeNode(node, data)
+	if _, err := bt.serializeNode(node, data); err != nil {
+		serializeBufPool.Put(dataBufPtr)
+		return fmt.Errorf("btree writeNode: %w", err)
+	}
 	r := bt.db.region.Load()
 	if r != nil {
 		r.RLock()
@@ -783,7 +855,22 @@ func (bt *BTree) splitChild(parent *BTreeNode, idx int, child *BTreeNode) error 
 	// In a B+ tree:
 	// - Leaf split: promoted key is copied up (stays in leaf), right sibling gets keys[mid..]
 	// - Internal split: promoted key is pushed up (removed from children)
-	mid := child.Count / 2
+	//
+	// The split point is chosen by serialized byte size (not count) so that both
+	// halves fit within PageSize even with variable-length keys.
+	mid := bt.pickSplitPoint(child)
+	if mid < 0 {
+		return fmt.Errorf("splitChild: cannot split node at %d: a single key (%d bytes) exceeds usable page size %d",
+			child.Offset, cellSize(len(child.Keys[0])), PageSize-PageHeaderSize-PageCRCSize)
+	}
+	if mid == 0 {
+		// pickSplitPoint refused to pick a balanced point (e.g. very few keys);
+		// fall back to the count midpoint to guarantee forward progress.
+		mid = child.Count / 2
+		if mid == 0 {
+			mid = 1
+		}
+	}
 
 	// For leaf: right gets keys[mid..] (mid is duplicated as separator in parent)
 	// For internal: right gets keys[mid+1..] (mid is promoted to parent, not in children)

@@ -25,7 +25,7 @@ func TestTxRollbackWithConcurrentReads(t *testing.T) {
 	os.Remove("/tmp/test_tx_rollback_race.db")
 	defer os.Remove("/tmp/test_tx_rollback_race.db")
 
-	db, err := Open("/tmp/test_tx_rollback_race.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_tx_rollback_race.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestTxRollbackVsBTreeIntegrity(t *testing.T) {
 	os.Remove("/tmp/test_tx_integrity.db")
 	defer os.Remove("/tmp/test_tx_integrity.db")
 
-	db, err := Open("/tmp/test_tx_integrity.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_tx_integrity.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestTxRollbackVsBTreeIntegrityConcurrent(t *testing.T) {
 	os.Remove("/tmp/test_tx_integrity_conc.db")
 	defer os.Remove("/tmp/test_tx_integrity_conc.db")
 
-	db, err := Open("/tmp/test_tx_integrity_conc.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_tx_integrity_conc.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestTxBulkInsertRollback(t *testing.T) {
 	os.Remove("/tmp/test_tx_bulk_rollback.db")
 	defer os.Remove("/tmp/test_tx_bulk_rollback.db")
 
-	db, err := Open("/tmp/test_tx_bulk_rollback.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_tx_bulk_rollback.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +413,7 @@ func TestTxBulkInsertRollbackConcurrent(t *testing.T) {
 	os.Remove("/tmp/test_tx_bulk_rollback_conc.db")
 	defer os.Remove("/tmp/test_tx_bulk_rollback_conc.db")
 
-	db, err := Open("/tmp/test_tx_bulk_rollback_conc.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_tx_bulk_rollback_conc.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}

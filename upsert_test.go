@@ -216,7 +216,7 @@ func TestUpsertWithIndexes(t *testing.T) {
 	os.Remove("/tmp/upsert_indexed.db")
 	defer os.Remove("/tmp/upsert_indexed.db")
 
-	db, err := Open("/tmp/upsert_indexed.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/upsert_indexed.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestDeleteWithIndexes(t *testing.T) {
 	os.Remove("/tmp/delete_indexed.db")
 	defer os.Remove("/tmp/delete_indexed.db")
 
-	db, err := Open("/tmp/delete_indexed.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/delete_indexed.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func TestDeleteManyWithIndexes(t *testing.T) {
 	os.Remove("/tmp/delete_many_indexed.db")
 	defer os.Remove("/tmp/delete_many_indexed.db")
 
-	db, err := Open("/tmp/delete_many_indexed.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/delete_many_indexed.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}

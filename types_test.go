@@ -145,7 +145,7 @@ func TestTimeFieldQuery(t *testing.T) {
 	os.Remove("/tmp/test_time_query.db")
 	defer os.Remove("/tmp/test_time_query.db")
 
-	db, err := Open("/tmp/test_time_query.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_time_query.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestTimeFieldRangeQuery(t *testing.T) {
 	os.Remove("/tmp/test_time_range.db")
 	defer os.Remove("/tmp/test_time_range.db")
 
-	db, err := Open("/tmp/test_time_range.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_time_range.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestTimeFieldWithoutIndex(t *testing.T) {
 	os.Remove("/tmp/test_time_no_index.db")
 	defer os.Remove("/tmp/test_time_no_index.db")
 
-	db, err := Open("/tmp/test_time_no_index.db", OpenOptions{AutoIndex: false})
+	db, err := Open("/tmp/test_time_no_index.db", OpenOptions{AutoIndex: Bool(false)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestNestedStructQueryByField(t *testing.T) {
 	os.Remove("/tmp/test_nested_query.db")
 	defer os.Remove("/tmp/test_nested_query.db")
 
-	db, err := Open("/tmp/test_nested_query.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_nested_query.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +430,7 @@ func TestNestedStructRangeQuery(t *testing.T) {
 	os.Remove("/tmp/test_nested_range.db")
 	defer os.Remove("/tmp/test_nested_range.db")
 
-	db, err := Open("/tmp/test_nested_range.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_nested_range.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +543,7 @@ func TestEventRecordTimeRangeQuery(t *testing.T) {
 	os.Remove("/tmp/test_event_range.db")
 	defer os.Remove("/tmp/test_event_range.db")
 
-	db, err := Open("/tmp/test_event_range.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_event_range.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -644,7 +644,7 @@ func TestEmbeddedStructQueryAndFilter(t *testing.T) {
 	os.Remove("/tmp/test_embedded_query.db")
 	defer os.Remove("/tmp/test_embedded_query.db")
 
-	db, err := Open("/tmp/test_embedded_query.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_embedded_query.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,7 +691,7 @@ func TestBoolFieldRoundTripAndQuery(t *testing.T) {
 	os.Remove("/tmp/test_bool.db")
 	defer os.Remove("/tmp/test_bool.db")
 
-	db, err := Open("/tmp/test_bool.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_bool.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -729,7 +729,7 @@ func TestFloatRangeQueries(t *testing.T) {
 	os.Remove("/tmp/test_float_range.db")
 	defer os.Remove("/tmp/test_float_range.db")
 
-	db, err := Open("/tmp/test_float_range.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/test_float_range.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}

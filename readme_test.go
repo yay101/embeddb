@@ -43,7 +43,7 @@ func TestReadmeQuickStart(t *testing.T) {
 	os.Remove("/tmp/readme_test.db")
 	defer os.Remove("/tmp/readme_test.db")
 
-	db, err := Open("/tmp/readme_test.db", OpenOptions{AutoIndex: true})
+	db, err := Open("/tmp/readme_test.db", OpenOptions{AutoIndex: Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -948,7 +948,7 @@ func TestGetIndexedFields(t *testing.T) {
 	os.Remove("/tmp/indexed_fields.db")
 	defer os.Remove("/tmp/indexed_fields.db")
 
-	db, _ := Open("/tmp/indexed_fields.db", OpenOptions{AutoIndex: false})
+	db, _ := Open("/tmp/indexed_fields.db", OpenOptions{AutoIndex: Bool(false)})
 	defer db.Close()
 
 	users, _ := Use[User](db, "users")

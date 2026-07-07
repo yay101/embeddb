@@ -141,6 +141,32 @@ db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
     StorageMode:   embeddb.StorageMmap, // or StorageFile for no mmap overhead
 })
 
+// Fast close for write-heavy workloads (default). Close() only persists the header
+// and table catalog without rewriting record data or rebuilding the B-tree.
+// Use Sync() or Vacuum() to reclaim dead space explicitly.
+db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
+    CompactOnClose: false,  // default: fast close
+})
+
+// Compact on close (legacy behavior). Close() rewrites records and rebuilds the
+// B-tree, reclaiming dead space. Significantly slower for large datasets.
+db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
+    CompactOnClose: true,
+})
+
+// Sync() likewise defaults to a fast metadata-only persist; opt in to compaction
+// per-Sync with CompactOnSync. Vacuum() always reclaims dead space explicitly.
+db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
+    CompactOnSync: false,  // default: fast Sync()
+})
+
+// Migrate and AutoIndex default to true. Use embeddb.Bool() to set them explicitly
+// (these fields are *bool so that omitting them keeps the default rather than false).
+db, err := embeddb.Open("/tmp/app.db", embeddb.OpenOptions{
+    AutoIndex: embeddb.Bool(false),  // explicitly disable auto-indexing
+    Migrate:   embeddb.Bool(true),   // explicitly enable migration (the default)
+})
+
 // Get table handle (versioning disabled by default)
 users, err := embeddb.Use[User](db, "users")
 

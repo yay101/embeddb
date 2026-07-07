@@ -13,7 +13,7 @@ func TestEncryptedField(t *testing.T) {
 
 	key := []byte("01234567890123456789012345678901") // 32-byte AES-256 key
 
-	db, err := Open("/tmp/test_encrypted_field.db", OpenOptions{AutoIndex: false, EncryptionKey: key})
+	db, err := Open("/tmp/test_encrypted_field.db", OpenOptions{AutoIndex: Bool(false), EncryptionKey: key})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestEncryptedField(t *testing.T) {
 
 	// Re-open with same key
 	db.Close()
-	db, err = Open("/tmp/test_encrypted_field.db", OpenOptions{AutoIndex: false, EncryptionKey: key})
+	db, err = Open("/tmp/test_encrypted_field.db", OpenOptions{AutoIndex: Bool(false), EncryptionKey: key})
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestEncryptedFieldWrongKey(t *testing.T) {
 	}
 
 	key := []byte("01234567890123456789012345678901")
-	db, err := Open("/tmp/test_enc_wrong_key.db", OpenOptions{AutoIndex: false, EncryptionKey: key})
+	db, err := Open("/tmp/test_enc_wrong_key.db", OpenOptions{AutoIndex: Bool(false), EncryptionKey: key})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestEncryptedFieldWrongKey(t *testing.T) {
 
 	// Re-open with wrong key - Email should decrypt to empty because GCM tag fails
 	wrongKey := []byte("00000000000000000000000000000000")
-	db2, err := Open("/tmp/test_enc_wrong_key.db", OpenOptions{AutoIndex: false, EncryptionKey: wrongKey})
+	db2, err := Open("/tmp/test_enc_wrong_key.db", OpenOptions{AutoIndex: Bool(false), EncryptionKey: wrongKey})
 	if err != nil {
 		t.Fatalf("Open with wrong key: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestEncryptedFieldWithIndexRejected(t *testing.T) {
 	}
 
 	key := []byte("01234567890123456789012345678901")
-	db, err := Open("/tmp/test_enc_idx_rejected.db", OpenOptions{AutoIndex: true, EncryptionKey: key})
+	db, err := Open("/tmp/test_enc_idx_rejected.db", OpenOptions{AutoIndex: Bool(true), EncryptionKey: key})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestEncryptedFieldInSliceOfStructs(t *testing.T) {
 	}
 
 	key := []byte("01234567890123456789012345678901")
-	db, err := Open("/tmp/test_enc_slice_struct.db", OpenOptions{AutoIndex: false, EncryptionKey: key})
+	db, err := Open("/tmp/test_enc_slice_struct.db", OpenOptions{AutoIndex: Bool(false), EncryptionKey: key})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

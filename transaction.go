@@ -9,7 +9,7 @@ type transaction struct {
 	rolledBack           bool
 	recordCounts         map[string]uint32
 	recordCountSnapshot  map[string]uint32
-	nextRecordIDSnapshot map[string]uint32
+	nextEDBIDSnapshot map[string]uint32
 	allocSnapshot        allocatorSnapshot
 	pageSnapshots        map[uint64][]byte
 }
@@ -25,10 +25,10 @@ func (db *database) begin() *transaction {
 	indexRootSnapshot := db.index.RootOffset()
 
 	recordCountSnapshot := make(map[string]uint32)
-	nextRecordIDSnapshot := make(map[string]uint32)
+	nextEDBIDSnapshot := make(map[string]uint32)
 	for name, entry := range db.tableCat {
 		recordCountSnapshot[name] = entry.RecordCount
-		nextRecordIDSnapshot[name] = entry.NextRecordID
+		nextEDBIDSnapshot[name] = entry.NextEDBID
 	}
 
 	allocSnapshot := db.alloc.Snapshot()
@@ -40,7 +40,7 @@ func (db *database) begin() *transaction {
 		rolledBack:           false,
 		recordCounts:         make(map[string]uint32),
 		recordCountSnapshot:  recordCountSnapshot,
-		nextRecordIDSnapshot: nextRecordIDSnapshot,
+		nextEDBIDSnapshot: nextEDBIDSnapshot,
 		allocSnapshot:        allocSnapshot,
 		pageSnapshots:        make(map[uint64][]byte),
 	}
@@ -100,9 +100,9 @@ func (tx *transaction) rollback() error {
 			entry.RecordCount = rc
 		}
 	}
-	for name, nrid := range tx.nextRecordIDSnapshot {
+	for name, nrid := range tx.nextEDBIDSnapshot {
 		if entry, ok := tx.db.tableCat[name]; ok {
-			entry.NextRecordID = nrid
+			entry.NextEDBID = nrid
 		}
 	}
 

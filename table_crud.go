@@ -19,20 +19,20 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		return 0, fmt.Errorf("table not found")
 	}
 
-	recordID := entry.NextRecordID
-	entry.NextRecordID++
+	edbID := entry.NextEDBID
+	entry.NextEDBID++
 
 	pkVal, _ := t.getPKValue(record)
 	if t.isZeroPK(pkVal) {
-		t.setPKValue(record, recordID)
-		pkVal = recordID
+		t.setPKValue(record, edbID)
+		pkVal = edbID
 	} else {
 		if _, err := t.db.index.Get(encodePrimaryKey(t.tableID, pkVal)); err == nil {
 			return 0, fmt.Errorf("primary key already exists: %v", pkVal)
 		}
 	}
 
-	recordBuf, err := t.encodeRecord(record, recordID, embeddbcore.FlagsActive, 0)
+	recordBuf, err := t.encodeRecord(record, edbID, embeddbcore.FlagsActive, 0)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode record: %w", err)
 	}
@@ -50,7 +50,7 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 	}
 
 	if t.maxVersions > 0 {
-		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, 1), offset)
+		t.db.index.Insert(encodeVersionKey(t.tableID, edbID, 1), offset)
 	}
 
 	if t.db.tx != nil {
@@ -59,11 +59,11 @@ func (t *Table[T]) Insert(record *T) (uint32, error) {
 		entry.RecordCount++
 	}
 
-	t.insertSecondaryKeys(record, recordID, offset)
+	t.insertSecondaryKeys(record, edbID, offset)
 
 	t.db.autoSync()
 
-	return recordID, nil
+	return edbID, nil
 }
 
 func (t *Table[T]) isZeroPK(val any) bool {
@@ -156,7 +156,7 @@ func (t *Table[T]) GetVersion(id any, version uint32) (*T, error) {
 		return nil, fmt.Errorf("invalid record header: %w", err)
 	}
 
-	versionOffset, err := t.db.index.Get(encodeVersionKey(t.tableID, hdr.RecordID, version))
+	versionOffset, err := t.db.index.Get(encodeVersionKey(t.tableID, hdr.EDBID, version))
 	if err != nil {
 		return nil, fmt.Errorf("version %d not found for record", version)
 	}
@@ -185,7 +185,7 @@ func (t *Table[T]) ListVersions(id any) ([]VersionMetadata, error) {
 		return nil, fmt.Errorf("invalid record header: %w", err)
 	}
 
-	prefix := encodeVersionKeyPrefix(t.tableID, hdr.RecordID)
+	prefix := encodeVersionKeyPrefix(t.tableID, hdr.EDBID)
 	var results []VersionMetadata
 	t.db.index.Scan(func(key []byte, value uint64) bool {
 		if bytes.HasPrefix(key, prefix) {
@@ -225,7 +225,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 		return fmt.Errorf("record at offset %d is not active", offset)
 	}
 
-	recordID := hdr.RecordID
+	edbID := hdr.EDBID
 
 	totalLen := recordTotalSize(hdr)
 	oldRecordBuf := make([]byte, totalLen)
@@ -237,7 +237,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 	var oldRecord T
 	t.decodeRecord(oldRecordBuf, &oldRecord)
 
-	t.deleteSecondaryKeys(&oldRecord, recordID, offset)
+	t.deleteSecondaryKeys(&oldRecord, edbID, offset)
 
 	var flags byte = embeddbcore.FlagsActive
 	var prevVersionOff uint64
@@ -246,7 +246,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 		prevVersionOff = offset
 	}
 
-	newRecordBuf, err := t.encodeRecord(record, recordID, flags, prevVersionOff)
+	newRecordBuf, err := t.encodeRecord(record, edbID, flags, prevVersionOff)
 	if err != nil {
 		return fmt.Errorf("failed to encode record: %w", err)
 	}
@@ -260,7 +260,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 	}
 
 	if t.maxVersions > 0 {
-		prefix := encodeVersionKeyPrefix(t.tableID, recordID)
+		prefix := encodeVersionKeyPrefix(t.tableID, edbID)
 		type verInfo struct {
 			version uint32
 			offset  uint64
@@ -276,7 +276,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 		})
 
 		if len(versions) == 0 {
-			t.db.index.Insert(encodeVersionKey(t.tableID, recordID, 1), offset)
+			t.db.index.Insert(encodeVersionKey(t.tableID, edbID, 1), offset)
 			versions = append(versions, verInfo{version: 1, offset: offset})
 		}
 		newVersion := uint32(1)
@@ -285,7 +285,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 				newVersion = v.version + 1
 			}
 		}
-		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, newVersion), newOffset)
+		t.db.index.Insert(encodeVersionKey(t.tableID, edbID, newVersion), newOffset)
 		versions = append(versions, verInfo{version: newVersion, offset: newOffset})
 
 		maxTotal := int(t.maxVersions) + 1
@@ -297,7 +297,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 				}
 			}
 			_ = t.deactivateRecord(versions[oldestIdx].offset)
-			t.db.index.Delete(encodeVersionKey(t.tableID, recordID, versions[oldestIdx].version))
+			t.db.index.Delete(encodeVersionKey(t.tableID, edbID, versions[oldestIdx].version))
 			versions = append(versions[:oldestIdx], versions[oldestIdx+1:]...)
 		}
 	} else {
@@ -310,7 +310,7 @@ func (t *Table[T]) Update(id any, record *T) error {
 		return fmt.Errorf("failed to update primary key index: %w", err)
 	}
 
-	t.insertSecondaryKeys(record, recordID, newOffset)
+	t.insertSecondaryKeys(record, edbID, newOffset)
 
 	t.db.autoSync()
 
@@ -331,7 +331,7 @@ func (t *Table[T]) Delete(id any) error {
 		return fmt.Errorf("record not found")
 	}
 
-	var recordID uint32
+	var edbID uint32
 	hdrBuf := make([]byte, embeddbcore.RecordHeaderSize)
 	if err := t.db.readAt(hdrBuf, int64(offset)); err != nil {
 		return fmt.Errorf("failed to read record header: %w", err)
@@ -339,7 +339,7 @@ func (t *Table[T]) Delete(id any) error {
 	if hdrBuf[0] == V2RecordVersion {
 		hdr, _ := decodeRecordHeader(hdrBuf)
 		if hdr.IsActive() {
-			recordID = hdr.RecordID
+			edbID = hdr.EDBID
 			totalLen := recordTotalSize(hdr)
 			oldRecordBuf := make([]byte, totalLen)
 			copy(oldRecordBuf, hdrBuf)
@@ -350,7 +350,7 @@ func (t *Table[T]) Delete(id any) error {
 			var oldRecord T
 			t.decodeRecord(oldRecordBuf, &oldRecord)
 
-			t.deleteSecondaryKeys(&oldRecord, recordID, offset)
+			t.deleteSecondaryKeys(&oldRecord, edbID, offset)
 		}
 	}
 
@@ -360,8 +360,8 @@ func (t *Table[T]) Delete(id any) error {
 
 	t.db.index.Delete(encodePrimaryKey(t.tableID, t.normalizePK(id)))
 
-	if t.maxVersions > 0 && recordID > 0 {
-		prefix := encodeVersionKeyPrefix(t.tableID, recordID)
+	if t.maxVersions > 0 && edbID > 0 {
+		prefix := encodeVersionKeyPrefix(t.tableID, edbID)
 		var versionKeys [][]byte
 		t.db.index.Scan(func(key []byte, value uint64) bool {
 			if bytes.HasPrefix(key, prefix) {
@@ -417,7 +417,7 @@ func (t *Table[T]) DeleteMany(ids []any) (int, error) {
 				var oldRecord T
 				t.decodeRecord(oldRecordBuf, &oldRecord)
 
-				t.deleteSecondaryKeys(&oldRecord, hdr.RecordID, offset)
+				t.deleteSecondaryKeys(&oldRecord, hdr.EDBID, offset)
 			}
 		}
 
@@ -471,7 +471,7 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 
 	type bulkEntry struct {
 		record     *T
-		recordID   uint32
+		edbID   uint32
 		offset     uint64
 		pkVal      any
 		pkKey      []byte
@@ -482,23 +482,23 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 	var totalSize uint64
 
 	for _, record := range records {
-		recordID := entry.NextRecordID
-		entry.NextRecordID++
+		edbID := entry.NextEDBID
+		entry.NextEDBID++
 
 		pkVal, _ := t.getPKValue(record)
 		if t.isZeroPK(pkVal) {
-			t.setPKValue(record, recordID)
-			pkVal = recordID
+			t.setPKValue(record, edbID)
+			pkVal = edbID
 		}
 
-		recordBuf, err := t.encodeRecord(record, recordID, embeddbcore.FlagsActive, 0)
+		recordBuf, err := t.encodeRecord(record, edbID, embeddbcore.FlagsActive, 0)
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode record: %w", err)
 		}
 
 		bulk = append(bulk, bulkEntry{
 			record:     record,
-			recordID:   recordID,
+			edbID:   edbID,
 			pkVal:      pkVal,
 			pkKey:      encodePrimaryKey(t.tableID, pkVal),
 			encodedBuf: recordBuf,
@@ -531,9 +531,9 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 
 	for _, b := range bulk {
 		if t.maxVersions > 0 {
-			t.db.index.Insert(encodeVersionKey(t.tableID, b.recordID, 1), b.offset)
+			t.db.index.Insert(encodeVersionKey(t.tableID, b.edbID, 1), b.offset)
 		}
-		t.insertSecondaryKeys(b.record, b.recordID, b.offset)
+		t.insertSecondaryKeys(b.record, b.edbID, b.offset)
 		if t.db.tx != nil {
 			t.db.tx.recordCounts[t.name]++
 		} else {
@@ -545,7 +545,7 @@ func (t *Table[T]) InsertManyBulk(records []*T) ([]uint32, error) {
 
 	ids := make([]uint32, len(bulk))
 	for i, b := range bulk {
-		ids[i] = b.recordID
+		ids[i] = b.edbID
 	}
 
 	if err := t.db.writeHeader(); err != nil {
@@ -599,20 +599,20 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 		return 0, fmt.Errorf("table not found")
 	}
 
-	recordID := entry.NextRecordID
-	entry.NextRecordID++
+	edbID := entry.NextEDBID
+	entry.NextEDBID++
 
 	pkVal, _ := t.getPKValue(record)
 	if t.isZeroPK(pkVal) {
-		t.setPKValue(record, recordID)
-		pkVal = recordID
+		t.setPKValue(record, edbID)
+		pkVal = edbID
 	} else {
 		if _, err := t.db.index.Get(encodePrimaryKey(t.tableID, pkVal)); err == nil {
 			return 0, fmt.Errorf("primary key already exists: %v", pkVal)
 		}
 	}
 
-	recordBuf, err := t.encodeRecord(record, recordID, embeddbcore.FlagsActive, 0)
+	recordBuf, err := t.encodeRecord(record, edbID, embeddbcore.FlagsActive, 0)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode record: %w", err)
 	}
@@ -628,7 +628,7 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 	t.db.index.Insert(encodePrimaryKey(t.tableID, pkVal), offset)
 
 	if t.maxVersions > 0 {
-		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, 1), offset)
+		t.db.index.Insert(encodeVersionKey(t.tableID, edbID, 1), offset)
 	}
 
 	if t.db.tx != nil {
@@ -637,9 +637,9 @@ func (t *Table[T]) insertLocked(record *T) (uint32, error) {
 		entry.RecordCount++
 	}
 
-	t.insertSecondaryKeys(record, recordID, offset)
+	t.insertSecondaryKeys(record, edbID, offset)
 
-	return recordID, nil
+	return edbID, nil
 }
 
 func (t *Table[T]) updateLocked(id any, record *T) error {
@@ -660,7 +660,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 		return fmt.Errorf("invalid record at offset %d: %w", oldOffset, err)
 	}
 
-	recordID := hdr.RecordID
+	edbID := hdr.EDBID
 
 	totalLen := recordTotalSize(hdr)
 	oldRecordBuf := make([]byte, totalLen)
@@ -672,7 +672,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	var oldRecord T
 	t.decodeRecord(oldRecordBuf, &oldRecord)
 
-	t.deleteSecondaryKeys(&oldRecord, recordID, oldOffset)
+	t.deleteSecondaryKeys(&oldRecord, edbID, oldOffset)
 
 	var flags byte = embeddbcore.FlagsActive
 	var prevVersionOff uint64
@@ -681,7 +681,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 		prevVersionOff = oldOffset
 	}
 
-	newRecordBuf, err := t.encodeRecord(record, recordID, flags, prevVersionOff)
+	newRecordBuf, err := t.encodeRecord(record, edbID, flags, prevVersionOff)
 	if err != nil {
 		return fmt.Errorf("failed to encode record: %w", err)
 	}
@@ -695,7 +695,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 	}
 
 	if t.maxVersions > 0 {
-		prefix := encodeVersionKeyPrefix(t.tableID, recordID)
+		prefix := encodeVersionKeyPrefix(t.tableID, edbID)
 		type verInfo struct {
 			version uint32
 			offset  uint64
@@ -711,7 +711,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 		})
 
 		if len(versions) == 0 {
-			t.db.index.Insert(encodeVersionKey(t.tableID, recordID, 1), oldOffset)
+			t.db.index.Insert(encodeVersionKey(t.tableID, edbID, 1), oldOffset)
 			versions = append(versions, verInfo{version: 1, offset: oldOffset})
 		}
 		newVersion := uint32(1)
@@ -720,7 +720,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 				newVersion = v.version + 1
 			}
 		}
-		t.db.index.Insert(encodeVersionKey(t.tableID, recordID, newVersion), newOffset)
+		t.db.index.Insert(encodeVersionKey(t.tableID, edbID, newVersion), newOffset)
 		versions = append(versions, verInfo{version: newVersion, offset: newOffset})
 
 		if len(versions) > int(t.maxVersions) {
@@ -729,7 +729,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 					continue
 				}
 				_ = t.deactivateRecord(versions[i].offset)
-				t.db.index.Delete(encodeVersionKey(t.tableID, recordID, versions[i].version))
+				t.db.index.Delete(encodeVersionKey(t.tableID, edbID, versions[i].version))
 				versions = append(versions[:i], versions[i+1:]...)
 				i--
 			}
@@ -742,7 +742,7 @@ func (t *Table[T]) updateLocked(id any, record *T) error {
 		return fmt.Errorf("failed to update primary key index: %w", err)
 	}
 
-	t.insertSecondaryKeys(record, recordID, newOffset)
+	t.insertSecondaryKeys(record, edbID, newOffset)
 
 	return nil
 }
@@ -768,12 +768,12 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 		return 0, false, fmt.Errorf("table not found")
 	}
 
-	recordID := entry.NextRecordID
-	entry.NextRecordID++
+	edbID := entry.NextEDBID
+	entry.NextEDBID++
 
 	t.setPKValue(record, t.normalizePK(id))
 
-	recordBuf, err := t.encodeRecord(record, recordID, embeddbcore.FlagsActive, 0)
+	recordBuf, err := t.encodeRecord(record, edbID, embeddbcore.FlagsActive, 0)
 	if err != nil {
 		return 0, true, fmt.Errorf("failed to encode record: %w", err)
 	}
@@ -789,7 +789,7 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 	pkVal, _ := t.getPKValue(record)
 	t.db.index.Insert(encodePrimaryKey(t.tableID, pkVal), offset)
 
-	t.insertSecondaryKeys(record, recordID, offset)
+	t.insertSecondaryKeys(record, edbID, offset)
 
 	if t.db.tx != nil {
 		t.db.tx.recordCounts[t.name]++
@@ -799,5 +799,5 @@ func (t *Table[T]) Upsert(id any, record *T) (uint32, bool, error) {
 
 	t.db.autoSync()
 
-	return recordID, true, nil
+	return edbID, true, nil
 }
